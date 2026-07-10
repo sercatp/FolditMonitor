@@ -1,6 +1,12 @@
-# Foldit Monitor
+# FolditMonitor
 
-Foldit Monitor is a small desktop helper for watching local Foldit clients, tracking scores/log output, viewing puzzle stats, and optionally connecting monitors over the local network.
+FolditMonitor is a small desktop helper for watching local Foldit clients, tracking scores/log output, viewing puzzle stats, and connecting monitors over the local network.
+
+## Screenshots
+
+![Main window](images/main-window.jpg)
+
+![Stats window](images/stats-window.jpg)
 
 ## Contents
 
@@ -20,35 +26,22 @@ Runtime folders such as `logs/`, `puzzle_logs/`, `foldit_backup/`, `__pycache__/
 - Foldit clients running locally.
 - Python packages from `requirements.txt`.
 
-Optional features:
-
-- Install `PySide6` to use the Qt stats UI (`display.stats_ui_backend = "pyside6"`).
-- Install `frida` to use the speed boost menu items.
-
 ## Install
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\python -m pip install --upgrade pip
-.\.venv\Scripts\python -m pip install -r requirements.txt
-```
-
-Optional dependencies:
-
-```powershell
-.\.venv\Scripts\python -m pip install -r requirements-optional.txt
+python -m pip install -r requirements.txt
 ```
 
 ## Run
 
 ```powershell
-.\.venv\Scripts\pythonw "Foldit Monitor.pyw"
+pythonw "Foldit Monitor.pyw"
 ```
 
 For console output while debugging:
 
 ```powershell
-.\.venv\Scripts\python "Foldit Monitor.pyw"
+python "Foldit Monitor.pyw"
 ```
 
 On first start the app creates `Foldit Monitor.json` from defaults. That file stores local window positions, last selected puzzle, network address, and other user preferences, so it is ignored by git.
@@ -58,7 +51,5 @@ On first start the app creates `Foldit Monitor.json` from defaults. That file st
 ## Test
 
 ```powershell
-.\.venv\Scripts\python -m unittest discover -s tests
+python -m unittest discover -s tests
 ```
-
-Some Qt tests are skipped unless `PySide6` is installed.
