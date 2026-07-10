@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local runtime settings and generated data
+Foldit Monitor.json
+logs/
+puzzle_logs/
+foldit_backup/
+_remote/
+
+# Local profiling, traces, and exported artifacts
+*.log
+*.etl
+*.pdb
+*.part
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
