@@ -26,7 +26,6 @@ class FolditSpeedBoostIntegration:
         self.manager = FolditSpeedBoostManager()
         self.armed_pids = set()
         self.script_running_pids = set()
-        self.visible_pids = set()
         self.busy_pids = set()
         self.managed_pids = set()
         self.enabled_pids = set()
@@ -69,26 +68,15 @@ class FolditSpeedBoostIntegration:
         return insert_index + 1
 
     def before_activate(self, pid, after=None) -> bool:
-        pid = int(pid)
-        with self._lock:
-            should_disable = pid in self.enabled_pids and pid not in self.busy_pids
-            if should_disable:
-                self.busy_pids.add(pid)
-        if not should_disable:
-            return False
-
-        self._run_thread(self._worker_disable_before_activate, pid, after)
-        return True
+        # This hook only shortens solver-worker waits, not the UI Sleep loop.
+        # It is therefore safe to leave active while the Foldit window is open.
+        return False
 
     def on_clients_refreshed(self, clients) -> None:
         sync_state = tuple(self._normalize_client_state(client) for client in clients)
         with self._lock:
             for pid, is_visible, client_name, script_running in sync_state:
                 self.client_names[pid] = client_name
-                if is_visible:
-                    self.visible_pids.add(pid)
-                else:
-                    self.visible_pids.discard(pid)
                 if script_running is not None:
                     if script_running:
                         self.script_running_pids.add(pid)
@@ -121,19 +109,6 @@ class FolditSpeedBoostIntegration:
     def _show_dependency_message(self) -> None:
         messagebox.showinfo("Speed boost dependency", unavailable_message())
 
-    def _tree_item_for_pid(self, pid):
-        clean_pid = int(pid)
-        for item in self.process_tree.get_children():
-            if self.get_pid_tag(self.process_tree.item(item, "tags")) == clean_pid:
-                return item
-        return None
-
-    def _is_window_visible(self, pid) -> bool:
-        item = self._tree_item_for_pid(pid)
-        if item is None:
-            return False
-        return "active_window" in self.process_tree.item(item, "tags")
-
     def _row_clients(self):
         rows = []
         for item in self.process_tree.get_children():
@@ -160,11 +135,10 @@ class FolditSpeedBoostIntegration:
             None,
         )
 
-    def _desired_enabled_locked(self, pid: int, is_window_visible: bool) -> bool:
+    def _desired_enabled_locked(self, pid: int, _is_window_visible: bool) -> bool:
         return (
             int(pid) in self.armed_pids
             and int(pid) in self.script_running_pids
-            and not bool(is_window_visible)
         )
 
     def toggle(self, pid, client_name: str = "") -> None:
@@ -172,7 +146,6 @@ class FolditSpeedBoostIntegration:
         if not self.manager.is_supported():
             self._show_dependency_message()
             return
-        is_visible = self._is_window_visible(pid)
         with self._lock:
             if pid in self.busy_pids:
                 return
@@ -180,7 +153,7 @@ class FolditSpeedBoostIntegration:
             if should_enable:
                 self.armed_pids.add(pid)
                 self.client_names[pid] = client_name or self.client_names.get(pid, str(pid))
-                enabled = self._desired_enabled_locked(pid, is_visible)
+                enabled = self._desired_enabled_locked(pid, False)
                 if not enabled:
                     return
             else:
@@ -265,7 +238,6 @@ class FolditSpeedBoostIntegration:
                     still_should_enable = (
                         pid in self.armed_pids
                         and pid in self.script_running_pids
-                        and pid not in self.visible_pids
                     )
                 if not still_should_enable:
                     self.manager.disable(pid)
@@ -288,7 +260,6 @@ class FolditSpeedBoostIntegration:
                 still_should_enable = (
                     pid in self.armed_pids
                     and pid in self.script_running_pids
-                    and pid not in self.visible_pids
                 )
             if not still_should_enable:
                 self.manager.disable(pid)
@@ -308,15 +279,6 @@ class FolditSpeedBoostIntegration:
             self.manager.log(f"Speed boost pid={pid}: disable failed: {exc}")
         finally:
             self._clear_busy((pid,))
-
-    def _worker_disable_before_activate(self, pid: int, after) -> None:
-        try:
-            self.manager.set_enabled(pid, False)
-            self._refresh_snapshot()
-        finally:
-            self._clear_busy((pid,))
-            if after is not None:
-                self._after(0, after)
 
     def _worker_sync_clients(self) -> None:
         while not self._closed:
@@ -340,7 +302,6 @@ class FolditSpeedBoostIntegration:
                             with self._lock:
                                 self.armed_pids.discard(pid)
                                 self.script_running_pids.discard(pid)
-                                self.visible_pids.discard(pid)
                                 self.client_names.pop(pid, None)
                             self._refresh_snapshot()
                         finally:

@@ -15,15 +15,18 @@ else:
 
 
 INSTALL_COMMAND = "python -m pip install frida==17.15.4"
-GAME_LIBRARY_SLEEP_OFFSET = 0xAECD90
-GAME_LIBRARY_OFFSET_TOLERANCE = 32
+# The two 0.1-second wiggle waits in the Foldit worker path.  These are return
+# addresses inside game_library.dll, so keep the match exact and revalidate
+# them after a Foldit update instead of matching a nearby Sleep call.
+GAME_LIBRARY_SLEEP_OFFSETS = (0xDB729B, 0xE729B9)
+TARGET_SLEEP_MS = 100
+REPLACEMENT_SLEEP_MS = 5
 
 
 SPEED_BOOST_JS = r"""
-const targetMs = 2;
-const replaceMs = 0;
-const gameOffset = GAME_OFFSET_PLACEHOLDER;
-const offsetTolerance = OFFSET_TOLERANCE_PLACEHOLDER;
+const targetMs = TARGET_MS_PLACEHOLDER;
+const replaceMs = REPLACEMENT_MS_PLACEHOLDER;
+const gameOffsets = [GAME_OFFSETS_PLACEHOLDER];
 const stats = {
     patched: 0,
     passed: 0,
@@ -46,7 +49,7 @@ function callerMatches(returnAddress) {
         return false;
     }
     const offset = returnAddress.sub(module.base).toUInt32();
-    return Math.abs(offset - gameOffset) <= offsetTolerance;
+    return gameOffsets.indexOf(offset) !== -1;
 }
 
 function attachSleep(moduleName) {
@@ -129,8 +132,9 @@ def unavailable_message() -> str:
 
 def _script_source() -> str:
     return (
-        SPEED_BOOST_JS.replace("GAME_OFFSET_PLACEHOLDER", str(GAME_LIBRARY_SLEEP_OFFSET))
-        .replace("OFFSET_TOLERANCE_PLACEHOLDER", str(GAME_LIBRARY_OFFSET_TOLERANCE))
+        SPEED_BOOST_JS.replace("TARGET_MS_PLACEHOLDER", str(TARGET_SLEEP_MS))
+        .replace("REPLACEMENT_MS_PLACEHOLDER", str(REPLACEMENT_SLEEP_MS))
+        .replace("GAME_OFFSETS_PLACEHOLDER", ", ".join(str(offset) for offset in GAME_LIBRARY_SLEEP_OFFSETS))
     )
 
 
@@ -242,9 +246,6 @@ class FolditSpeedBoostManager:
 
     def stop(self, pid: int, fast: bool = True) -> None:
         self.detach(pid, fast=fast)
-
-    def sync_window_state(self, pid: int, is_window_visible: bool) -> None:
-        self.set_enabled(pid, not bool(is_window_visible))
 
     def prune(self, live_pids) -> None:
         live = {int(pid) for pid in live_pids}
