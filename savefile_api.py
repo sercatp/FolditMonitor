@@ -21,7 +21,7 @@ Import examples:
         export_pdb,
     )
 
-    save_path = "C:/Foldit/foldit_scripts/puzzle_2014286_time_1773822868.ir_solution"
+    save_path = "C:/Games/foldit_scripts/puzzle_2014286_time_1773822868.ir_solution"
 
     info = get_basic_info(save_path)
     print(info.player_name)
@@ -35,7 +35,7 @@ Import examples:
     disulfide_info = get_disulfide_info(save_path)
 
     pdb_path = export_pdb(save_path)
-    pdb_path = export_pdb(save_path, "C:/temp/my_model.pdb")
+    pdb_path = export_pdb(save_path, "C:/tmp/my_model.pdb")
 
 Available functions:
     get_basic_info(save_path) -> FolditBasicInfo

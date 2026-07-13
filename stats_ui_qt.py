@@ -653,12 +653,21 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
         self.log_lookup_handler = log_lookup_handler
 
         display_settings = self.settings.get("display", {})
+        row_appearance = display_settings.get("row_appearance", {})
+        if not isinstance(row_appearance, dict):
+            row_appearance = {}
+        copy_source_appearance = row_appearance.get("copy_source", {})
+        idle_appearance = row_appearance.get("idle", {})
+        if not isinstance(copy_source_appearance, dict):
+            copy_source_appearance = {}
+        if not isinstance(idle_appearance, dict):
+            idle_appearance = {}
         self.selected_main_background_color = str(
-            display_settings.get("selected_source_background_color", "#dbeafe")
+            copy_source_appearance.get("background", "#dbeafe")
         )
-        self.idle_main_background_color = str(display_settings.get("idle_background_color", "#f3f4f6"))
-        self.idle_header_background_color = str(display_settings.get("idle_background_color", "#f3f4f6"))
-        self.idle_main_foreground_color = str(display_settings.get("idle_font_color", "#6b7280"))
+        self.idle_main_background_color = str(idle_appearance.get("background", "#f3f4f6"))
+        self.idle_header_background_color = str(idle_appearance.get("background", "#f3f4f6"))
+        self.idle_main_foreground_color = str(idle_appearance.get("foreground", "#6b7280"))
 
         self.clients: List[str] = []
         self.selected_client: Optional[str] = None

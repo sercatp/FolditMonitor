@@ -1,15 +1,20 @@
 import ast
+import json
 import os
 import re
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from logger import FolditLogHandler, LogFileHandler
 from stats_domain import format_score_history, format_score_latest, format_score_line
 from stats_editor import StatsEditorSession
 from stats_module import StatsManager, parse_numeric_score
+from row_appearance import build_row_visual_state, resolve_row_appearance
+from settings import Settings
+from window_manager import enable_native_dpi_awareness
 
 
 DRW_OPEN = """<?xml version="1.0" encoding="UTF-8"?>
@@ -56,6 +61,12 @@ def write_windows_text(path: str, text: str):
 def append_windows_text(path: str, text: str):
     with open(path, "a", encoding="utf-8", newline="\r\n") as f:
         f.write(text)
+
+
+class DpiAwarenessCases(unittest.TestCase):
+    @patch("window_manager.platform.system", return_value="Linux")
+    def test_non_windows_keeps_toolkit_scaling_unchanged(self, _system):
+        self.assertFalse(enable_native_dpi_awareness())
 
 
 def make_logger_settings():
@@ -308,6 +319,91 @@ class PostCopyShortcutCases(unittest.TestCase):
         self.assertEqual(self.get_post_copy_shortcut("1234", None), "ctrl+o")
 
 
+class MonitorRowAppearanceCases(unittest.TestCase):
+    def setUp(self):
+        self.appearance = {
+            "normal": {"foreground": "#000000", "stale_to_foreground": "#2f6c7a"},
+            "idle": {"foreground": "#6b7280"},
+            "stale": {"fade_to_foreground": "#2f6c7a"},
+            "fin": {"foreground": "#315d6d", "stale_to_foreground": "#567f8a"},
+            "visible": {"background": "#ffe1d6"},
+            "focused": {"bold": True},
+            "copy_source": {"background": "#7dd3fc"},
+        }
+        self.build_state = build_row_visual_state
+        self.resolve = lambda state: resolve_row_appearance(state, self.appearance, 8)
+
+    def test_composes_fin_visible_and_focus_without_color_mixing(self):
+        state = self.build_state(is_fin=True, is_visible=True, is_focused=True)
+        self.assertEqual(self.resolve(state), ("bold", "#315d6d", "#ffe1d6"))
+
+    def test_copy_background_overrides_visible_background(self):
+        state = self.build_state(is_visible=True, is_copy_source=True)
+        self.assertEqual(self.resolve(state), ("normal", "#000000", "#7dd3fc"))
+
+    def test_idle_and_stale_use_their_text_priority(self):
+        self.assertEqual(self.resolve(self.build_state(is_idle=True)), ("normal", "#6b7280", None))
+        self.assertEqual(self.resolve(self.build_state(stale_ticks=8)), ("normal", "#2f6c7a", None))
+
+    def test_fin_keeps_its_own_color_when_stale(self):
+        state = self.build_state(is_fin=True, stale_ticks=8)
+        self.assertEqual(self.resolve(state), ("normal", "#567f8a", None))
+
+
+class PaletteConfigurationCases(unittest.TestCase):
+    def test_every_palette_has_complete_row_roles(self):
+        required_roles = {"tree", "normal", "idle", "stale", "fin", "visible", "focused", "copy_source"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(temp_dir)
+            for palette_name in settings.DISPLAY_PALETTES:
+                settings.save_active_display_palette(palette_name)
+                self.assertTrue(required_roles.issubset(settings.ROW_APPEARANCE))
+                self.assertIn("foreground", settings.ROW_APPEARANCE["normal"])
+                self.assertIn("stale_to_foreground", settings.ROW_APPEARANCE["normal"])
+                self.assertIn("foreground", settings.ROW_APPEARANCE["fin"])
+                self.assertIn("stale_to_foreground", settings.ROW_APPEARANCE["fin"])
+
+
+class PublicStarterProfileCases(unittest.TestCase):
+    def test_defaults_keep_the_curated_working_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(temp_dir)
+            defaults = settings.get_default_settings()
+            mapping = defaults["script_type_mapping"]
+
+            self.assertEqual(defaults["launch"]["last_seen_foldit_parent"], "")
+            self.assertEqual(defaults["display"]["window_position"], {"x": 1, "y": 1})
+            self.assertEqual(defaults["display"]["stats_window_position"], {"x": -1, "y": -1})
+            self.assertEqual(defaults["display"]["stats_last_puzzle"], "")
+            self.assertEqual(defaults["display"]["active_palette"], "contrast")
+            self.assertEqual(defaults["display"]["stats_ui_backend"], "pyside6")
+            self.assertEqual(defaults["display"]["stale_tick_limit"], 10_000)
+            self.assertEqual(defaults["network"]["default_address"], "127.0.0.1")
+            self.assertEqual(defaults["network"]["startup_connections"], [])
+            self.assertIn("Remaining time:", defaults["logging"]["exclude_score_strings"])
+            self.assertEqual(
+                {item["column_number"] for item in mapping.values() if item["column_number"] > 0},
+                {10, 20, 30, 50, 80},
+            )
+            self.assertEqual(mapping["cut "]["column_number"], 10)
+            self.assertEqual(mapping["cut and wiggle"]["column_number"], 50)
+            self.assertEqual(mapping["drw"]["state_snapshot_rules"][0]["name"], "serca drw")
+            self.assertEqual(mapping["drw"]["state_snapshot_rules"][1]["name"], "tvdl drw")
+
+    def test_defaults_profile_file_matches_the_first_run_defaults(self):
+        defaults_path = Path(__file__).resolve().parents[1] / "Foldit Monitor.defaults.json"
+        with defaults_path.open(encoding="utf-8") as handle:
+            profile = json.load(handle)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(temp_dir)
+            self.assertEqual(Path(settings.defaults_profile_file), defaults_path)
+            self.assertEqual(profile, settings.get_default_settings())
+            generated_path = Path(temp_dir) / "Foldit Monitor.json"
+            with generated_path.open(encoding="utf-8") as handle:
+                self.assertEqual(profile, json.load(handle))
+
+
 class LoggerRewriteCases(unittest.TestCase):
     def test_closed_drw_then_gab_rewrite_switches_script_type(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -324,7 +420,7 @@ class LoggerRewriteCases(unittest.TestCase):
             self.assertEqual(data["script_type"], "DRW")
             self.assertTrue(data["run_open"])
             self.assertAlmostEqual(data["highest_score"], 4299.941, places=3)
-            self.assertAlmostEqual(data["script_highest_score"], 4299.941, places=3)
+            self.assertNotIn("script_highest_score", data)
 
             write_windows_text(path, DRW_CLOSED)
             self.assertEqual(os.path.getsize(path), 445)
@@ -335,7 +431,6 @@ class LoggerRewriteCases(unittest.TestCase):
             self.assertEqual(data["script_type"], "DRW")
             self.assertFalse(data["run_open"])
             self.assertAlmostEqual(data["highest_score"], 4299.941, places=3)
-            self.assertAlmostEqual(data["script_highest_score"], 4299.941, places=3)
 
             write_windows_text(path, GAB_OPEN)
             self.assertEqual(os.path.getsize(path), 654)
@@ -346,7 +441,6 @@ class LoggerRewriteCases(unittest.TestCase):
             self.assertEqual(data["script_type"], "GAB")
             self.assertTrue(data["run_open"])
             self.assertAlmostEqual(data["highest_score"], 4299.942, places=3)
-            self.assertAlmostEqual(data["script_highest_score"], 4299.942, places=3)
             self.assertEqual(
                 handler.consume_stats_events(),
                 [
@@ -407,7 +501,6 @@ class LoggerRewriteCases(unittest.TestCase):
             self.assertEqual(data["script_name"], "-Serca DRW 2.1.112")
             self.assertTrue(data["run_open"])
             self.assertAlmostEqual(data["highest_score"], 4300.5, places=3)
-            self.assertAlmostEqual(data["script_highest_score"], 4300.5, places=3)
             self.assertEqual(data["script_change_token"], 1)
             self.assertEqual(
                 handler.consume_stats_events(),
@@ -420,6 +513,25 @@ class LoggerRewriteCases(unittest.TestCase):
                     }
                 ],
             )
+
+    def test_highest_score_is_not_limited_by_log_tail_size(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "scriptlog.default.xml")
+            settings = make_logger_settings()
+            settings["MAX_LINES"] = 3
+            settings["tooltip_lines"] = 3
+            write_windows_text(
+                path,
+                DRW_OPEN
+                + "first peak 5000.0\n"
+                + "later score 4100.0\n" * 8,
+            )
+
+            handler = LogFileHandler(settings, path)
+            handler._update_data()
+
+            self.assertAlmostEqual(handler.get_data()["highest_score"], 5000.0, places=3)
+            self.assertLessEqual(len(handler._tail_lines), 3)
 
 
 class LoggerBootstrapCases(unittest.TestCase):

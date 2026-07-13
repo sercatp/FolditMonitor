@@ -1,13 +1,23 @@
 import os
 import json
 import re
+import sys
 from copy import deepcopy
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 class Settings:
     def __init__(self, root_path: str):
         self.root_path = root_path
         self.settings_file = os.path.join(root_path, "Foldit Monitor.json")
+        self.bundled_resource_root = getattr(
+            sys,
+            "_MEIPASS",
+            os.path.dirname(os.path.abspath(__file__)),
+        )
+        self.defaults_profile_file = os.path.join(
+            self.bundled_resource_root,
+            "Foldit Monitor.defaults.json",
+        )
         self.user_settings: Dict[str, Any] = {}
         self.non_merged_paths = {('script_type_mapping',)}
         
@@ -26,102 +36,194 @@ class Settings:
         self.CHECK_INTERVAL = 2
         self.MONITOR_DURATION = 60
         self.HIGH_CPU_THRESHOLD = 60
-        self.LOW_CPU_THRESHOLD = 15
+        self.LOW_CPU_THRESHOLD = 7
         self.SCRIPT_EXCLUSIONS = ["c-w", "other_script_name"]
         self.BACKUP_FOLDER_NAME = "foldit_backup"
         self.SAVE_TO_BACKUP = True
         self.INACTIVE_PROCESS_PREFIX = "- "
-        self.STALE_TICK_LIMIT = 100
-        self.DISPLAY_COLOR_KEYS = (
-            "normal_font_color",
-            "idle_font_color",
-            "stale_font_color",
-            "idle_background_color",
-            "mismatch_background_color",
-            "selected_source_background_color",
+        self.STALE_TICK_LIMIT = 10_000
+        self.ROW_APPEARANCE_STATES = (
+            "normal",
+            "idle",
+            "stale",
+            "fin",
+            "visible",
+            "focused",
+            "copy_source",
         )
         self.DISPLAY_PALETTE_ALIASES = {
             "warm": "balanced",
             "classic": "balanced",
             "olive": "cool",
             "copper": "contrast",
+            "night": "dark",
         }
         self.DISPLAY_PALETTES = {
             "balanced": {
-                "normal_font_color": "#000000",
-                "idle_font_color": "#6b7280",
-                "stale_font_color": "#6f5d4a",
-                "idle_background_color": "#f3f4f6",
-                "mismatch_background_color": "#fde8e8",
-                "selected_source_background_color": "#dbeafe",
+                "tree": {
+                    "background": "#ffffff",
+                    "heading_background": "#f3f4f6",
+                    "heading_foreground": "#111827",
+                },
+                "normal": {"foreground": "#111827", "stale_to_foreground": "#8d969d"},
+                "idle": {"foreground": "#6b7280"},
+                "stale": {"fade_to_foreground": "#8d969d"},
+                "fin": {"foreground": "#0f766e", "stale_to_foreground": "#76a69f"},
+                "visible": {"background": "#fff1f2"},
+                "focused": {"bold": True},
+                "copy_source": {"background": "#bfdbfe"},
             },
             "cool": {
-                "normal_font_color": "#000000",
-                "idle_font_color": "#64748b",
-                "stale_font_color": "#4f6b8a",
-                "idle_background_color": "#eef4f8",
-                "mismatch_background_color": "#fee2e2",
-                "selected_source_background_color": "#d6e9ff",
+                "tree": {
+                    "background": "#f8fbff",
+                    "heading_background": "#e8f0fa",
+                    "heading_foreground": "#1e3a5f",
+                },
+                "normal": {"foreground": "#172033", "stale_to_foreground": "#8998a8"},
+                "idle": {"foreground": "#64748b"},
+                "stale": {"fade_to_foreground": "#8998a8"},
+                "fin": {"foreground": "#0e7490", "stale_to_foreground": "#79b8c8"},
+                "visible": {"background": "#e0e7ff", "italic": True},
+                "focused": {"bold": True},
+                "copy_source": {"background": "#fde68a"},
             },
             "contrast": {
-                "normal_font_color": "#000000",
-                "idle_font_color": "#4b5563",
-                "stale_font_color": "#8a5a3b",
-                "idle_background_color": "#e5e7eb",
-                "mismatch_background_color": "#f8d2d9",
-                "selected_source_background_color": "#bfdbfe",
+                "tree": {
+                    "background": "#fffdf9",
+                    "heading_background": "#f5e9dd",
+                    "heading_foreground": "#3c2415",
+                },
+                "normal": {"foreground": "#171717", "stale_to_foreground": "#927667"},
+                "idle": {"foreground": "#77816b"},
+                "stale": {"fade_to_foreground": "#927667"},
+                "fin": {"foreground": "#7c3aed", "stale_to_foreground": "#b39ae5"},
+                "visible": {"background": "#fecaca"},
+                "focused": {"bold": True},
+                "copy_source": {"background": "#93c5fd"},
             },
             "signal": {
-                "normal_font_color": "#000000",
-                "idle_font_color": "#6b7280",
-                "stale_font_color": "#2f6c7a",
-                "idle_background_color": "#f0f4f5",
-                "mismatch_background_color": "#ffe1d6",
-                "selected_source_background_color": "#d7f0ff",
+                "tree": {
+                    "background": "#ffffff",
+                    "heading_background": "#eef2f7",
+                    "heading_foreground": "#111827",
+                },
+                "normal": {"foreground": "#111827", "stale_to_foreground": "#98a0a8"},
+                "idle": {"foreground": "#64748b"},
+                "stale": {"fade_to_foreground": "#98a0a8"},
+                "fin": {"foreground": "#0284c7", "stale_to_foreground": "#8bc5e5"},
+                "visible": {"background": "#ffe1d6"},
+                "focused": {"bold": True},
+                "copy_source": {"background": "#7dd3fc"},
+            },
+            "marked": {
+                "tree": {
+                    "background": "#fffbeb",
+                    "heading_background": "#fef3c7",
+                    "heading_foreground": "#78350f",
+                },
+                "normal": {"foreground": "#1f2937", "stale_to_foreground": "#9ca3af"},
+                "idle": {"foreground": "#6b7280"},
+                "stale": {"fade_to_foreground": "#9ca3af"},
+                "fin": {
+                    "foreground": "#b45309",
+                    "stale_to_foreground": "#d6a66e",
+                    "italic": True,
+                },
+                "visible": {"background": "#fde68a"},
+                "focused": {"bold": True},
+                "copy_source": {"background": "#ddd6fe"},
+            },
+            "dark": {
+                "tree": {
+                    "background": "#172033",
+                    "heading_background": "#0f172a",
+                    "heading_foreground": "#e5e7eb",
+                },
+                "normal": {
+                    "foreground": "#e5e7eb",
+                    "background": "#172033",
+                    "stale_to_foreground": "#708093",
+                },
+                "idle": {"foreground": "#718096"},
+                "stale": {"fade_to_foreground": "#708093"},
+                "fin": {"foreground": "#38bdf8", "stale_to_foreground": "#78b5d1"},
+                "visible": {"background": "#4a2530"},
+                "focused": {"bold": True},
+                "copy_source": {"foreground": "#e0f2fe", "background": "#164e63"},
             },
         }
-        self.DEFAULT_DISPLAY_PALETTE = "balanced"
+        self.DEFAULT_DISPLAY_PALETTE = "contrast"
         default_palette = self.DISPLAY_PALETTES[self.DEFAULT_DISPLAY_PALETTE]
-        self.NORMAL_FONT_COLOR = default_palette["normal_font_color"]
-        self.IDLE_FONT_COLOR = default_palette["idle_font_color"]
-        self.STALE_FONT_COLOR = default_palette["stale_font_color"]
-        self.IDLE_BACKGROUND_COLOR = default_palette["idle_background_color"]
-        self.MISMATCH_BACKGROUND_COLOR = default_palette["mismatch_background_color"]
-        self.SELECTED_SOURCE_BACKGROUND_COLOR = default_palette["selected_source_background_color"]
-        self.IDLE_STALE_BACKGROUND_COLOR = self.IDLE_BACKGROUND_COLOR
-        # Backward-compatible aliases for legacy code paths.
-        self.INACTIVE_ROW_FOREGROUND = self.IDLE_FONT_COLOR
-        self.INACTIVE_ROW_BACKGROUND = self.IDLE_STALE_BACKGROUND_COLOR
+        self.ROW_APPEARANCE = deepcopy(default_palette)
         self.MAX_LINE_LENGTH = 100
         self.SCRIPT_TYPE_FALLBACK_MAX_LENGTH = 10
-        self.STATS_UI_BACKEND = "tk"
+        self.STATS_UI_BACKEND = "pyside6"
         self.STATS_LAST_PUZZLE = ""
 
-        # Словари и списки по умолчанию
+        # Публичный стартовый профиль. Он сохраняет рабочие распознавания
+        # скриптов, но раскрывает только часть фиксированной FIN-раскладки:
+        # 20/30/50/80. Пара c-w остаётся без изменений (10/50); остальные
+        # скрипты создают динамические колонки.
         self.SCRIPT_TYPE_MAPPING = {
-            "ideali": {"name": "Microidealize", "column_number": 1},
-            "jet": {"name": "JET", "column_number": 1},
-            "with cuts": {"name": "Cuts", "column_number": 1},
-            "_cut": {"name": "Cuts", "column_number": 1},
+            "Deep Shake": {"name": "Deep Shake", "column_number": 30},
+            "hinge": {"name": "Hinge", "column_number": 0},
+            "ideali": {"name": "Midealize", "column_number": 0},
+            "jet": {"name": "JET", "column_number": 0},
+            "with cuts": {"name": "Cuts", "column_number": 0},
+            "_cut": {"name": "Cuts", "column_number": 0},
+            "cut and wiggle": {"name": "c-w", "column_number": 50},
+            "cut and close": {"name": "c-c", "column_number": 0},
+            "__gap20__": {"name": "", "column_number": 20},
             "gab": {"name": "GAB", "column_number": 0},
             "helix": {"name": "Helix", "column_number": 0},
-            "cut ": {"name": "c-w", "column_number": 1},
-            "worm": {"name": "Worm", "column_number": 1},
-            "drw": {"name": "DRW", "column_number": 0},
-            "bwp": {"name": "bwp", "column_number": 1},
-            "sidechain": {"name": "Sidechain", "column_number": 1},
+            "cut ": {"name": "c-w", "column_number": 10},
+            "worm": {"name": "Worm", "column_number": 80},
+            "bwp": {"name": "bwp", "column_number": 80},
+            "sidechain": {"name": "Sidechain", "column_number": 30},
+            "drw": {
+                "name": "DRW",
+                "column_number": 0,
+                "state_snapshot_rules": [
+                    {
+                        "name": "serca drw",
+                        "detector": ["#", "segs:", "Score"],
+                        "extractors": [
+                            {"name": "task_id", "find_after": "#", "find_before": " "},
+                            {"name": "f_value", "find_after": " F", "find_before": "."},
+                        ],
+                        "stats_mapping": {"script": "task_id", "score": "f_value"},
+                    },
+                    {
+                        "name": "tvdl drw",
+                        "detector": ["times.", "Wait", "score"],
+                        "extractors": [
+                            {
+                                "name": "task_id_tvdl",
+                                "find_after": "DR ",
+                                "find_before": " ",
+                            },
+                        ],
+                        "stats_mapping": {"script": "task_id_tvdl"},
+                    },
+                ],
+            },
+            "barrel": {"name": "Barrel", "column_number": 0},
             "prediction": {"name": "prediction", "column_number": 0},
             "rebuild": {"name": "Rebuild", "column_number": 0},
             "zz1": {"name": "Rebuild_loc", "column_number": 0},
             "defuze": {"name": "Defuze", "column_number": 0},
             "assembly": {"name": "Assembly", "column_number": 0},
-            "hinge": {"name": "Hinge", "column_number": 1},
             "quake": {"name": "Quake", "column_number": 0},
             "remix": {"name": "Remix", "column_number": 0},
-            "ligand": {"name": "Ligand", "column_number": 0}
+            "ligand": {"name": "Ligand", "column_number": 0},
         }
         
-        self.EXCLUSION_CRITERIA = ["Group rank", "ignore other score string"]
+        self.EXCLUSION_CRITERIA = [
+            "Group rank",
+            "a0.txt Apr 7 2022",
+            "Remaining time:",
+            "ignore other score string",
+        ]
         
         # Score patterns to detect score string in the log file. Checks each of these elements sequentially.
         self.SCORE_PATTERNS = [
@@ -137,7 +239,27 @@ class Settings:
         self.update_globals()
 
     def get_default_settings(self) -> Dict[str, Any]:
-        """Возвращает словарь настроек по умолчанию"""
+        """Return the bundled public profile, or a minimal code fallback."""
+        profile = self._load_defaults_profile()
+        if profile is not None:
+            return profile
+        return self._get_builtin_default_settings()
+
+    def _load_defaults_profile(self) -> Optional[Dict[str, Any]]:
+        try:
+            with open(self.defaults_profile_file, "r", encoding="utf-8") as handle:
+                profile = json.load(handle)
+            if not isinstance(profile, dict):
+                raise ValueError("Settings profile root must be a JSON object.")
+            return profile
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            print(f"Could not load default settings profile: {error}")
+            return None
+
+    def _get_builtin_default_settings(self) -> Dict[str, Any]:
+        """Fallback for an incomplete installation without the bundled profile."""
         return {
             "launch": {
                 "last_seen_foldit_parent": ""
@@ -226,7 +348,6 @@ class Settings:
             self.user_settings = deepcopy(default_settings)
             should_initialize_file = True
 
-        should_initialize_file = self._migrate_display_color_settings() or should_initialize_file
         should_initialize_file = self._migrate_stats_ui_backend_setting() or should_initialize_file
 
         effective_settings = deepcopy(self.user_settings)
@@ -238,68 +359,6 @@ class Settings:
 
         return effective_settings
 
-    def _migrate_display_color_settings(self) -> bool:
-        """Normalize row color settings and migrate to palette-based display settings."""
-        display_settings = self.user_settings.get("display")
-        if not isinstance(display_settings, dict):
-            return False
-
-        changed = False
-        color_mappings = (
-            ("idle_font_color", "inactive_row_foreground", self.IDLE_FONT_COLOR),
-            (
-                "idle_background_color",
-                "inactive_row_background",
-                self.IDLE_BACKGROUND_COLOR,
-            ),
-            (
-                "idle_background_color",
-                "idle_stale_background_color",
-                self.IDLE_BACKGROUND_COLOR,
-            ),
-        )
-
-        for new_key, legacy_key, default_value in color_mappings:
-            if new_key not in display_settings:
-                display_settings[new_key] = display_settings.get(legacy_key, default_value)
-                changed = True
-            if legacy_key in display_settings:
-                del display_settings[legacy_key]
-                changed = True
-        if "highlight_color" in display_settings:
-            del display_settings["highlight_color"]
-            changed = True
-
-        palette_name = display_settings.get("active_palette")
-        if palette_name is None:
-            palette_name = self._detect_display_palette(display_settings)
-            display_settings["active_palette"] = palette_name
-            changed = True
-        else:
-            normalized_name = self._normalize_display_palette(palette_name)
-            if normalized_name != palette_name:
-                display_settings["active_palette"] = normalized_name
-                changed = True
-            palette_name = normalized_name
-
-        if "stale_tick_limit" not in display_settings:
-            display_settings["stale_tick_limit"] = self.STALE_TICK_LIMIT
-            changed = True
-
-        if palette_name == "custom":
-            custom_defaults = self.DISPLAY_PALETTES[self.DEFAULT_DISPLAY_PALETTE]
-            for key in self.DISPLAY_COLOR_KEYS:
-                if key not in display_settings:
-                    display_settings[key] = custom_defaults[key]
-                    changed = True
-        else:
-            for key in self.DISPLAY_COLOR_KEYS:
-                if key in display_settings:
-                    del display_settings[key]
-                    changed = True
-
-        return changed
-
     def _normalize_display_palette(self, palette_name: Any) -> str:
         palette_text = str(palette_name).strip().lower()
         palette_text = self.DISPLAY_PALETTE_ALIASES.get(palette_text, palette_text)
@@ -308,21 +367,6 @@ class Settings:
         if palette_text in self.DISPLAY_PALETTES:
             return palette_text
         return self.DEFAULT_DISPLAY_PALETTE
-
-    def _detect_display_palette(self, display_settings: Dict[str, Any]) -> str:
-        explicit_colors = {
-            key: display_settings[key]
-            for key in self.DISPLAY_COLOR_KEYS
-            if key in display_settings
-        }
-        if not explicit_colors:
-            return self.DEFAULT_DISPLAY_PALETTE
-
-        for palette_name, palette_colors in self.DISPLAY_PALETTES.items():
-            if all(explicit_colors.get(key, palette_colors[key]) == palette_colors[key] for key in self.DISPLAY_COLOR_KEYS):
-                return palette_name
-
-        return "custom"
 
     def _apply_display_palette(self, settings_dict: Dict[str, Any]) -> None:
         display_settings = settings_dict.get("display")
@@ -334,15 +378,16 @@ class Settings:
         )
         display_settings["active_palette"] = palette_name
 
+        palette = deepcopy(self.DISPLAY_PALETTES[self.DEFAULT_DISPLAY_PALETTE])
         if palette_name == "custom":
-            palette_colors = {
-                key: display_settings.get(key, self.DISPLAY_PALETTES[self.DEFAULT_DISPLAY_PALETTE][key])
-                for key in self.DISPLAY_COLOR_KEYS
-            }
+            custom_appearance = display_settings.get("row_appearance", {})
+            if isinstance(custom_appearance, dict):
+                self._apply_defaults(custom_appearance, palette)
+                palette = custom_appearance
         else:
-            palette_colors = deepcopy(self.DISPLAY_PALETTES[palette_name])
+            palette = deepcopy(self.DISPLAY_PALETTES[palette_name])
 
-        display_settings.update(palette_colors)
+        display_settings["row_appearance"] = palette
 
     def _normalize_stats_ui_backend(self, backend_name: Any) -> str:
         backend_text = str(backend_name).strip().lower()
@@ -396,6 +441,16 @@ class Settings:
         with open(self.settings_file, 'w', encoding='utf-8') as f:
             json.dump(self.user_settings, f, indent=4, ensure_ascii=False)
 
+    def _resolve_runtime_or_bundled_file(self, file_name: Any) -> str:
+        clean_file_name = str(file_name or "").strip()
+        if os.path.isabs(clean_file_name):
+            return clean_file_name
+
+        runtime_path = os.path.join(self.root_path, clean_file_name)
+        if os.path.exists(runtime_path) or not getattr(sys, "frozen", False):
+            return runtime_path
+        return os.path.join(self.bundled_resource_root, clean_file_name)
+
     def update_globals(self):
         """Обновляет глобальные переменные из загруженных настроек"""
         self.LAST_SEEN_FOLDIT_PARENT = self.settings['launch'].get('last_seen_foldit_parent', '')
@@ -426,17 +481,13 @@ class Settings:
         self.BACKUP_FOLDER_NAME = self.settings['backup']['folder_name']
         self.SAVE_TO_BACKUP = self.settings['backup']['save_to_backup']
         self.SCRIPT_TYPE_MAPPING = self.settings['script_type_mapping']
-        self.sound_file = os.path.join(self.root_path, self.settings['sound']['alert_file'])
+        self.sound_file = self._resolve_runtime_or_bundled_file(
+            self.settings['sound']['alert_file']
+        )
         self.ACTIVE_DISPLAY_PALETTE = self.settings['display']['active_palette']
-        self.NORMAL_FONT_COLOR = self.settings['display']['normal_font_color']
-        self.IDLE_FONT_COLOR = self.settings['display']['idle_font_color']
-        self.STALE_FONT_COLOR = self.settings['display']['stale_font_color']
-        self.IDLE_BACKGROUND_COLOR = self.settings['display']['idle_background_color']
-        self.MISMATCH_BACKGROUND_COLOR = self.settings['display']['mismatch_background_color']
-        self.SELECTED_SOURCE_BACKGROUND_COLOR = self.settings['display']['selected_source_background_color']
+        self.ROW_APPEARANCE = deepcopy(self.settings['display']['row_appearance'])
         self.STATS_UI_BACKEND = self.settings['display'].get('stats_ui_backend', self.STATS_UI_BACKEND)
         self.STATS_LAST_PUZZLE = str(self.settings['display'].get('stats_last_puzzle', self.STATS_LAST_PUZZLE)).strip()
-        self.IDLE_STALE_BACKGROUND_COLOR = self.IDLE_BACKGROUND_COLOR
         try:
             self.STALE_TICK_LIMIT = max(1, int(self.settings['display'].get('stale_tick_limit', self.STALE_TICK_LIMIT)))
         except (TypeError, ValueError):
@@ -446,8 +497,6 @@ class Settings:
         self.HIGH_CPU_THRESHOLD = self.settings.get('high_cpu_threshold', self.HIGH_CPU_THRESHOLD)
         self.LOW_CPU_THRESHOLD = self.settings.get('low_cpu_threshold', self.LOW_CPU_THRESHOLD)
         self.INACTIVE_PROCESS_PREFIX = self.settings.get('inactive_process_prefix', self.INACTIVE_PROCESS_PREFIX)
-        self.INACTIVE_ROW_FOREGROUND = self.IDLE_FONT_COLOR
-        self.INACTIVE_ROW_BACKGROUND = self.IDLE_STALE_BACKGROUND_COLOR
         self.MAX_LINE_LENGTH = self.settings['logging']['max_line_length']
 
         # Lower-case aliases kept for legacy callers.
@@ -466,17 +515,9 @@ class Settings:
         self.save_to_backup = self.SAVE_TO_BACKUP
         self.script_type_mapping = self.SCRIPT_TYPE_MAPPING
         self.active_display_palette = self.ACTIVE_DISPLAY_PALETTE
-        self.normal_font_color = self.NORMAL_FONT_COLOR
-        self.idle_font_color = self.IDLE_FONT_COLOR
-        self.stale_font_color = self.STALE_FONT_COLOR
-        self.idle_background_color = self.IDLE_BACKGROUND_COLOR
-        self.mismatch_background_color = self.MISMATCH_BACKGROUND_COLOR
-        self.selected_source_background_color = self.SELECTED_SOURCE_BACKGROUND_COLOR
+        self.row_appearance = self.ROW_APPEARANCE
         self.stats_ui_backend = self.STATS_UI_BACKEND
-        self.idle_stale_background_color = self.IDLE_STALE_BACKGROUND_COLOR
         self.stale_tick_limit = self.STALE_TICK_LIMIT
-        self.inactive_row_foreground = self.INACTIVE_ROW_FOREGROUND
-        self.inactive_row_background = self.INACTIVE_ROW_BACKGROUND
         self.check_interval = self.CHECK_INTERVAL
         self.monitor_duration = self.MONITOR_DURATION
         self.high_cpu_threshold = self.HIGH_CPU_THRESHOLD
@@ -504,11 +545,6 @@ class Settings:
         """Persist the selected display palette and refresh effective settings."""
         normalized_name = self._normalize_display_palette(palette_name)
         self._set_nested_value(self.user_settings, ('display', 'active_palette'), normalized_name)
-        if normalized_name != "custom":
-            display_settings = self.user_settings.get('display', {})
-            if isinstance(display_settings, dict):
-                for key in self.DISPLAY_COLOR_KEYS:
-                    display_settings.pop(key, None)
 
         self.settings = deepcopy(self.user_settings)
         self._apply_defaults(self.settings, self.get_default_settings())

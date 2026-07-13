@@ -8,7 +8,8 @@ __pycache__/
 venv/
 env/
 
-# Local runtime settings and generated data
+# Local runtime settings and generated data.
+# Foldit Monitor.defaults.json is the tracked first-run profile.
 Foldit Monitor.json
 logs/
 puzzle_logs/
@@ -20,6 +21,12 @@ _remote/
 *.etl
 *.pdb
 *.part
+
+# PyInstaller output
+/build/
+/dist/
+/release/
+/FolditMonitor.spec
 
 # OS/editor noise
 .DS_Store

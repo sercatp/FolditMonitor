@@ -4,9 +4,20 @@
 import psutil
 import time
 import os
+import sys
 # pygame is imported lazily inside the sound helpers below: its SDL init costs ~1s,
 # and it is only needed when an alarm actually plays, never on the startup path.
 from collections import defaultdict, deque
+from window_manager import (
+    WindowManager,
+    create_ribbon_icon,
+    enable_native_dpi_awareness,
+    open_file,
+    open_folder,
+)
+
+enable_native_dpi_awareness()
+
 import tkinter as tk
 from tkinter import ttk, font, messagebox
 import threading
@@ -31,12 +42,20 @@ from network import (
     sanitize_artifact_filename,
 )
 from log_lookup import find_matching_log_file, values_match_log_query
-from window_manager import WindowManager, open_folder, open_file, create_ribbon_icon
 from settings import Settings
 from tooltip import TooltipWindow
 from logger import FolditLogHandler
 from foldit_speed_boost_integration import FolditSpeedBoostIntegration
 from stats_module import StatsManager, parse_numeric_score
+from row_appearance import (
+    ROW_APPEARANCE_TAG_PREFIX,
+    build_appearance_tag,
+    build_row_visual_state,
+    get_appearance_profile as get_palette_appearance_profile,
+    is_row_appearance_tag,
+    parse_appearance_tag,
+    resolve_row_appearance as resolve_palette_row_appearance,
+)
 from stats_ui import (
     close_stats_window_if_exists,
     get_open_stats_window,
@@ -50,8 +69,12 @@ except Exception as e:
     get_basic_info = None
     print(f"savefile_api unavailable: {e}")
 
-# Define the root path and settings manager
-root_path = os.path.dirname(os.path.abspath(__file__))
+# Keep mutable data beside a packaged EXE. PyInstaller extracts code to a
+# temporary directory, which is not suitable for settings, logs, or backups.
+if getattr(sys, "frozen", False):
+    root_path = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    root_path = os.path.dirname(os.path.abspath(__file__))
 settings_manager = Settings(root_path)
 stats_manager = StatsManager(root_path, settings_manager.settings)
 
@@ -87,11 +110,12 @@ def is_ui_interacting():
     )
 
 normal_font = None
-bold_font = None 
+bold_font = None
 italic_font = None
-tooltip_font = None  
+bold_italic_font = None
+tooltip_font = None
 def init_fonts():
-    global normal_font, bold_font, italic_font, tooltip_font
+    global normal_font, bold_font, italic_font, bold_italic_font, tooltip_font
     family = settings_manager.settings['display']['fonts']['family']
     size = settings_manager.settings['display']['fonts']['normal_size']
     tooltip_size = settings_manager.settings['display']['fonts']['tooltip_size']
@@ -99,6 +123,7 @@ def init_fonts():
     normal_font = font.Font(family=family, size=size)
     bold_font = font.Font(family=family, size=size, weight="bold")
     italic_font = font.Font(family=family, size=size, slant="italic")
+    bold_italic_font = font.Font(family=family, size=size, weight="bold", slant="italic")
     tooltip_font = font.Font(family=family, size=tooltip_size)
 
 backup_folder_name = "foldit_backup"
@@ -132,7 +157,6 @@ logs_menu = None
 all_clients_menu = None
 palette_menu = None
 palette_var = None
-ROW_APPEARANCE_TAG_PREFIX = 'appearance_'
 row_appearance_tags = set()
 
 
@@ -253,7 +277,7 @@ def build_remote_artifact(kind, row_id, address, connection_id):
         log_data = foldit_log_handler.get_fresh_data(script_path)
         if log_data:
             row["script_type"] = log_data.get("script_type") or row.get("script_type")
-            score = log_data.get("highest_score") or log_data.get("script_highest_score")
+            score = log_data.get("highest_score")
             row["score"] = str(score).split(".")[0] if score is not None else row.get("score")
 
         return {
@@ -343,10 +367,6 @@ def get_post_copy_shortcut(source_puzzle_id, target_puzzle_id):
     return "ctrl+o"
 
 
-def clamp(value, minimum, maximum):
-    return max(minimum, min(maximum, value))
-
-
 def format_client_column_value(folder_name):
     return re.sub(r'foldit', 'f', str(folder_name), flags=re.IGNORECASE)
 
@@ -376,10 +396,7 @@ def get_known_client_log_roots(client_name):
 def _score_from_log_data(log_data):
     if not log_data:
         return None
-    score = log_data.get("highest_score")
-    if score is None:
-        score = log_data.get("script_highest_score")
-    return score
+    return log_data.get("highest_score")
 
 
 def export_matching_live_log(query, open_after=False):
@@ -407,40 +424,35 @@ def export_matching_live_log(query, open_after=False):
     return None
 
 
-def parse_hex_color(color_value):
-    clean = str(color_value).strip()
-    if not re.fullmatch(r"#[0-9a-fA-F]{6}", clean):
-        return None
-    return tuple(int(clean[idx:idx + 2], 16) for idx in (1, 3, 5))
+def get_appearance_profile(state_name):
+    return get_palette_appearance_profile(settings_manager.ROW_APPEARANCE, state_name)
 
 
-def blend_hex_colors(start_color, end_color, ratio):
-    start_rgb = parse_hex_color(start_color)
-    end_rgb = parse_hex_color(end_color)
-    if start_rgb is None or end_rgb is None:
-        return end_color if ratio >= 1.0 else start_color
+def apply_treeview_palette():
+    """Apply the palette's non-row Treeview surface colors."""
+    tree_profile = get_appearance_profile('tree')
+    normal_profile = get_appearance_profile('normal')
+    foreground = normal_profile.get('foreground') or '#000000'
+    background = (
+        tree_profile.get('background')
+        or normal_profile.get('background')
+        or '#ffffff'
+    )
+    heading_background = tree_profile.get('heading_background') or background
+    heading_foreground = tree_profile.get('heading_foreground') or foreground
 
-    ratio = clamp(float(ratio), 0.0, 1.0)
-    channels = [
-        round(start + (end - start) * ratio)
-        for start, end in zip(start_rgb, end_rgb)
-    ]
-    return "#{:02x}{:02x}{:02x}".format(*channels)
-
-
-def get_score_fade_ratio(stale_ticks):
-    tick_limit = max(1, int(settings_manager.STALE_TICK_LIMIT))
-    return clamp(stale_ticks / tick_limit, 0.0, 1.0)
-
-
-def is_row_appearance_tag(tag):
-    return isinstance(tag, str) and tag.startswith(ROW_APPEARANCE_TAG_PREFIX)
-
-
-def encode_appearance_color(color_value):
-    if not color_value:
-        return 'none'
-    return str(color_value).strip().lower().lstrip('#')
+    style = ttk.Style()
+    style.configure(
+        'Treeview',
+        foreground=foreground,
+        background=background,
+        fieldbackground=background,
+    )
+    style.configure(
+        'Treeview.Heading',
+        background=heading_background,
+        foreground=heading_foreground,
+    )
 
 
 def update_score_stale_ticks(process_state, is_idle, score_value, script_change_token):
@@ -476,43 +488,17 @@ def update_score_stale_ticks(process_state, is_idle, score_value, script_change_
     return stale_ticks
 
 
-def resolve_row_appearance(
-    base_foreground,
-    is_window_visible,
-    is_idle,
-    has_score_mismatch,
-    is_selected_source,
-    stale_ticks,
-):
-    font_key = 'bold' if is_window_visible else 'normal'
-    foreground = settings_manager.IDLE_FONT_COLOR if is_idle else base_foreground
-    fade_ratio = get_score_fade_ratio(stale_ticks)
-    if not is_idle and fade_ratio > 0.0:
-        foreground = blend_hex_colors(
-            base_foreground,
-            settings_manager.STALE_FONT_COLOR,
-            fade_ratio,
-        )
-
-    background = None
-    if is_selected_source:
-        background = settings_manager.SELECTED_SOURCE_BACKGROUND_COLOR
-    elif is_idle:
-        background = settings_manager.IDLE_BACKGROUND_COLOR
-    elif has_score_mismatch:
-        background = settings_manager.MISMATCH_BACKGROUND_COLOR
-
-    return font_key, foreground, background
-
-
 def ensure_row_appearance_tag(treeview, font_key, foreground, background):
-    tag_name = (
-        f"{ROW_APPEARANCE_TAG_PREFIX}"
-        f"{font_key}_{encode_appearance_color(foreground)}_{encode_appearance_color(background)}"
-    )
+    tag_name = build_appearance_tag(font_key, foreground, background)
     if tag_name not in row_appearance_tags:
+        fonts_by_key = {
+            'normal': normal_font,
+            'bold': bold_font,
+            'italic': italic_font,
+            'bold_italic': bold_italic_font,
+        }
         tag_options = {
-            'font': bold_font if font_key == 'bold' else normal_font,
+            'font': fonts_by_key.get(font_key, normal_font),
         }
         if foreground:
             tag_options['foreground'] = foreground
@@ -523,31 +509,19 @@ def ensure_row_appearance_tag(treeview, font_key, foreground, background):
     return tag_name
 
 
-def build_row_appearance_tag(
-    treeview,
-    base_foreground,
-    is_window_visible,
-    is_idle,
-    has_score_mismatch,
-    is_selected_source,
-    stale_ticks,
-):
-    appearance = resolve_row_appearance(
-        base_foreground=base_foreground,
-        is_window_visible=is_window_visible,
-        is_idle=is_idle,
-        has_score_mismatch=has_score_mismatch,
-        is_selected_source=is_selected_source,
-        stale_ticks=stale_ticks,
+def build_row_appearance_tag(treeview, row_state):
+    appearance = resolve_palette_row_appearance(
+        row_state,
+        settings_manager.ROW_APPEARANCE,
+        settings_manager.STALE_TICK_LIMIT,
     )
     return ensure_row_appearance_tag(treeview, *appearance)
 
 
-def apply_row_appearance(item_id, base_foreground=None):
+def apply_row_appearance(item_id):
     if not process_tree.exists(item_id):
         return
 
-    base_foreground = base_foreground or settings_manager.NORMAL_FONT_COLOR
     tags = [
         tag for tag in process_tree.item(item_id, 'tags')
         if not is_row_appearance_tag(tag)
@@ -561,12 +535,14 @@ def apply_row_appearance(item_id, base_foreground=None):
 
     appearance_tag = build_row_appearance_tag(
         process_tree,
-        base_foreground=base_foreground,
-        is_window_visible='active_window' in tags,
-        is_idle='idle_window' in tags,
-        has_score_mismatch='score_mismatch' in tags,
-        is_selected_source='selected_source' in tags,
-        stale_ticks=stale_ticks,
+        build_row_visual_state(
+            is_idle='idle_window' in tags,
+            is_visible='visible_window' in tags,
+            is_focused='focused_window' in tags,
+            is_fin='fin_state' in tags,
+            is_copy_source='copy_source' in tags,
+            stale_ticks=stale_ticks,
+        )
     )
     tags.append(appearance_tag)
     process_tree.item(item_id, tags=tags)
@@ -621,8 +597,7 @@ def update_process_list():
     clients = get_foldit_clients()
     update_process_cpu_usage(clients)
     
-    # Capture selected folders up front so we can keep the selection tag during
-    # the refresh instead of removing and restoring it after the repaint.
+    # Capture the source folder up front so its visual state survives the refresh.
     existing_items = set(process_tree.get_children())
     selected_folder_order = []
     for item in selected_rows:
@@ -631,10 +606,11 @@ def update_process_list():
         folder_tag = get_folder_tag(process_tree.item(item, 'tags'))
         if folder_tag and folder_tag not in selected_folder_order:
             selected_folder_order.append(folder_tag)
-    selected_folders = set(selected_folder_order)
+    copy_source_folder = selected_folder_order[0] if selected_folder_order else None
     current_selected_items = {}
     current_items = set()
     current_artifact_rows = {}
+    stats_targets_by_puzzle = {}
     speed_boost_states = {
         int(client.pid): {
             "pid": int(client.pid),
@@ -644,9 +620,6 @@ def update_process_list():
         }
         for client in clients
     }
-    
-    default_row_foreground = settings_manager.NORMAL_FONT_COLOR
-    ttk.Style().configure('Treeview', foreground=default_row_foreground)
     
     for client in clients:
         try:
@@ -669,11 +642,9 @@ def update_process_list():
 
             score_display = ""
             highest_score = None
-            script_highest_score = None
             script_type = ""
             script_change_token = 0
             script_running = False
-            has_score_mismatch = False
             script_path = os.path.join(folder, "scriptlog.default.xml")
             foldit_log_handler.start_monitoring(script_path)
             log_data = foldit_log_handler.get_data(script_path)
@@ -681,7 +652,6 @@ def update_process_list():
                 script_type = log_data.get('script_type', '')
                 script_running = bool(log_data.get('run_open', False))
                 highest_score = log_data.get('highest_score')
-                script_highest_score = log_data.get('script_highest_score')
                 try:
                     script_change_token = max(0, int(log_data.get('script_change_token', 0) or 0))
                 except (TypeError, ValueError):
@@ -691,11 +661,6 @@ def update_process_list():
                     maxlen=settings_manager.tooltip_lines
                 )
                 process_state['last_log_update'] = time.time()
-                has_score_mismatch = (
-                    highest_score is not None
-                    and script_highest_score is not None
-                    and abs(float(highest_score) - float(script_highest_score)) > 1e-9
-                )
 
             score_display = ""
             if highest_score is not None:
@@ -709,9 +674,21 @@ def update_process_list():
             tags = [pid, folder]
             is_idle = (not is_window_visible) and cpu_percent < settings_manager.LOW_CPU_THRESHOLD
             if is_window_visible:
-                tags.append('active_window')
+                tags.append('visible_window')
+            if getattr(client, 'is_window_focused', False):
+                tags.append('focused_window')
             elif is_idle:
                 tags.append('idle_window')
+
+            puzzle_key = str(puzzle_number) if puzzle_number else ''
+            if puzzle_key and puzzle_key not in stats_targets_by_puzzle:
+                stats_targets_by_puzzle[puzzle_key] = stats_manager.get_active_targets(puzzle_key)
+            is_fin = bool(
+                puzzle_key
+                and stats_targets_by_puzzle.get(puzzle_key, {}).get(client.client_name) == 'horizontal'
+            )
+            if is_fin:
+                tags.append('fin_state')
 
             speed_boost_states[pid] = {
                 "pid": pid,
@@ -729,15 +706,15 @@ def update_process_list():
             stale_ticks = update_score_stale_ticks(
                 process_state,
                 is_idle=is_idle,
-                score_value=script_highest_score,
+                score_value=highest_score,
                 script_change_token=script_change_token,
             )
 
             # Per-client "Alarm on change": beep once when the monitored score
-            # changes, then disarm. Watches the same script score the stale-fade
-            # tracks (monotonic within a script run -> no spurious drops to misfire on).
+            # changes, then disarm. Watches the same per-script highest score the
+            # stale-fade tracks.
             if alarm_armed:
-                alarm_new_score = parse_numeric_score(script_highest_score)
+                alarm_new_score = parse_numeric_score(highest_score)
                 if (
                     alarm_prev_score is not None
                     and alarm_new_score is not None
@@ -746,24 +723,23 @@ def update_process_list():
                     play_alert_sound()
                     process_state['alarm_on_change'] = False
 
-            if has_score_mismatch:
-                tags.append('score_mismatch')
-
-            is_selected_source = folder in selected_folders
-            if folder in selected_folders:
-                if 'selected_source' not in tags:
-                    tags.append('selected_source')
+            if folder in selected_folder_order:
                 current_selected_items[folder] = item_id
+            is_copy_source = folder == copy_source_folder
+            if is_copy_source:
+                tags.append('copy_source')
 
             tags.append(
                 build_row_appearance_tag(
                     process_tree,
-                    base_foreground=default_row_foreground,
-                    is_window_visible=is_window_visible,
-                    is_idle=is_idle,
-                    has_score_mismatch=has_score_mismatch,
-                    is_selected_source=is_selected_source,
-                    stale_ticks=stale_ticks,
+                    build_row_visual_state(
+                        is_idle=is_idle,
+                        is_visible=is_window_visible,
+                        is_focused=getattr(client, 'is_window_focused', False),
+                        is_fin=is_fin,
+                        is_copy_source=is_copy_source,
+                        stale_ticks=stale_ticks,
+                    ),
                 )
             )
             
@@ -840,6 +816,19 @@ def natural_sort(value):
     return [int(s) if s.isdigit() else s.lower() for s in re.split(r'(\d+)', value)]
 
 #-------------------------------------------------------------------------------------------------------------GUI MAIN WINDOW
+def get_row_font(tags):
+    fonts_by_key = {
+        'normal': normal_font,
+        'bold': bold_font,
+        'italic': italic_font,
+        'bold_italic': bold_italic_font,
+    }
+    appearance_tag = next((tag for tag in tags if is_row_appearance_tag(tag)), '')
+    parsed_appearance = parse_appearance_tag(appearance_tag)
+    font_key = parsed_appearance[0] if parsed_appearance else 'normal'
+    return fonts_by_key.get(font_key, normal_font)
+
+
 def adjust_column_widths(treeview):
     """Adjust the column widths to fit their content."""
     for col in treeview['columns']:
@@ -852,12 +841,8 @@ def adjust_column_widths(treeview):
         max_pixels = current_font.measure(treeview.heading(col)['text'])
         
         for item in treeview.get_children():
-            # Get item's font based on its tags
             item_tags = treeview.item(item)['tags']
-            if 'active_window' in item_tags:
-                current_font = bold_font
-            else:
-                current_font = normal_font
+            current_font = get_row_font(item_tags)
                 
             # Measure text width with the appropriate font
             text = str(treeview.set(item, col))  # Convert to string to handle non-string values
@@ -883,7 +868,8 @@ def adjust_window_size(changeWidth=True, force=False):
     font_height = max(
         normal_font.metrics()['linespace'],
         bold_font.metrics()['linespace'],
-        italic_font.metrics()['linespace']
+        italic_font.metrics()['linespace'],
+        bold_italic_font.metrics()['linespace'],
     )
     row_height = font_height + 0  # Add padding (0px top and bottom)
         
@@ -1113,10 +1099,7 @@ def get_last_log_lines(folder_path):
 
 def on_focus_out(event):
     """Handler for losing focus of the window"""
-    global selected_source_item
-    # if selected_source_item:
-    #     clear_selections(selected_source_item, None)
-    #     selected_source_item = None
+    return None
 
 def get_puzzle_number(window_title):
     """Extracts the first likely puzzle id from the Foldit window title."""
@@ -1261,7 +1244,7 @@ def check_client_changes(clients=None):
                             score=event.get('score'),
                         )
                     elif event_kind == 'finish':
-                        speed_boost_integration = globals().get("speed_boost")
+                        speed_boost_integration = globals().get('speed_boost')
                         if speed_boost_integration is not None:
                             speed_boost_integration.on_script_finished(client.pid)
                         foldit_log_handler.export_log(
@@ -1351,12 +1334,8 @@ def create_remote_tree(address, connection_id, port=None):
         fonts = {
             'normal': normal_font,
             'bold': bold_font,
-            'italic': italic_font
-        }
-        inactive_row_colors = {
-            'normal_foreground': settings_manager.NORMAL_FONT_COLOR,
-            'foreground': settings_manager.IDLE_FONT_COLOR,
-            'background': settings_manager.IDLE_BACKGROUND_COLOR
+            'italic': italic_font,
+            'bold_italic': bold_italic_font,
         }
         
         remote_tree = RemoteTreeView(
@@ -1365,7 +1344,6 @@ def create_remote_tree(address, connection_id, port=None):
             display_id, 
             fonts,
             show_puzzle_column=settings_manager.settings['display']['show_puzzle_column'],
-            inactive_row_colors=inactive_row_colors
         )
         root.remote_trees[tree_id] = remote_tree
         remote_tree.port = port
@@ -1721,8 +1699,8 @@ def clear_all_selections():
         if not process_tree.exists(item):
             continue
         tags = list(process_tree.item(item, 'tags'))
-        if 'selected_source' in tags:
-            tags.remove('selected_source')
+        if 'copy_source' in tags:
+            tags.remove('copy_source')
             process_tree.item(item, tags=tags)
             apply_row_appearance(item)
     selected_rows.clear()
@@ -1743,8 +1721,8 @@ def handle_middle_click(event):
     if len(selected_rows) < 2:
         selected_rows.append(item)
         tags = list(process_tree.item(item, 'tags'))
-        if 'selected_source' not in tags:
-            tags.append('selected_source')
+        if len(selected_rows) == 1 and 'copy_source' not in tags:
+            tags.append('copy_source')
         process_tree.item(item, tags=tags)
         apply_row_appearance(item)
 
@@ -1858,7 +1836,7 @@ def _perform_copy_job(job):
         source_log_data = foldit_log_handler.get_fresh_data(source_script_path)
         source_snapshot = foldit_log_handler.get_stats_snapshot(source_script_path, fresh=True)
         if source_log_data:
-            source_score = source_log_data.get('script_highest_score')
+            source_score = source_log_data.get('highest_score')
     except Exception as e:
         print(f"Error reading source log for copy: {e}")
 
@@ -2078,9 +2056,9 @@ def apply_display_palette(palette_name):
     if palette_var is not None:
         palette_var.set(settings_manager.ACTIVE_DISPLAY_PALETTE)
 
-    ttk.Style().configure('Treeview', foreground=settings_manager.NORMAL_FONT_COLOR)
+    apply_treeview_palette()
     for item_id in process_tree.get_children():
-        apply_row_appearance(item_id, base_foreground=settings_manager.NORMAL_FONT_COLOR)
+        apply_row_appearance(item_id)
     adjust_column_widths(process_tree)
 
     if 'network_manager' in globals() and network_manager.has_clients():
@@ -2499,9 +2477,9 @@ def play_alert_sound():
 
 # Set window position and make draggable
 if settings_x == -1 or settings_y == -1:
-    # Legacy configs used -1 as an unset position marker.
-    x_position = 1
-    y_position = 1
+    # Use default position (bottom right)
+    x_position = root.winfo_screenwidth() - window_width - 130
+    y_position = root.winfo_screenheight() - window_height
 else:
     x_position = settings_x
     y_position = settings_y
@@ -2617,6 +2595,7 @@ root.bind("<Configure>", handle_root_configure)
 root.bind('<FocusOut>', on_focus_out)
 
 init_fonts()
+apply_treeview_palette()
 root.tooltip = setup_tooltip(root)
 
 network_manager = NetworkManager(

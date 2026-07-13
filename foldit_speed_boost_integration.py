@@ -117,7 +117,7 @@ class FolditSpeedBoostIntegration:
             if pid is None:
                 continue
             folder = next((tag for tag in tags if isinstance(tag, str) and ("\\" in tag or "/" in tag)), "")
-            rows.append((int(pid), os.path.basename(folder), "active_window" in tags))
+            rows.append((int(pid), os.path.basename(folder), "visible_window" in tags))
         return rows
 
     def _normalize_client_state(self, client):

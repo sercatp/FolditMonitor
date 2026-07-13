@@ -13,7 +13,8 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from collections import defaultdict
 
-ROW_APPEARANCE_TAG_PREFIX = "appearance_"
+from row_appearance import ROW_APPEARANCE_TAG_PREFIX, parse_appearance_tag
+
 ARTIFACT_TRANSFER_CAPABILITY = "artifact_transfer_v1"
 ARTIFACT_QUERY_CAPABILITY = "artifact_query_v1"
 REMOTE_LOG_CAPABILITY = "remote_log_v1"
@@ -44,14 +45,6 @@ def mask_user_path(path):
     if path.lower().startswith(_HOME_DIR.lower()):
         return "~" + path[len(_HOME_DIR):]
     return path
-
-
-def decode_appearance_color(token):
-    if not token or token == "none":
-        return None
-    if len(token) == 6 and all(ch in "0123456789abcdefABCDEF" for ch in token):
-        return f"#{token.lower()}"
-    return token
 
 
 def sanitize_artifact_filename(filename, fallback="artifact.bin", max_length=180):
@@ -150,7 +143,7 @@ class ConnectDialog:
         self.dialog.destroy()
 
 class RemoteTreeView:
-    def __init__(self, parent, address, connection_id, fonts, show_puzzle_column=True, inactive_row_colors=None):
+    def __init__(self, parent, address, connection_id, fonts, show_puzzle_column=True):
         self.fonts = fonts
         self.address = address
         self.connection_id = connection_id
@@ -164,20 +157,18 @@ class RemoteTreeView:
         self.header = ttk.Label(self.frame, text=f"Connected: {address} {connection_id}")
         self.header.pack(fill="x")
 
-        inactive_row_colors = inactive_row_colors or {}
-        
         # Calculate row height
         font_height = max(
             fonts['normal'].metrics()['linespace'],
-            fonts['bold'].metrics()['linespace']
+            fonts['bold'].metrics()['linespace'],
+            fonts['italic'].metrics()['linespace'],
+            fonts['bold_italic'].metrics()['linespace'],
         )
         row_height = font_height + 6
         
         # Configure style with row height
         style = ttk.Style()
         style.configure('Treeview', rowheight=row_height)
-        default_row_foreground = inactive_row_colors.get('normal_foreground') or '#111827'
-        style.configure('Treeview', foreground=default_row_foreground)
         
         # Create treeview with style
         columns = ("Score", "CPU", "Folder", "Type", "Puzzle") if show_puzzle_column else ("Score", "CPU", "Folder", "Type")
@@ -186,20 +177,6 @@ class RemoteTreeView:
             show="", 
             selectmode='none', 
             style='Treeview')
-        
-        # Configure tags
-        self.tree.tag_configure('normal_window', font=fonts['normal'])
-        self.tree.tag_configure('active_window', font=fonts['bold'])
-        idle_tag = {'font': fonts['normal']}
-        if inactive_row_colors.get('foreground'):
-            idle_tag['foreground'] = inactive_row_colors['foreground']
-        if inactive_row_colors.get('background'):
-            idle_tag['background'] = inactive_row_colors['background']
-        self.tree.tag_configure('idle_window', **idle_tag)
-        stale_tag = {}
-        if inactive_row_colors.get('background'):
-            stale_tag['background'] = inactive_row_colors['background']
-        self.tree.tag_configure('stale_score', **stale_tag)
         
         # Set initial column widths
         for col in self.tree["columns"]:
@@ -234,17 +211,14 @@ class RemoteTreeView:
         if not tag_name.startswith(ROW_APPEARANCE_TAG_PREFIX) or tag_name in self.dynamic_style_tags:
             return
 
-        payload = tag_name[len(ROW_APPEARANCE_TAG_PREFIX):]
-        parts = payload.split("_", 2)
-        if len(parts) != 3:
+        appearance = parse_appearance_tag(tag_name)
+        if appearance is None:
             return
 
-        font_key, foreground_token, background_token = parts
+        font_key, foreground, background = appearance
         tag_options = {
-            "font": self.fonts["bold"] if font_key == "bold" else self.fonts["normal"]
+            "font": self.fonts.get(font_key, self.fonts["normal"])
         }
-        foreground = decode_appearance_color(foreground_token)
-        background = decode_appearance_color(background_token)
         if foreground:
             tag_options["foreground"] = foreground
         if background:
@@ -252,22 +226,8 @@ class RemoteTreeView:
         self.tree.tag_configure(tag_name, **tag_options)
         self.dynamic_style_tags.add(tag_name)
 
-    def _ensure_dynamic_score_fade_tag(self, tag_name):
-        if not isinstance(tag_name, str):
-            return
-        if not tag_name.startswith("score_fade_") or tag_name in self.dynamic_style_tags:
-            return
-
-        color_suffix = tag_name[len("score_fade_"):]
-        if len(color_suffix) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in color_suffix):
-            return
-
-        self.tree.tag_configure(tag_name, foreground=f"#{color_suffix.lower()}")
-        self.dynamic_style_tags.add(tag_name)
-
     def _ensure_dynamic_tag(self, tag_name):
         self._ensure_dynamic_appearance_tag(tag_name)
-        self._ensure_dynamic_score_fade_tag(tag_name)
         
     def supports_capability(self, capability):
         return capability in self.capabilities
