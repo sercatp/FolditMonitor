@@ -22,7 +22,9 @@ if ($LASTEXITCODE -ne 0) {
     }
 }
 
-& python -m PyInstaller --noconfirm --clean --windowed --onedir --name "FolditMonitor" --paths $projectRoot --add-data "$alertPath;." --add-data "$defaultsProfilePath;." --collect-all frida --workpath $buildRoot --distpath $distRoot --specpath $buildRoot "Foldit Monitor.pyw"
+# stats_ui.py imports the PySide6 backend on demand, so PyInstaller cannot discover
+# this local module through static imports alone.
+& python -m PyInstaller --noconfirm --clean --windowed --onedir --name "FolditMonitor" --paths $projectRoot --add-data "$alertPath;." --add-data "$defaultsProfilePath;." --hidden-import stats_ui_qt --collect-all frida --workpath $buildRoot --distpath $distRoot --specpath $buildRoot "Foldit Monitor.pyw"
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller did not complete successfully."
 }
