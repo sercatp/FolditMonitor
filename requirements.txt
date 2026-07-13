@@ -1,4 +1,14 @@
 psutil>=5.9
+Pillow>=10
 pygame>=2.5
 PySide6>=6.7
-frida==17.15.4
+numpy>=1.26
+
+# The speed boost targets Windows' game_library.dll and is optional.
+frida==17.15.4; sys_platform == "win32"
+
+# Native window integration; pip installs only the entry for the current OS.
+pywin32>=306; sys_platform == "win32"
+keyboard>=0.13.5; sys_platform == "win32"
+python-xlib>=0.33; sys_platform == "linux"
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
