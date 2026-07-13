@@ -1,55 +1,48 @@
-# FolditMonitor
+# Foldit Monitor
 
-FolditMonitor is a small desktop helper for watching local Foldit clients, tracking scores/log output, viewing puzzle stats, and connecting monitors over the local network.
+Foldit Monitor is a Windows desktop companion for people who run one or more local Foldit clients. It watches scores and logs, keeps puzzle statistics, and can connect monitors on a local network.
 
-## Screenshots
+## Start here
 
-![Main window](images/main-window.jpg)
+You need Windows and at least one local Foldit client. The recommended way to use Foldit Monitor is the Python version; a packaged Windows EXE is also available when a release includes one.
 
-![Stats window](images/stats-window.jpg)
+### Recommended: run with Python
 
-## Contents
+This option receives updates directly from the source and is the easiest way to see an error message if something needs attention.
 
-- `Foldit Monitor.pyw` - main Tk application.
-- `settings.py` - defaults and runtime settings handling.
-- `network.py` - local network sync and artifact transfer.
-- `stats_*.py`, `logger.py`, `log_lookup.py` - score/log parsing and stats UI.
-- `foldit_speed_boost*.py` - optional Frida-based speed boost integration.
-- `alert.wav` - default alert sound.
-- `tests/` - unit tests.
+1. Install [Python 3.11 or newer](https://www.python.org/downloads/windows/). During installation, select **Add Python to PATH**.
+2. Download this repository with **Code → Download ZIP**, then extract the ZIP.
+3. Open a terminal in the extracted folder.
+4. Install the required packages:
 
-Runtime folders such as `logs/`, `puzzle_logs/`, `foldit_backup/`, `__pycache__/`, and the generated `Foldit Monitor.json` are intentionally not tracked.
+   ```powershell
+   python -m pip install -r requirements.txt
+   ```
 
-## Requirements
+5. Start Foldit Monitor:
 
-- Windows with Python 3.11+.
-- Foldit clients running locally.
-- Python packages from `requirements.txt`.
+   ```powershell
+   python "Foldit Monitor.pyw"
+   ```
 
-## Install
+If `python` is not recognized, reinstall Python and make sure **Add Python to PATH** is selected.
 
-```powershell
-python -m pip install -r requirements.txt
-```
+### Alternative: Windows EXE
 
-## Run
+When a release provides `FolditMonitor-windows-x64.zip`, download it from the repository's **Releases** page, extract the entire ZIP, and run `FolditMonitor.exe`. The ZIP already includes everything required, so Python does not need to be installed.
 
-```powershell
-pythonw "Foldit Monitor.pyw"
-```
+## First launch
 
-For console output while debugging:
+Foldit Monitor starts with the bundled [default profile](Foldit%20Monitor.defaults.json). It then creates a separate `Foldit Monitor.json` for your own machine. That local file stores window positions, the last puzzle, paths, and connections; it is intentionally not part of the repository.
 
-```powershell
-python "Foldit Monitor.pyw"
-```
+The app creates `puzzle_logs/`, `logs/`, and `foldit_backup/` when it needs them. You can keep or remove those local files without affecting the source code.
 
-On first start the app creates `Foldit Monitor.json` from defaults. That file stores local window positions, last selected puzzle, network address, and other user preferences, so it is ignored by git.
+## For maintainers: build the EXE
 
-`Foldit Monitor.example.json` is a clean default settings example.
-
-## Test
+From a Python-enabled PowerShell in the project folder:
 
 ```powershell
-python -m unittest discover -s tests
+powershell -ExecutionPolicy Bypass -File scripts\build_windows_exe.ps1
 ```
+
+The script installs PyInstaller if required, creates a folder distribution in `dist/FolditMonitor/`, and packages it as `release/FolditMonitor-windows-x64.zip`. Build outputs are intentionally ignored by Git.

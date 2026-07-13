@@ -267,7 +267,6 @@ class LogFileHandler:
             "script_name": "",
             "script_type": "",
             "highest_score": None,
-            "script_highest_score": None,
             "script_column_number": 0,
             "script_change_token": 0,
             "run_open": False,
@@ -282,8 +281,8 @@ class LogFileHandler:
         self.last_read_position = 0
         self._line_count = 0
         self._tail_lines = deque(maxlen=self.tail_capacity)
-        self._script_highest_score = None
-        self._script_pattern_high_scores = self._new_pattern_score_state()
+        self._highest_score = None
+        self._highest_pattern_scores = self._new_pattern_score_state()
         self._script_name = ""
         self._script_type = ""
         self._script_column_number = 0
@@ -322,8 +321,8 @@ class LogFileHandler:
         self._tail_lines.clear()
         self._line_count = 0
         self.last_read_position = 0
-        self._script_highest_score = None
-        self._script_pattern_high_scores = self._new_pattern_score_state()
+        self._highest_score = None
+        self._highest_pattern_scores = self._new_pattern_score_state()
         self._script_name = ""
         self._script_type = ""
         self._script_column_number = 0
@@ -365,8 +364,7 @@ class LogFileHandler:
             {
                 "script_name": self._script_name,
                 "script_type": self._script_type,
-                "highest_score": self._calculate_window_highest_score(),
-                "script_highest_score": self._script_highest_score,
+                "highest_score": self._highest_score,
                 "script_column_number": self._script_column_number,
                 "script_change_token": self._script_change_token,
                 "run_open": self._run_open,
@@ -387,10 +385,10 @@ class LogFileHandler:
             return
 
         script_payload = None
-        if self._script_type and self._script_highest_score is not None:
+        if self._script_type and self._highest_score is not None:
             script_payload = (
                 str(self._script_type).strip(),
-                float(self._script_highest_score),
+                float(self._highest_score),
             )
         self._last_emitted_script_payload = script_payload
 
@@ -414,10 +412,10 @@ class LogFileHandler:
         run_started = self._tail_mode != "continue"
 
         script_payload = None
-        if self._script_type and self._script_highest_score is not None:
+        if self._script_type and self._highest_score is not None:
             script_payload = (
                 str(self._script_type).strip(),
-                float(self._script_highest_score),
+                float(self._highest_score),
             )
             if run_started or script_payload != self._last_emitted_script_payload:
                 self._enqueue_stats_event(
@@ -626,10 +624,10 @@ class LogFileHandler:
                 self._tail_lines.append((self._line_count, line))
                 self._update_script_metadata(line, bootstrap_attach=bootstrap_attach)
                 if self._run_open:
-                    self._update_script_pattern_scores(line)
+                    self._update_highest_pattern_scores(line)
                     self._update_script_state_snapshot(line)
-                    self._script_highest_score = self._resolve_highest_score(
-                        self._script_pattern_high_scores
+                    self._highest_score = self._resolve_highest_score(
+                        self._highest_pattern_scores
                     )
                 self.last_read_position = next_pos
             pos = next_pos
@@ -649,8 +647,8 @@ class LogFileHandler:
         self._script_change_token += 1
         self._run_open = True
         self._tail_mode = "continue" if boot_attached else "new"
-        self._script_pattern_high_scores = self._new_pattern_score_state()
-        self._script_highest_score = None
+        self._highest_pattern_scores = self._new_pattern_score_state()
+        self._highest_score = None
         self._script_state_snapshot = None
         self._script_name = script_name
         self._script_type, self._script_column_number = self._build_script_type(script_name)
@@ -871,10 +869,10 @@ class LogFileHandler:
                     current_score = score
         return current_score
 
-    def _update_script_pattern_scores(self, line: str):
+    def _update_highest_pattern_scores(self, line: str):
         for idx, pattern in enumerate(self.settings["SCORE_PATTERNS"]):
-            self._script_pattern_high_scores[idx] = self._update_max_score_for_pattern(
-                self._script_pattern_high_scores[idx],
+            self._highest_pattern_scores[idx] = self._update_max_score_for_pattern(
+                self._highest_pattern_scores[idx],
                 line,
                 pattern,
             )
@@ -885,20 +883,6 @@ class LogFileHandler:
             if score is not None:
                 return score
         return None
-
-    def _detect_highest_score(self, lines) -> Optional[float]:
-        pattern_high_scores = self._new_pattern_score_state()
-        for idx, pattern in enumerate(self.settings["SCORE_PATTERNS"]):
-            current_score = None
-            for line in reversed(lines):
-                current_score = self._update_max_score_for_pattern(current_score, line, pattern)
-            pattern_high_scores[idx] = current_score
-        return self._resolve_highest_score(pattern_high_scores)
-
-    def _calculate_window_highest_score(self) -> Optional[float]:
-        max_lines = int(self.settings["MAX_LINES"])
-        tail_lines = list(self._tail_lines)[-max_lines:]
-        return self._detect_highest_score([line for _, line in tail_lines])
 
     def _get_last_log_lines(self):
         tooltip_lines = int(self.settings["tooltip_lines"])

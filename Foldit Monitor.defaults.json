@@ -1,0 +1,217 @@
+{
+  "launch": {
+    "last_seen_foldit_parent": ""
+  },
+  "display": {
+    "tooltip_lines": 15,
+    "always_on_top": false,
+    "show_puzzle_column": false,
+    "window_position": {
+      "x": 1,
+      "y": 1
+    },
+    "stats_window_position": {
+      "x": -1,
+      "y": -1
+    },
+    "fonts": {
+      "family": "DejaVu Sans Mono",
+      "normal_size": 9,
+      "tooltip_size": 7,
+      "stats_size": 7
+    },
+    "active_palette": "contrast",
+    "stale_tick_limit": 10000,
+    "script_type_fallback_max_length": 10,
+    "stats_ui_backend": "pyside6",
+    "stats_last_puzzle": ""
+  },
+  "network": {
+    "default_port": 8000,
+    "default_address": "127.0.0.1",
+    "server_timeout": 10,
+    "password": "fold.it",
+    "auto_reconnect": true,
+    "max_artifact_bytes": 536870912,
+    "artifact_chunk_bytes": 262144,
+    "startup_connections": [],
+    "startup_connections_description": "\"startup_connections\" holds the list of addresses and ports to automatically connect to at startup."
+  },
+  "sound": {
+    "alert_file": "alert.wav",
+    "volume": 1
+  },
+  "logging": {
+    "max_lines": 400,
+    "script_exclusions": [
+      "c-w",
+      "other_script_name"
+    ],
+    "exclude_score_strings": [
+      "Group rank",
+      "a0.txt Apr 7 2022",
+      "Remaining time:",
+      "ignore other score string"
+    ],
+    "logs_folder": "puzzle_logs",
+    "stats_save_interval_minutes": 30,
+    "stats_score_decimals": 0,
+    "save_logs_immediately": true,
+    "managed_log_exports": true,
+    "log_format": {
+      "column_separator": "||",
+      "value_separator": " | "
+    },
+    "max_line_length": 100
+  },
+  "backup": {
+    "folder_name": "foldit_backup",
+    "save_to_backup": true
+  },
+  "script_type_mapping": {
+    "Deep Shake": {
+      "name": "Deep Shake",
+      "column_number": 30
+    },
+    "hinge": {
+      "name": "Hinge",
+      "column_number": 0
+    },
+    "ideali": {
+      "name": "Midealize",
+      "column_number": 0
+    },
+    "jet": {
+      "name": "JET",
+      "column_number": 0
+    },
+    "with cuts": {
+      "name": "Cuts",
+      "column_number": 0
+    },
+    "_cut": {
+      "name": "Cuts",
+      "column_number": 0
+    },
+    "cut and wiggle": {
+      "name": "c-w",
+      "column_number": 50
+    },
+    "cut and close": {
+      "name": "c-c",
+      "column_number": 0
+    },
+    "__gap20__": {
+      "name": "",
+      "column_number": 20
+    },
+    "gab": {
+      "name": "GAB",
+      "column_number": 0
+    },
+    "helix": {
+      "name": "Helix",
+      "column_number": 0
+    },
+    "cut ": {
+      "name": "c-w",
+      "column_number": 10
+    },
+    "worm": {
+      "name": "Worm",
+      "column_number": 80
+    },
+    "bwp": {
+      "name": "bwp",
+      "column_number": 80
+    },
+    "sidechain": {
+      "name": "Sidechain",
+      "column_number": 30
+    },
+    "drw": {
+      "name": "DRW",
+      "column_number": 0,
+      "state_snapshot_rules": [
+        {
+          "name": "serca drw",
+          "detector": [
+            "#",
+            "segs:",
+            "Score"
+          ],
+          "extractors": [
+            {
+              "name": "task_id",
+              "find_after": "#",
+              "find_before": " "
+            },
+            {
+              "name": "f_value",
+              "find_after": " F",
+              "find_before": "."
+            }
+          ],
+          "stats_mapping": {
+            "script": "task_id",
+            "score": "f_value"
+          }
+        },
+        {
+          "name": "tvdl drw",
+          "detector": [
+            "times.",
+            "Wait",
+            "score"
+          ],
+          "extractors": [
+            {
+              "name": "task_id_tvdl",
+              "find_after": "DR ",
+              "find_before": " "
+            }
+          ],
+          "stats_mapping": {
+            "script": "task_id_tvdl"
+          }
+        }
+      ]
+    },
+    "barrel": {
+      "name": "Barrel",
+      "column_number": 0
+    },
+    "prediction": {
+      "name": "prediction",
+      "column_number": 0
+    },
+    "rebuild": {
+      "name": "Rebuild",
+      "column_number": 0
+    },
+    "zz1": {
+      "name": "Rebuild_loc",
+      "column_number": 0
+    },
+    "defuze": {
+      "name": "Defuze",
+      "column_number": 0
+    },
+    "assembly": {
+      "name": "Assembly",
+      "column_number": 0
+    },
+    "quake": {
+      "name": "Quake",
+      "column_number": 0
+    },
+    "remix": {
+      "name": "Remix",
+      "column_number": 0
+    },
+    "ligand": {
+      "name": "Ligand",
+      "column_number": 0
+    }
+  }
+}

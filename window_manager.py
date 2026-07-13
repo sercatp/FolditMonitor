@@ -1,3 +1,4 @@
+import ctypes
 import os
 import platform
 import subprocess
@@ -6,6 +7,37 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 import psutil
+
+
+def enable_native_dpi_awareness() -> bool:
+    """Enable native monitor scaling for a Windows GUI process.
+
+    This must run before the first Tk window is created. Other operating
+    systems keep their existing toolkit-managed scaling unchanged.
+    """
+    if platform.system() != "Windows":
+        return False
+
+    try:
+        set_context = ctypes.windll.user32.SetProcessDpiAwarenessContext
+        set_context.argtypes = [ctypes.c_void_p]
+        set_context.restype = ctypes.c_bool
+        if set_context(ctypes.c_void_p(-4)):  # PER_MONITOR_AWARE_V2
+            return True
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        result = ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor aware
+        if result == 0:
+            return True
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        return bool(ctypes.windll.user32.SetProcessDPIAware())
+    except (AttributeError, OSError):
+        return False
 
 
 FOLDIT_EXECUTABLES = {
@@ -25,6 +57,7 @@ class ClientInfo:
     window_info: Any = None
     window_title: str = ""
     is_window_visible: bool = False
+    is_window_focused: bool = False
 
 class WindowManager:
     def __init__(self):
@@ -169,6 +202,34 @@ class WindowManager:
         
         return False
 
+    def is_window_focused(self, window_info):
+        """Check whether this Foldit window owns the current keyboard focus."""
+        if not window_info:
+            return False
+
+        if self.system == 'Windows':
+            if not self.win32gui:
+                return False
+            return self.win32gui.GetForegroundWindow() == window_info[0]
+
+        if self.system == 'Linux':
+            if not self.Xlib or not self.display:
+                return False
+            try:
+                active_window = self.display.screen().root.get_full_property(
+                    self.display.intern_atom('_NET_ACTIVE_WINDOW'),
+                    self.Xlib.X.AnyPropertyType,
+                )
+                return bool(active_window and active_window.value[0] == window_info[0])
+            except Exception:
+                return False
+
+        if self.system == 'Darwin':
+            window = window_info[0]
+            return bool(window.isKeyWindow())
+
+        return False
+
     def get_executable_name(self) -> Optional[str]:
         return FOLDIT_EXECUTABLES.get(self.system)
 
@@ -235,6 +296,7 @@ class WindowManager:
                 selected_window = None
                 selected_title = ""
                 is_visible = False
+                is_focused = False
                 windows = self.get_process_windows(proc.pid)
                 foldit_windows = [
                     window
@@ -245,6 +307,7 @@ class WindowManager:
                     selected_window = foldit_windows[0]
                     selected_title = str(selected_window[1] or "")
                     is_visible = self.is_window_visible(selected_window)
+                    is_focused = self.is_window_focused(selected_window)
 
                 clients.append(
                     ClientInfo(
@@ -256,6 +319,7 @@ class WindowManager:
                         window_info=selected_window,
                         window_title=selected_title,
                         is_window_visible=is_visible,
+                        is_window_focused=is_focused,
                     )
                 )
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):

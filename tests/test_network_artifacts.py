@@ -163,7 +163,7 @@ class ArtifactAssemblerCases(unittest.TestCase):
             }
 
             manager._handle_message(
-                "127.0.0.1",
+                "192.168.1.7",
                 "conn",
                 {
                     "type": "artifact_start",
@@ -176,7 +176,7 @@ class ArtifactAssemblerCases(unittest.TestCase):
                 },
             )
             manager._handle_message(
-                "127.0.0.1",
+                "192.168.1.7",
                 "conn",
                 {
                     "type": "artifact_chunk",
@@ -187,7 +187,7 @@ class ArtifactAssemblerCases(unittest.TestCase):
                 },
             )
             manager._handle_message(
-                "127.0.0.1",
+                "192.168.1.7",
                 "conn",
                 {
                     "type": "artifact_end",
