@@ -28,7 +28,7 @@ If you do not want to install Python, download `FolditMonitor-windows-x64.zip` f
 
 ## Screenshots
 
-[![Main window](https://github.com/sercatp/FolditMonitor/raw/main/images/main-window.jpg)](https://github.com/sercatp/FolditMonitor/blob/main/images/main-window.jpg)
+[![Main window](https://github.com/sercatp/FolditMonitor/raw/main/images/main-window.png)](https://github.com/sercatp/FolditMonitor/blob/main/images/main-window.png)
 
 [![Stats window](https://github.com/sercatp/FolditMonitor/raw/main/images/stats-window.jpg)](https://github.com/sercatp/FolditMonitor/blob/main/images/stats-window.jpg)
 
