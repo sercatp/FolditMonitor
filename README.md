@@ -24,7 +24,7 @@ If your system calls Python `python3`, use that command instead of `python`.
 
 ### Alternative: Windows EXE
 
-If you do not want to install Python, download `FolditMonitor-windows-x64.zip` from the repository's **Releases** page. Extract the entire ZIP and run `FolditMonitor.exe`. The ZIP already includes everything required.
+If you do not want to install Python, open [the latest release](https://github.com/sercatp/FolditMonitor/releases/latest), download `FolditMonitor-windows-x64.zip`, extract the entire ZIP, and run `FolditMonitor.exe`. The ZIP already includes everything required.
 
 ## Screenshots
 
