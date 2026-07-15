@@ -3,13 +3,13 @@ import tkinter as tk
 class TooltipWindow:
     def __init__(self, parent, fonts, update_interval=1000, hover_delay=200):
         """
-        Инициализация окна подсказки
+        Initialize the tooltip window.
         
         Args:
-            parent: Родительское окно
-            fonts: Словарь шрифтов {'tooltip': font_object}
-            update_interval: Интервал обновления в миллисекундах
-            hover_delay: Задержка появления подсказки в миллисекундах
+            parent: Parent window.
+            fonts: Font dictionary, e.g. {'tooltip': font_object}.
+            update_interval: Refresh interval in milliseconds.
+            hover_delay: Delay before displaying the tooltip in milliseconds.
         """
         self.window = tk.Toplevel(parent)
         self.window.withdraw()
@@ -26,7 +26,7 @@ class TooltipWindow:
         )
         self.label.pack()
         
-        # Состояние
+        # State
         self.visible = False
         self.current_item = None
         self.last_update = 0
@@ -40,23 +40,23 @@ class TooltipWindow:
         self.hover_column = None
         self.current_tree = None
         
-        # Ссылка на родительское окно
+        # Reference to the parent window
         self.parent = parent
         self.parent.bind('<FocusOut>', self.on_parent_focus_out)
 
     def on_parent_focus_out(self, event):
-        """Обработка потери фокуса родительским окном"""
+        """Handle the parent window losing focus."""
         self.hide()
 
     def show(self, text, x, y, item):
         """
-        Показать подсказку
+        Display a tooltip.
         
         Args:
-            text: Текст подсказки
-            x: X-координата
-            y: Y-координата
-            item: Идентификатор элемента
+            text: Tooltip text.
+            x: X coordinate.
+            y: Y coordinate.
+            item: Item identifier.
         """
         self.current_x = x
         self.current_y = y
@@ -67,7 +67,7 @@ class TooltipWindow:
             self.schedule_update()
 
     def update_tooltip(self, text):
-        """Обновить содержимое подсказки"""
+        """Update the tooltip content."""
         self.label.config(text=text, wraplength=0)
         self.window.update_idletasks()
         tooltip_width = self.window.winfo_reqwidth()
@@ -77,7 +77,7 @@ class TooltipWindow:
             self.visible = True
 
     def hide(self):
-        """Скрыть подсказку"""
+        """Hide the tooltip."""
         if self.pending_show:
             self.window.after_cancel(self.pending_show)
             self.pending_show = None
@@ -90,7 +90,7 @@ class TooltipWindow:
         self.current_item = None
 
     def delayed_show(self, text, x, y, item, column, tree_widget=None):
-        """Показать подсказку с задержкой"""
+        """Display the tooltip after a delay."""
         if self.pending_show:
             self.window.after_cancel(self.pending_show)
         
@@ -111,7 +111,7 @@ class TooltipWindow:
             self.show(text, x, y, item)
 
     def check_and_show(self, text, x, y, item):
-        """Проверить позицию мыши перед показом подсказки"""
+        """Check the mouse position before displaying the tooltip."""
         mouse_x = self.current_tree.winfo_pointerx() - self.current_tree.winfo_rootx()
         mouse_y = self.current_tree.winfo_pointery() - self.current_tree.winfo_rooty()
         
@@ -124,7 +124,7 @@ class TooltipWindow:
             self.show(text, x, y, item)
 
     def schedule_update(self):
-        """Запланировать следующее обновление подсказки"""
+        """Schedule the next tooltip update."""
         if self.update_callback and self.visible and self.current_item:
             try:
                 if self.current_tree and self.current_item in self.current_tree.get_children():
@@ -144,9 +144,9 @@ class TooltipWindow:
 
     def set_update_callback(self, callback):
         """
-        Установить функцию обновления содержимого подсказки
+        Set the tooltip-content update function.
         
         Args:
-            callback: Функция, принимающая item_id и возвращающая текст подсказки
+            callback: Function that accepts an item_id and returns tooltip text.
         """
         self.update_callback = callback 

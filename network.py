@@ -188,7 +188,7 @@ class RemoteTreeView:
         # Add dictionary for storing logs and items
         self.log_data = {}
         self.item_payloads = {}
-        self.items = {}  # Словарь для хранения соответствия данных и ID элементов
+        self.items = {}  # Mapping between data and item IDs
         self.capabilities = set()
         self.dynamic_style_tags = set()
 
@@ -233,7 +233,7 @@ class RemoteTreeView:
         return capability in self.capabilities
 
     def update_items(self, new_data, capabilities=None):
-        """Обновляет элементы дерева, сохраняя существующие ID"""
+        """Update tree items while preserving their existing IDs."""
         if capabilities is not None:
             self.capabilities = {
                 str(capability)
@@ -244,42 +244,42 @@ class RemoteTreeView:
         existing_items = set(self.tree.get_children())
         current_items = set()
         
-        # Создаем ключи для сопоставления элементов
+        # Create keys for mapping items
         for item_data in new_data:
             values = item_data.get('values', [])
             tags = item_data.get('tags', [])
             for tag_name in tags:
                 self._ensure_dynamic_tag(tag_name)
 
-            # Используем полный путь к папке как стабильный ключ строки.
+            # Use the full folder path as the stable row key.
             item_key = next(
                 (tag for tag in tags if isinstance(tag, str) and ('\\' in tag or '/' in tag)),
                 values[2] if len(values) > 2 else repr(values)
             )
             
             if item_key in self.items:
-                # Обновляем существующий элемент
+                # Update the existing item
                 item_id = self.items[item_key]
                 self.tree.item(item_id, values=values, tags=tags)
                 self.log_data[item_id] = item_data.get('log_lines', [])
                 self.item_payloads[item_id] = dict(item_data)
                 current_items.add(item_id)
             else:
-                # Создаем новый элемент
+                # Create a new item
                 item_id = self.tree.insert('', 'end', values=values, tags=tags)
                 self.items[item_key] = item_id
                 self.log_data[item_id] = item_data.get('log_lines', [])
                 self.item_payloads[item_id] = dict(item_data)
                 current_items.add(item_id)
         
-        # Удаляем элементы, которых больше нет в данных
+        # Remove items that are no longer present in the data
         items_to_remove = existing_items - current_items
         for item_id in items_to_remove:
             self.tree.delete(item_id)
-            # Удаляем из log_data и items
+            # Remove from log_data and items
             self.log_data.pop(item_id, None)
             self.item_payloads.pop(item_id, None)
-            # Удаляем из self.items (инвертированный поиск)
+            # Remove from self.items (reverse lookup)
             keys_to_remove = [k for k, v in self.items.items() if v == item_id]
             for k in keys_to_remove:
                 self.items.pop(k, None)
@@ -323,7 +323,7 @@ class NetworkManager:
         self.pending_artifact_requests = {}
         self.incoming_artifact_transfers = {}
         
-        # Сохраняем callbacks
+        # Store callbacks
         self.create_remote_tree = callbacks['create_remote_tree']
         self.remove_remote_tree = callbacks['remove_remote_tree']
         self.update_remote_trees = callbacks['update_remote_trees']
@@ -332,7 +332,7 @@ class NetworkManager:
         self.artifact_received = callbacks.get('artifact_received')
         self.artifact_error = callbacks.get('artifact_error')
         
-        # Сохраняем объекты
+        # Store objects
         self.process_tree = tree
         self.monitored_processes = monitored_processes
     
@@ -413,7 +413,7 @@ class NetworkManager:
                            args=(address, connection_id), 
                            daemon=True).start()
             
-            # Используем сохраненный callback
+            # Use the stored callback
             self.main_window.after(100, lambda: self.create_remote_tree(address, connection_id, port))
             return True
         except Exception as e:
@@ -538,11 +538,11 @@ class NetworkManager:
 
         self._cleanup_artifacts_for_connection(address, connection_id)
 
-        # Вызываем callback для удаления в главном потоке GUI
+        # Invoke the removal callback on the main GUI thread
         if disconnect_callback is not None:
             self.main_window.after(0, disconnect_callback)
 
-        # Используем сохраненный callback
+        # Use the stored callback
         self.main_window.after(100, lambda: self.remove_remote_tree(address, connection_id, user_initiated))
 
     def register_disconnect_callback(self, address, connection_id, callback):

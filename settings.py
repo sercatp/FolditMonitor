@@ -21,7 +21,7 @@ class Settings:
         self.user_settings: Dict[str, Any] = {}
         self.non_merged_paths = {('script_type_mapping',)}
         
-        # Константы по умолчанию
+        # Default constants
         self.DEFAULT_PORT = 8000
         self.DEFAULT_ADDRESS = "127.0.0.1"
         self.SERVER_TIMEOUT = 10
@@ -160,10 +160,10 @@ class Settings:
         self.STATS_UI_BACKEND = "pyside6"
         self.STATS_LAST_PUZZLE = ""
 
-        # Публичный стартовый профиль. Он сохраняет рабочие распознавания
-        # скриптов, но раскрывает только часть фиксированной FIN-раскладки:
-        # 20/30/50/80. Пара c-w остаётся без изменений (10/50); остальные
-        # скрипты создают динамические колонки.
+        # Public starter profile. It retains the working script recognizers,
+        # while exposing only part of the fixed FIN layout: 20/30/50/80.
+        # The c-w pair remains unchanged (10/50); other scripts create
+        # dynamic columns.
         self.SCRIPT_TYPE_MAPPING = {
             "Deep Shake": {"name": "Deep Shake", "column_number": 30},
             "hinge": {"name": "Hinge", "column_number": 0},
@@ -234,7 +234,7 @@ class Settings:
         ]
 
         
-        # Загрузка настроек
+        # Load settings
         self.settings = self.load_settings()
         self.update_globals()
 
@@ -326,7 +326,7 @@ class Settings:
         }
 
     def load_settings(self) -> Dict[str, Any]:
-        """Загружает пользовательские настройки и накладывает их на defaults только в памяти."""
+        """Load user settings and apply defaults only in memory."""
         default_settings = self.get_default_settings()
         should_initialize_file = False
 
@@ -409,7 +409,7 @@ class Settings:
         return True
 
     def _apply_defaults(self, target: Dict[str, Any], defaults: Dict[str, Any], path: tuple[str, ...] = ()) -> Dict[str, Any]:
-        """Добавляет только отсутствующие значения по умолчанию, сохраняя пользовательский порядок."""
+        """Add only missing default values while preserving the user's order."""
         for key, default_value in defaults.items():
             current_path = path + (key,)
 
@@ -427,7 +427,7 @@ class Settings:
         return target
 
     def _set_nested_value(self, settings_dict: Dict[str, Any], path: tuple[str, ...], value: Any):
-        """Создает промежуточные словари по необходимости и сохраняет значение по указанному пути."""
+        """Create intermediate dictionaries as needed and store a value at the specified path."""
         current = settings_dict
         for key in path[:-1]:
             next_value = current.get(key)
@@ -452,7 +452,7 @@ class Settings:
         return os.path.join(self.bundled_resource_root, clean_file_name)
 
     def update_globals(self):
-        """Обновляет глобальные переменные из загруженных настроек"""
+        """Update global variables from the loaded settings."""
         self.LAST_SEEN_FOLDIT_PARENT = self.settings['launch'].get('last_seen_foldit_parent', '')
         self.DEFAULT_PORT = self.settings['network']['default_port']
         self.DEFAULT_ADDRESS = self.settings['network']['default_address']
@@ -526,7 +526,7 @@ class Settings:
         self.last_seen_foldit_parent = self.LAST_SEEN_FOLDIT_PARENT
 
     def save_window_position(self, x: int, y: int):
-        """Сохраняет позицию окна в настройках"""
+        """Save the window position in the settings."""
         self._set_nested_value(self.settings, ('display', 'window_position', 'x'), x)
         self._set_nested_value(self.settings, ('display', 'window_position', 'y'), y)
         self._set_nested_value(self.user_settings, ('display', 'window_position', 'x'), x)
