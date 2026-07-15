@@ -981,12 +981,12 @@ def on_close():
 
 #----------------------------------------------------------------------------------------------------------- TOOLTIP WINDOW
 def setup_tooltip(root):
-    """Настройка подсказок"""
+    """Configure tooltips."""
     fonts = {'tooltip': tooltip_font}
     tooltip = TooltipWindow(root, fonts)
     
     def get_tooltip_text(item):
-        """Получение текста подсказки для элемента"""
+        """Get the tooltip text for an item."""
         tags = process_tree.item(item, 'tags')
         folder_path = next((tag for tag in tags if '\\' in tag or '/' in tag), None)
         if folder_path:
@@ -1054,7 +1054,7 @@ def get_last_log_lines(folder_path):
     last_lines = data['last_log_lines']  # Get the last log lines
     formatted_lines = []
     
-    # Добавляем первую строку с названием папки, скриптом и счетом
+    # Add the first line with the folder name, script, and score
     folder_name = os.path.basename(folder_path)
     script_name = data.get('script_type', 'Unknown')
     highest_score = data.get('highest_score', 'N/A')
@@ -1174,7 +1174,7 @@ def show_stats_puzzle_menu(event=None):
     return "break"
 
 def check_client_changes(clients=None):
-    """Проверяет изменения в состоянии клиентов"""
+    """Check for changes in client state."""
     current_stats_clients = set()
     current_client_runtime = {}
     active_script_paths = set()
@@ -2019,9 +2019,9 @@ def dump_all_logs():
     """Saves logs of all active Foldit clients"""
     for item in process_tree.get_children():
         try:
-            # Получаем все теги элемента
+            # Get all item tags
             tags = process_tree.item(item, 'tags')
-            # Ищем тег с путем к папке (содержит \ или /)
+            # Find the tag containing the folder path (contains \\ or /)
             folder_path = next((tag for tag in tags if '\\' in tag or '/' in tag), None)
             if folder_path:
                 foldit_log_handler.export_log(
@@ -2037,9 +2037,9 @@ def open_all_logs():
     """Opens logs of all active Foldit clients"""
     for item in process_tree.get_children():
         try:
-            # Получаем все теги элемента
+            # Get all item tags
             tags = process_tree.item(item, 'tags')
-            # Ищем тег с путем к папке (содержит \ или /)
+            # Find the tag containing the folder path (contains \\ or /)
             folder_path = next((tag for tag in tags if '\\' in tag or '/' in tag), None)
             if folder_path:
                 foldit_log_handler.export_log(
@@ -2069,17 +2069,17 @@ def toggle_always_on_top():
     settings_manager.ALWAYS_ON_TOP = not settings_manager.ALWAYS_ON_TOP
     root.attributes("-topmost", settings_manager.ALWAYS_ON_TOP)
     
-    # Найти индекс элемента "Always on Top" динамически
+    # Find the index of the "Always on Top" item dynamically
     for i in range(context_menu.index("end") + 1):
         try:
-            # Проверяем, существует ли элемент
-            if context_menu.index(i) >= 0:  # Проверка на существование индекса
+            # Check whether the item exists
+            if context_menu.index(i) >= 0:  # Verify that the index exists
                 label = context_menu.entrycget(i, "label")
                 if "Always on Top" in label:
                     context_menu.entryconfig(i, label="✓ Always on Top" if settings_manager.ALWAYS_ON_TOP else "Always on Top")
                     break
         except tk.TclError:
-            # Игнорируем ошибку, если элемент не существует
+            # Ignore the error if the item does not exist
             continue
 
 share_info_cache = {}  # folder -> info dict filled in by _read_share_info worker
@@ -2609,8 +2609,8 @@ network_manager = NetworkManager(
         'artifact_received': handle_remote_artifact_received,
         'artifact_error': handle_remote_artifact_error,
     },
-    tree=process_tree,  # Добавляем process_tree
-    monitored_processes=monitored_processes,  # Добавляем monitored_processes
+    tree=process_tree,  # Pass process_tree
+    monitored_processes=monitored_processes,  # Pass monitored_processes
     password=settings_manager.NETWORK_PASSWORD,
     artifact_root=os.path.join(stats_manager.logs_folder, "_remote"),
     max_artifact_bytes=settings_manager.NETWORK_MAX_ARTIFACT_BYTES,
