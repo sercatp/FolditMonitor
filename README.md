@@ -52,5 +52,6 @@ The app also creates `logs/`, `puzzle_logs/`, and `foldit_backup/` when needed. 
 - `settings.py` — default and local settings.
 - `network.py` — local-network synchronisation and artifact transfer.
 - `stats_*.py`, `logger.py`, `log_lookup.py` — score/log parsing and the statistics UI.
+- `save_catalog.py`, `save_manager_qt.py`, `savefile_api.py` — indexed save-file browsing and export.
 - `foldit_speed_boost*.py` — optional Frida-based speed-boost integration.
 - `alert.wav` — default alert sound.

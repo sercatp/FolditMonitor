@@ -22,10 +22,12 @@ import tkinter as tk
 from tkinter import ttk, font, messagebox
 import threading
 import re
+from types import SimpleNamespace
 
 import datetime
 import shutil
 import tempfile
+from importlib import import_module
 
 PUZZLE_ID_RE = re.compile(r"""
     (?<!\d)                     # Do not start inside a longer number.
@@ -45,7 +47,6 @@ from log_lookup import find_matching_log_file, values_match_log_query
 from settings import Settings
 from tooltip import TooltipWindow
 from logger import FolditLogHandler
-from foldit_speed_boost_integration import FolditSpeedBoostIntegration
 from stats_module import StatsManager, parse_numeric_score
 from row_appearance import (
     ROW_APPEARANCE_TAG_PREFIX,
@@ -93,6 +94,25 @@ foldit_log_settings = {
 # Create an instance with the correct settings
 foldit_log_handler = FolditLogHandler(foldit_log_settings)
 speed_boost = None
+
+
+def create_speed_boost_integration(root_widget, tree_widget):
+    """Load the optional local feature without making monitor startup depend on it."""
+    if not settings_manager.SPEED_BOOST_ENABLED:
+        return None
+    try:
+        integration_module = import_module("foldit_speed_boost_integration")
+        integration_class = integration_module.FolditSpeedBoostIntegration
+        return integration_class(
+            root_widget,
+            tree_widget,
+            get_pid_tag,
+            settings_manager,
+        )
+    except Exception as error:
+        print(f"Optional speed boost unavailable: {error}")
+        return None
+
 
 # Now use settings_manager instead of settings
 window_width = 360
@@ -154,7 +174,7 @@ stats_button = None
 stats_puzzle_menu = None
 connect_menu = None
 logs_menu = None
-all_clients_menu = None
+speed_boost_menu = None
 palette_menu = None
 palette_var = None
 row_appearance_tags = set()
@@ -611,15 +631,19 @@ def update_process_list():
     current_items = set()
     current_artifact_rows = {}
     stats_targets_by_puzzle = {}
-    speed_boost_states = {
-        int(client.pid): {
-            "pid": int(client.pid),
-            "client_name": client.client_name,
-            "is_window_visible": bool(client.is_window_visible),
-            "script_running": False,
+    speed_boost_states = (
+        {
+            int(client.pid): {
+                "pid": int(client.pid),
+                "client_name": client.client_name,
+                "is_window_visible": bool(client.is_window_visible),
+                "script_running": False,
+            }
+            for client in clients
         }
-        for client in clients
-    }
+        if speed_boost is not None
+        else None
+    )
     
     for client in clients:
         try:
@@ -690,12 +714,13 @@ def update_process_list():
             if is_fin:
                 tags.append('fin_state')
 
-            speed_boost_states[pid] = {
-                "pid": pid,
-                "client_name": client.client_name,
-                "is_window_visible": is_window_visible,
-                "script_running": script_running,
-            }
+            if speed_boost_states is not None:
+                speed_boost_states[pid] = {
+                    "pid": pid,
+                    "client_name": client.client_name,
+                    "is_window_visible": is_window_visible,
+                    "script_running": script_running,
+                }
 
             alarm_armed = bool(process_state.get('alarm_on_change'))
             alarm_prev_score = (
@@ -779,7 +804,7 @@ def update_process_list():
     with artifact_row_cache_lock:
         artifact_row_cache = current_artifact_rows
 
-    if speed_boost is not None:
+    if speed_boost is not None and speed_boost_states is not None:
         speed_boost.on_clients_refreshed(speed_boost_states.values())
     
 
@@ -1120,7 +1145,74 @@ def open_stats_for_puzzle(puzzle_id):
             settings_manager,
             clean_puzzle_id,
             log_lookup_handler=handle_stats_log_lookup,
+            save_manager_handler=open_save_manager_window,
         )
+
+
+def normalize_save_manager_path(path):
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def get_save_manager_clients():
+    """Return installations from the monitor's plain-data cache (no Tk access)."""
+    running_paths = {}
+    with artifact_row_cache_lock:
+        cached_rows = [dict(row) for row in artifact_row_cache.values()]
+    for row in cached_rows:
+        folder = str(row.get("folder", "")).strip()
+        if folder:
+            running_paths[normalize_save_manager_path(folder)] = (
+                os.path.abspath(folder),
+                str(row.get("puzzle_id", "")).strip(),
+            )
+
+    parent_dirs = []
+    for folder, _active_puzzle_id in running_paths.values():
+        parent_dir = get_foldit_parent_dir(folder)
+        if parent_dir and parent_dir not in parent_dirs:
+            parent_dirs.append(parent_dir)
+    remembered_parent = str(settings_manager.LAST_SEEN_FOLDIT_PARENT).strip()
+    if remembered_parent and os.path.isdir(remembered_parent) and remembered_parent not in parent_dirs:
+        parent_dirs.append(remembered_parent)
+
+    folders = list(window_manager.find_installation_folders(parent_dirs))
+    known_keys = {normalize_save_manager_path(folder) for folder in folders}
+    for key, (folder, _active_puzzle_id) in running_paths.items():
+        if key not in known_keys:
+            folders.append(folder)
+            known_keys.add(key)
+
+    folders.sort(key=lambda folder: natural_sort(os.path.basename(folder)))
+    return [
+        SimpleNamespace(
+            name=os.path.basename(folder),
+            path=os.path.abspath(folder),
+            running=normalize_save_manager_path(folder) in running_paths,
+            active_puzzle_id=running_paths.get(normalize_save_manager_path(folder), ("", ""))[1],
+        )
+        for folder in folders
+    ]
+
+
+def open_save_manager_window(puzzle_id, initial_client_path=None, initial_scope="client"):
+    """Open the Qt Save Manager without crossing back into Tk from Qt callbacks."""
+    clean_puzzle_id = str(puzzle_id or "").strip()
+    if not clean_puzzle_id:
+        return
+    try:
+        from save_manager_qt import show_save_manager
+
+        show_save_manager(
+            root,
+            clean_puzzle_id,
+            get_save_manager_clients,
+            os.path.join(stats_manager.logs_folder, "_save_index.sqlite3"),
+            stats_manager.logs_folder,
+            initial_client_path=initial_client_path,
+            initial_scope=initial_scope,
+        )
+    except Exception as exc:
+        print(f"Error opening Save Manager: {exc}")
 
 
 def refresh_stats_puzzle_menu():
@@ -2128,6 +2220,7 @@ def get_share_info(folder, wait=0.35):
 
 STATS_TO_MAIN_LABEL = "To Main"
 STATS_TO_FINALIZATION_LABEL = "To Finalization"
+MANAGE_SAVES_LABEL = "Manage Saves"
 def get_client_stats_identity(row_id):
     """(client_name, puzzle_id) for a process-tree row, or None when the row has no
     active puzzle. Stats key clients by client_name on a recognized puzzle id, which
@@ -2162,11 +2255,9 @@ def remove_client_menu_items():
             label.startswith("Share ")
             or label == "Export to PDB"
             or label.endswith("Alarm on change")
-            or label in (STATS_TO_MAIN_LABEL, STATS_TO_FINALIZATION_LABEL)
+            or label in (STATS_TO_MAIN_LABEL, STATS_TO_FINALIZATION_LABEL, MANAGE_SAVES_LABEL)
         ):
             context_menu.delete(i)
-    if speed_boost is not None:
-        speed_boost.remove_client_menu_items(context_menu)
     remove_leading_context_separator()
 
 
@@ -2193,6 +2284,12 @@ def show_tree_context_menu(event):
     insert_index = 0
 
     pid = get_pid_tag(tags)
+    if speed_boost is not None:
+        speed_boost.populate_menu(
+            speed_boost_menu,
+            pid=pid,
+            client_name=os.path.basename(folder),
+        )
     if pid is not None:
         alarm_armed = bool(monitored_processes.get(pid, {}).get('alarm_on_change'))
         context_menu.insert(insert_index, "command",
@@ -2200,8 +2297,6 @@ def show_tree_context_menu(event):
             command=lambda p=pid: toggle_alarm_on_change(p),
         )
         insert_index += 1
-        if speed_boost is not None:
-            insert_index = speed_boost.insert_client_menu_item(context_menu, insert_index, pid, folder)
 
     # Stats: move this client between the Main (vertical) and Finalization
     # (horizontal) tables, depending on where it currently is.
@@ -2218,6 +2313,19 @@ def show_tree_context_menu(event):
             command=lambda p=puzzle_id, c=client_name, t=new_target: move_client_stats_target(p, c, t),
         )
         insert_index += 1
+
+    row = get_cached_artifact_row(item) or {}
+    row_puzzle_id = str(row.get("puzzle_id", "")).strip()
+    if row_puzzle_id:
+        context_menu.insert(
+            insert_index,
+            "command",
+            label=MANAGE_SAVES_LABEL,
+            command=lambda p=row_puzzle_id, f=folder: open_save_manager_window(p, f, "client"),
+        )
+    else:
+        context_menu.insert(insert_index, "command", label=MANAGE_SAVES_LABEL, state="disabled")
+    insert_index += 1
 
     info = get_share_info(folder)
     save_path = info.get('path')
@@ -2261,6 +2369,8 @@ def post_context_menu(event):
 def show_context_menu(event):
     """RMB outside client rows: global menu without per-client items."""
     remove_client_menu_items()
+    if speed_boost is not None:
+        speed_boost.populate_menu(speed_boost_menu)
     post_context_menu(event)
 
 def reset_window_size():
@@ -2503,10 +2613,9 @@ if settings_manager.settings['display']['show_puzzle_column']:
     process_tree.heading("Puzzle", text="Puzzle")
     process_tree.column("Puzzle", width=50, stretch=False)
 process_tree.pack(fill="both", expand=True)
-speed_boost = FolditSpeedBoostIntegration(
+speed_boost = create_speed_boost_integration(
     root,
     process_tree,
-    get_pid_tag,
 )
 
 
@@ -2571,10 +2680,10 @@ for palette_name in settings_manager.DISPLAY_PALETTES:
         variable=palette_var,
         command=lambda name=palette_name: apply_display_palette(name),
     )
-all_clients_menu = tk.Menu(context_menu, tearoff=0)
 if speed_boost is not None:
-    speed_boost.add_global_menu_items(all_clients_menu)
-    context_menu.add_cascade(label="All clients", menu=all_clients_menu)
+    speed_boost_menu = tk.Menu(context_menu, tearoff=0)
+    speed_boost.populate_menu(speed_boost_menu)
+    context_menu.add_cascade(label="Speed boost", menu=speed_boost_menu)
     context_menu.add_separator()
 context_menu.add_cascade(label="Palette", menu=palette_menu)
 context_menu.add_command(label="Always on Top", command=toggle_always_on_top)

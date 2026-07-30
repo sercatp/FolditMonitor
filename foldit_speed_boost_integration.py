@@ -1,16 +1,19 @@
 import os
 import threading
+import tkinter as tk
 from tkinter import messagebox
 
 from foldit_speed_boost import (
     FolditSpeedBoostManager,
+    SpeedBoostTiming,
     SpeedBoostUnavailable,
     unavailable_message,
 )
 
 
 SPEED_BOOST_LABEL = "Enable speed boost"
-STOP_SPEED_BOOST_LABEL = "Disable speed boost"
+STOP_SPEED_BOOST_LABEL = "Disable speed boost (active)"
+ARMED_SPEED_BOOST_LABEL = "Disable speed boost (armed; waiting for script)"
 SPEED_BOOST_BUSY_LABEL = "Speed boost in progress..."
 SPEED_BOOST_ALL_LABEL = "Enable speed boost for all clients"
 STOP_SPEED_BOOST_ALL_LABEL = "Disable speed boost for all clients"
@@ -19,11 +22,18 @@ STOP_SPEED_BOOST_ALL_LABEL = "Disable speed boost for all clients"
 class FolditSpeedBoostIntegration:
     """Tk/Foldit Monitor glue for the optional Frida speed boost."""
 
-    def __init__(self, root, process_tree, get_pid_tag):
+    def __init__(self, root, process_tree, get_pid_tag, settings_manager):
         self.root = root
         self.process_tree = process_tree
         self.get_pid_tag = get_pid_tag
-        self.manager = FolditSpeedBoostManager()
+        self.settings_manager = settings_manager
+        self.profile_var = tk.StringVar(
+            master=root,
+            value=settings_manager.SPEED_BOOST_PROFILE,
+        )
+        self.manager = FolditSpeedBoostManager(
+            timing=self._timing_for_profile(settings_manager.SPEED_BOOST_PROFILE)
+        )
         self.armed_pids = set()
         self.script_running_pids = set()
         self.busy_pids = set()
@@ -33,39 +43,83 @@ class FolditSpeedBoostIntegration:
         self._lock = threading.RLock()
         self._closed = False
         self._pending_sync = None
+        self._active_sync = None
+        self._last_completed_sync = None
         self._sync_running = False
+        self._pending_profile = None
+        self._profile_sync_running = False
 
-    def remove_client_menu_items(self, menu) -> None:
-        for i in range(menu.index("end"), -1, -1):
-            try:
-                label = menu.entrycget(i, "label")
-            except Exception:
-                continue
-            if label in (SPEED_BOOST_LABEL, STOP_SPEED_BOOST_LABEL, SPEED_BOOST_BUSY_LABEL):
-                menu.delete(i)
+    def _timing_for_profile(self, profile_name: str) -> SpeedBoostTiming:
+        profile = self.settings_manager.SPEED_BOOST_PROFILES.get(profile_name)
+        if profile is None:
+            profile = self.settings_manager.SPEED_BOOST_PROFILES[
+                self.settings_manager.DEFAULT_SPEED_BOOST_PROFILE
+            ]
+        return SpeedBoostTiming(
+            replacement_sleep_ms=int(profile["replacement_sleep_ms"]),
+            timer_resolution_ms=int(profile["timer_resolution_ms"]),
+        )
 
-    def insert_client_menu_item(self, menu, insert_index: int, pid, folder: str) -> int:
+    def _client_menu_state(self, pid: int):
         pid = int(pid)
         with self._lock:
             is_busy = pid in self.busy_pids
             is_armed = pid in self.armed_pids
+            is_enabled = pid in self.enabled_pids
         if is_busy:
             label = SPEED_BOOST_BUSY_LABEL
             state = "disabled"
-        elif is_armed:
+        elif is_enabled:
             label = STOP_SPEED_BOOST_LABEL
+            state = "normal"
+        elif is_armed:
+            label = ARMED_SPEED_BOOST_LABEL
             state = "normal"
         else:
             label = SPEED_BOOST_LABEL
             state = "normal"
-        menu.insert(
-            insert_index,
-            "command",
-            label=label,
-            state=state,
-            command=lambda p=int(pid), c=os.path.basename(folder): self.toggle(p, c),
+        return label, state
+
+    def populate_menu(self, menu, pid=None, client_name: str = "") -> None:
+        """Rebuild the single Speed boost submenu for global or row context."""
+        menu.delete(0, tk.END)
+        if pid is not None:
+            pid = int(pid)
+            clean_name = str(client_name or self.client_names.get(pid, pid))
+            label, state = self._client_menu_state(pid)
+            menu.add_command(
+                label=f"{label} [{clean_name}]",
+                state=state,
+                command=lambda p=pid, c=clean_name: self.toggle(p, c),
+            )
+            menu.add_separator()
+
+        rows = self._row_clients()
+        menu.add_command(
+            label=SPEED_BOOST_ALL_LABEL,
+            state="normal" if rows else "disabled",
+            command=self.speed_up_all,
         )
-        return insert_index + 1
+        with self._lock:
+            can_stop_all = bool(self.armed_pids)
+        menu.add_command(
+            label=STOP_SPEED_BOOST_ALL_LABEL,
+            state="normal" if can_stop_all else "disabled",
+            command=self.stop_all,
+        )
+        menu.add_separator()
+
+        active_profile = self.settings_manager.SPEED_BOOST_PROFILE
+        self.profile_var.set(active_profile)
+        for profile_name, profile in self.settings_manager.SPEED_BOOST_PROFILES.items():
+            replacement_ms = int(profile["replacement_sleep_ms"])
+            resolution_ms = int(profile["timer_resolution_ms"])
+            menu.add_radiobutton(
+                label=f"{profile['label']} — {replacement_ms}/{resolution_ms} ms",
+                value=profile_name,
+                variable=self.profile_var,
+                command=lambda name=profile_name: self.select_profile(name),
+            )
 
     def before_activate(self, pid, after=None) -> bool:
         # This hook only shortens solver-worker waits, not the UI Sleep loop.
@@ -75,6 +129,8 @@ class FolditSpeedBoostIntegration:
     def on_clients_refreshed(self, clients) -> None:
         sync_state = tuple(self._normalize_client_state(client) for client in clients)
         with self._lock:
+            if self._closed:
+                return
             for pid, is_visible, client_name, script_running in sync_state:
                 self.client_names[pid] = client_name
                 if script_running is not None:
@@ -82,6 +138,14 @@ class FolditSpeedBoostIntegration:
                         self.script_running_pids.add(pid)
                     else:
                         self.script_running_pids.discard(pid)
+
+            if sync_state == self._pending_sync:
+                return
+            if sync_state == self._active_sync and self._pending_sync is None:
+                return
+            if not self._sync_running and sync_state == self._last_completed_sync:
+                return
+
             self._pending_sync = sync_state
             if self._sync_running:
                 return
@@ -102,9 +166,42 @@ class FolditSpeedBoostIntegration:
         self._closed = True
         self.manager.abandon_all()
 
-    def add_global_menu_items(self, menu) -> None:
-        menu.add_command(label=SPEED_BOOST_ALL_LABEL, command=self.speed_up_all)
-        menu.add_command(label=STOP_SPEED_BOOST_ALL_LABEL, command=self.stop_all)
+    def select_profile(self, profile_name: str) -> None:
+        if profile_name not in self.settings_manager.SPEED_BOOST_PROFILES:
+            return
+        timing = self._timing_for_profile(profile_name)
+        self.settings_manager.save_speed_boost_profile(profile_name)
+        self.profile_var.set(profile_name)
+        with self._lock:
+            self._pending_profile = (profile_name, timing)
+            if self._profile_sync_running:
+                return
+            self._profile_sync_running = True
+        self._run_thread(self._worker_apply_profiles)
+
+    def _worker_apply_profiles(self) -> None:
+        while not self._closed:
+            with self._lock:
+                pending_profile = self._pending_profile
+                self._pending_profile = None
+                if pending_profile is None:
+                    self._profile_sync_running = False
+                    return
+
+            profile_name, timing = pending_profile
+            results = self.manager.set_timing(timing)
+            failed_pids = [pid for pid, applied in results.items() if not applied]
+            if failed_pids:
+                failed_text = ", ".join(str(pid) for pid in failed_pids)
+                self.manager.log(
+                    f"Speed boost profile {profile_name}: failed for pid(s) {failed_text}"
+                )
+                with self._lock:
+                    is_latest = self._pending_profile is None
+                if is_latest:
+                    self._post_error(
+                        f"The profile was saved, but could not be applied to client(s): {failed_text}"
+                    )
 
     def _show_dependency_message(self) -> None:
         messagebox.showinfo("Speed boost dependency", unavailable_message())
@@ -186,11 +283,11 @@ class FolditSpeedBoostIntegration:
     def stop_all(self) -> None:
         with self._lock:
             pids = set(self.armed_pids)
+            self.armed_pids.difference_update(pids)
         for pid in pids:
             with self._lock:
                 if not self._mark_busy_locked(pid):
                     continue
-                self.armed_pids.discard(pid)
             self._run_thread(self._worker_disable_one, pid)
 
     def _after(self, delay_ms: int, callback) -> None:
@@ -281,52 +378,66 @@ class FolditSpeedBoostIntegration:
             self._clear_busy((pid,))
 
     def _worker_sync_clients(self) -> None:
-        while not self._closed:
+        while True:
             with self._lock:
+                if self._closed:
+                    self._active_sync = None
+                    self._sync_running = False
+                    return
                 sync_state = self._pending_sync
                 self._pending_sync = None
-            if sync_state is None:
-                with self._lock:
+                self._active_sync = sync_state
+                if sync_state is None:
                     self._sync_running = False
-                return
+                    return
 
-            live_pids = {pid for pid, _, _, _ in sync_state}
-            visible_by_pid = {pid: is_visible for pid, is_visible, _, _ in sync_state}
-            client_name_by_pid = {pid: client_name for pid, _, client_name, _ in sync_state}
-            snapshot = self.manager.snapshot()
-            for pid in list(snapshot):
-                if pid not in live_pids:
+            completed = False
+            try:
+                live_pids = {pid for pid, _, _, _ in sync_state}
+                visible_by_pid = {pid: is_visible for pid, is_visible, _, _ in sync_state}
+                client_name_by_pid = {pid: client_name for pid, _, client_name, _ in sync_state}
+                snapshot = self.manager.snapshot()
+                for pid in list(snapshot):
+                    if pid not in live_pids:
+                        if self._mark_busy(pid):
+                            try:
+                                self.manager.forget(pid)
+                                with self._lock:
+                                    self.armed_pids.discard(pid)
+                                    self.script_running_pids.discard(pid)
+                                    self.client_names.pop(pid, None)
+                                self._refresh_snapshot()
+                            finally:
+                                self._clear_busy((pid,))
+                for pid, is_visible in visible_by_pid.items():
+                    with self._lock:
+                        desired_enabled = self._desired_enabled_locked(pid, is_visible)
+                        client_name = client_name_by_pid.get(pid) or self.client_names.get(pid, str(pid))
+                        current_enabled = snapshot.get(pid)
+                    if current_enabled is None:
+                        if not desired_enabled:
+                            continue
+                        if self._mark_busy(pid):
+                            self._run_thread(self._worker_enable_one, pid, client_name)
+                        continue
+                    if current_enabled == desired_enabled:
+                        continue
                     if self._mark_busy(pid):
                         try:
-                            self.manager.forget(pid)
-                            with self._lock:
-                                self.armed_pids.discard(pid)
-                                self.script_running_pids.discard(pid)
-                                self.client_names.pop(pid, None)
+                            self.manager.set_enabled(pid, desired_enabled)
                             self._refresh_snapshot()
                         finally:
                             self._clear_busy((pid,))
-            for pid, is_visible in visible_by_pid.items():
+                completed = True
+            except Exception as exc:
+                self.manager.log(f"Speed boost client sync failed: {exc}")
+            finally:
                 with self._lock:
-                    desired_enabled = self._desired_enabled_locked(pid, is_visible)
-                    client_name = client_name_by_pid.get(pid) or self.client_names.get(pid, str(pid))
-                    current_enabled = snapshot.get(pid)
-                if current_enabled is None:
-                    if not desired_enabled:
-                        continue
-                    if self._mark_busy(pid):
-                        self._run_thread(self._worker_enable_one, pid, client_name)
-                    continue
-                if current_enabled == desired_enabled:
-                    continue
-                if self._mark_busy(pid):
-                    try:
-                        self.manager.set_enabled(pid, desired_enabled)
-                        self._refresh_snapshot()
-                    finally:
-                        self._clear_busy((pid,))
-
-            with self._lock:
-                if self._pending_sync is None:
-                    self._sync_running = False
-                    break
+                    if completed:
+                        self._last_completed_sync = sync_state
+                        if self._pending_sync == sync_state:
+                            self._pending_sync = None
+                    self._active_sync = None
+                    if self._pending_sync is None:
+                        self._sync_running = False
+                        return

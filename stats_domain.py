@@ -248,14 +248,10 @@ def append_text_history_if_changed(current_value: Any, new_value: Any) -> tuple[
 
 
 class FinalizationDomain:
-    def __init__(self, settings: Dict[str, Any], score_decimals: int):
-        self.score_decimals = max(0, int(score_decimals))
+    def __init__(self, settings: Dict[str, Any]):
         self.script_column_numbers = self._build_script_column_numbers(settings)
         self.default_numbered_columns = self._build_default_numbered_columns(settings)
         self.gap_column_numbers = self._build_gap_column_numbers(settings)
-
-    def set_score_decimals(self, decimals: int):
-        self.score_decimals = max(0, int(decimals))
 
     @staticmethod
     def _build_script_column_numbers(settings: Dict[str, Any]) -> Dict[str, int]:
@@ -854,8 +850,9 @@ class FinalizationDomain:
 
         return clean_key == self.dynamic_column_key(clean_name)
 
-    def scores_match_for_startup(self, saved_score: Any, current_score: float) -> bool:
-        return format_score_latest(saved_score, self.score_decimals) == format_score(current_score, self.score_decimals)
+    @staticmethod
+    def scores_match_for_startup(saved_score: Any, current_score: float, score_decimals: int) -> bool:
+        return format_score_latest(saved_score, score_decimals) == format_score(current_score, score_decimals)
 
     def resolve_startup_target(
         self,
@@ -863,6 +860,7 @@ class FinalizationDomain:
         client_name: str,
         script_name: str,
         score_value: float,
+        score_decimals: int,
     ) -> str:
         row_idx = self.find_last_fin_row_with_cells_index(puzzle, client_name)
         if row_idx is None:
@@ -877,7 +875,7 @@ class FinalizationDomain:
             return "vertical"
 
         saved_score = row.get("cells", {}).get(last_key, "")
-        if not self.scores_match_for_startup(saved_score, score_value):
+        if not self.scores_match_for_startup(saved_score, score_value, score_decimals):
             return "vertical"
 
         return "horizontal"

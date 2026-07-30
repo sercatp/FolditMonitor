@@ -138,6 +138,7 @@ class StatsEditorSession:
         self.fin_columns: List[Dict[str, Any]] = []
         self.active_targets: Dict[str, str] = {}
         self.client_runtime: Dict[str, Dict[str, Any]] = {}
+        self.score_decimals = self.manager.default_score_decimals
         self.ui_dirty = False
 
         self.reload_from_manager(preserve_dirty=False)
@@ -154,6 +155,7 @@ class StatsEditorSession:
         self.fin_columns = self.manager.get_fin_columns(self.puzzle_id)
         self.active_targets = self.manager.get_active_targets(self.puzzle_id)
         self.client_runtime = self.manager.get_client_runtime(self.puzzle_id)
+        self.score_decimals = self.manager.get_puzzle_score_decimals(self.puzzle_id)
         self._ensure_client_state(extra_clients=all_clients)
         self.ui_dirty = was_dirty if preserve_dirty else False
 
@@ -165,7 +167,7 @@ class StatsEditorSession:
         self.manager.set_fin_state(self.puzzle_id, self.fin_rows, self.fin_columns, self.active_targets)
 
     def save(self, decimals: int):
-        self.manager.set_score_decimals(decimals)
+        self.manager.set_puzzle_score_decimals(self.puzzle_id, decimals)
         self.sync_to_manager()
         self.manager.save_puzzle(self.puzzle_id, force=True)
         self.reload_from_manager(preserve_dirty=False)
@@ -221,7 +223,7 @@ class StatsEditorSession:
         elif column_name == "start_score":
             row["start_score"] = normalize_score_value(new_text)
         else:
-            score_value = normalize_score_history_edit_value(new_text, self.manager.score_decimals)
+            score_value = normalize_score_history_edit_value(new_text, self.score_decimals)
             if str(score_value).strip():
                 row.setdefault("cells", {})[column_name] = score_value
             else:
@@ -328,7 +330,7 @@ class StatsEditorSession:
                 updated_value, _changed = update_history(
                     cells.get(key, ""),
                     score_value,
-                    self.manager.score_decimals,
+                    self.score_decimals,
                 )
                 if str(updated_value).strip():
                     cells[key] = updated_value
@@ -406,7 +408,7 @@ class StatsEditorSession:
         self.append_vertical_entry(
             client_name,
             self.fin_script_from_column(column_key),
-            format_score_line(latest_history_value(score), self.manager.score_decimals),
+            format_score_line(latest_history_value(score), self.score_decimals),
         )
         if is_last_row and is_last_cell:
             self.active_targets[client_name] = "vertical"
@@ -430,7 +432,7 @@ class StatsEditorSession:
                 self.append_vertical_entry(
                     client_name,
                     self.fin_script_from_column(key),
-                    format_score_line(latest_history_value(row["cells"][key]), self.manager.score_decimals),
+                    format_score_line(latest_history_value(row["cells"][key]), self.score_decimals),
                 )
 
         self.active_targets[client_name] = "vertical"
@@ -702,6 +704,10 @@ class StatsWindowControllerMixin:
         return self.session.puzzle_id
 
     @property
+    def score_decimals(self) -> int:
+        return self.session.score_decimals
+
+    @property
     def working_entries(self) -> Dict[str, List[Dict[str, Any]]]:
         return self.session.working_entries
 
@@ -836,7 +842,7 @@ class StatsWindowControllerMixin:
             if row_idx < len(entries):
                 entry = entries[row_idx]
                 script = str(entry.get("script", "")).strip()
-                score = format_score(entry.get("score", ""), self.manager.score_decimals)
+                score = format_score(entry.get("score", ""), self.score_decimals)
             else:
                 script = ""
                 score = ""
@@ -857,8 +863,8 @@ class StatsWindowControllerMixin:
         if column_key == "start_from":
             return str(row.get("start_from", "")).strip()
         if column_key == "start_score":
-            return format_score(row.get("start_score", ""), self.manager.score_decimals)
-        return format_score_latest(row.get("cells", {}).get(column_key, ""), self.manager.score_decimals)
+            return format_score(row.get("start_score", ""), self.score_decimals)
+        return format_score_latest(row.get("cells", {}).get(column_key, ""), self.score_decimals)
 
     def _selected_fin_cell_clipboard_text(self) -> Optional[str]:
         selected_cell = self._require_fin_cell()
@@ -1169,7 +1175,7 @@ class StatsWindowControllerMixin:
             self._refresh_stats_view(fin_view_mode="preserve")
 
     def _has_unsaved_changes(self) -> bool:
-        return self.ui_dirty or self._get_decimals_text().strip() != str(self.manager.score_decimals)
+        return self.ui_dirty or self._get_decimals_text().strip() != str(self.score_decimals)
 
     def client_table_summary(self) -> str:
         """One-line overview of which table each client feeds; stopped clients in parentheses."""
@@ -1219,8 +1225,8 @@ class StatsWindowControllerMixin:
 
         self._pending_manager_reload = False
         self._set_window_puzzle(clean_puzzle_id)
-        self._set_decimals_value(int(self.manager.score_decimals))
         self._load_working_data()
+        self._set_decimals_value(self.score_decimals)
         self._refresh_stats_view(preserve_selection=False, fin_view_mode="bottom")
         self.focus_window()
         return True
@@ -1249,14 +1255,7 @@ class StatsWindowControllerMixin:
             self._show_error("Save", f"Puzzle {self.puzzle_id} saved, but flushing other puzzles failed:\n{exc}")
 
         self._pending_manager_reload = False
-
-        if hasattr(self.settings_source, "save_stats_score_decimals"):
-            try:
-                self.settings_source.save_stats_score_decimals(decimals)
-            except Exception as exc:
-                self._show_error("Save", f"Puzzle saved, but failed to save decimals setting:\n{exc}")
-
-        self._set_decimals_value(int(self.manager.score_decimals))
+        self._set_decimals_value(self.score_decimals)
         self._refresh_stats_view(main_view_mode="preserve", fin_view_mode="preserve")
         return True
 
