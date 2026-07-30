@@ -15,6 +15,7 @@ Import examples:
         get_basic_info,
         get_bonus_score,
         get_disulfide_info,
+        get_save_summary,
         get_player_name,
         get_save_name,
         get_foldit_score,
@@ -26,6 +27,8 @@ Import examples:
     info = get_basic_info(save_path)
     print(info.player_name)
     print(info.save_name)
+    summary = get_save_summary(save_path)
+    print(summary.base_score, summary.bonus_score, summary.total_score)
     print(info.foldit_score)
 
     player_name = get_player_name(save_path)
@@ -39,6 +42,7 @@ Import examples:
 
 Available functions:
     get_basic_info(save_path) -> FolditBasicInfo
+    get_save_summary(save_path) -> FolditSaveSummary
     get_bonus_score(save_path) -> float
     get_disulfide_info(save_path) -> FolditDisulfideInfo
     get_player_name(save_path) -> str
@@ -48,6 +52,7 @@ Available functions:
 
 Behavior:
     - `get_basic_info()` reads the save once and returns all 3 metadata fields.
+    - `get_save_summary()` also returns puzzle id and base/bonus/total scores.
     - The metadata functions do not export a PDB.
     - `export_pdb()` only exports the PDB and returns the written file path.
     - On parse problems, the module raises `FolditApiError`.
@@ -123,6 +128,16 @@ class FolditBasicInfo:
     player_name: str
     save_name: str
     foldit_score: float
+
+
+@dataclass(frozen=True)
+class FolditSaveSummary:
+    puzzle_id: int
+    player_name: str
+    save_name: str
+    base_score: float
+    bonus_score: float
+    total_score: float
 
 
 @dataclass(frozen=True)
@@ -1009,14 +1024,28 @@ def _find_player(data: bytes, energy_block: Optional[EnergyBlock] = None) -> Puz
     raise FolditApiError("Player block not found; cannot read player_name.")
 
 
-def _extract_basic_info(data: bytes) -> FolditBasicInfo:
+def _extract_save_summary(data: bytes) -> FolditSaveSummary:
     meta = _find_meta(data)
     energy_block = _find_energy(data, meta)
     player_block = _find_player(data, energy_block)
-    return FolditBasicInfo(
+    base_score = _calculate_base_score(energy_block)
+    bonus_score = _calculate_bonus_score(data)
+    return FolditSaveSummary(
+        puzzle_id=player_block.puzzle_id,
         player_name=player_block.player_name,
         save_name=meta.payload,
-        foldit_score=_calculate_base_score(energy_block) + _calculate_bonus_score(data),
+        base_score=base_score,
+        bonus_score=bonus_score,
+        total_score=base_score + bonus_score,
+    )
+
+
+def _extract_basic_info(data: bytes) -> FolditBasicInfo:
+    summary = _extract_save_summary(data)
+    return FolditBasicInfo(
+        player_name=summary.player_name,
+        save_name=summary.save_name,
+        foldit_score=summary.total_score,
     )
 
 
@@ -1024,6 +1053,12 @@ def get_basic_info(save_path: PathLike) -> FolditBasicInfo:
     """Return player_name, save_name, and foldit_score using one file read."""
     _, data = _read_save_bytes(save_path)
     return _extract_basic_info(data)
+
+
+def get_save_summary(save_path: PathLike) -> FolditSaveSummary:
+    """Return puzzle identity and base/bonus/total scores using one file read."""
+    _, data = _read_save_bytes(save_path)
+    return _extract_save_summary(data)
 
 
 def get_player_name(save_path: PathLike) -> str:
@@ -1101,6 +1136,7 @@ def export_pdb(save_path: PathLike, output_path: Optional[PathLike] = None) -> s
 __all__ = [
     "FolditApiError",
     "FolditBasicInfo",
+    "FolditSaveSummary",
     "FolditDisulfideInfo",
     "export_pdb",
     "get_basic_info",
@@ -1108,5 +1144,6 @@ __all__ = [
     "get_disulfide_info",
     "get_foldit_score",
     "get_player_name",
+    "get_save_summary",
     "get_save_name",
 ]

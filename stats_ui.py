@@ -241,6 +241,7 @@ class StatsWindowV2(StatsWindowControllerMixin):
         puzzle_id: str,
         settings_source: Any,
         log_lookup_handler: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        save_manager_handler: Optional[Callable[[str, Optional[str], str], Any]] = None,
     ):
         if StatsWindowV2.get_open_instance():
             if not StatsWindowV2.close_if_exists():
@@ -251,6 +252,7 @@ class StatsWindowV2(StatsWindowControllerMixin):
         self.settings_source = settings_source
         self.settings = resolve_settings_dict(settings_source)
         self.log_lookup_handler = log_lookup_handler
+        self.save_manager_handler = save_manager_handler
 
         self.clients: List[str] = []
 
@@ -306,9 +308,11 @@ class StatsWindowV2(StatsWindowControllerMixin):
 
         self.notes_button = ttk.Button(self.top_toolbar, text="Notes", command=self.open_notes_file)
         self.notes_button.pack(side=tk.RIGHT)
+        self.saves_button = ttk.Button(self.top_toolbar, text="Saves", command=self.open_save_manager)
+        self.saves_button.pack(side=tk.RIGHT, padx=(0, 4))
         ttk.Button(self.top_toolbar, text="Open Puzzle", command=self.open_puzzle_dialog).pack(side=tk.RIGHT, padx=(0, 4))
         ttk.Label(self.top_toolbar, text="Decimals:").pack(side=tk.LEFT)
-        self.decimals_var = tk.StringVar(value=str(self.manager.score_decimals))
+        self.decimals_var = tk.StringVar(value=str(self.score_decimals))
         self.decimals_spinbox = tk.Spinbox(
             self.top_toolbar,
             from_=0,
@@ -419,6 +423,20 @@ class StatsWindowV2(StatsWindowControllerMixin):
 
     def set_log_lookup_handler(self, log_lookup_handler: Optional[Callable[[Dict[str, Any]], Any]] = None):
         self.log_lookup_handler = log_lookup_handler
+
+    def set_save_manager_handler(
+        self,
+        save_manager_handler: Optional[Callable[[str, Optional[str], str], Any]] = None,
+    ):
+        self.save_manager_handler = save_manager_handler
+
+    def open_save_manager(self):
+        if self.save_manager_handler is None:
+            return
+        try:
+            self.save_manager_handler(self.puzzle_id, None, "running")
+        except Exception as exc:
+            messagebox.showerror("Save Manager", f"Failed to open Save Manager:\n{exc}", parent=self.window)
 
     def _bind_copy_shortcuts(self):
         shortcuts = ("<Control-c>", "<Control-C>", "<Control-Insert>", "<Command-c>", "<Command-C>")
@@ -679,7 +697,7 @@ class StatsWindowV2(StatsWindowControllerMixin):
         self._editor_commit = None
         self._pending_manager_reload = False
         self.session.discard_unsaved_changes()
-        self.decimals_var.set(str(self.manager.score_decimals))
+        self.decimals_var.set(str(self.score_decimals))
         if reload_ui:
             self._refresh_all(preserve_selection=False)
 
@@ -807,7 +825,7 @@ class StatsWindowV2(StatsWindowControllerMixin):
         entry = entries[row_idx]
         if value_type == "script":
             return str(entry.get("script", "")).strip()
-        return format_score(entry.get("score", ""), self.manager.score_decimals)
+        return format_score(entry.get("score", ""), self.score_decimals)
 
     def _fin_value(self, row_idx: int, column_name: str) -> str:
         if row_idx >= len(self.fin_rows):
@@ -823,8 +841,8 @@ class StatsWindowV2(StatsWindowControllerMixin):
             start_from = str(row.get("start_from", "")).strip()
             return display_fin_client_name(start_from)
         if column_name == "start_score":
-            return format_score(row.get("start_score", ""), self.manager.score_decimals)
-        return format_score(row.get("cells", {}).get(column_name, ""), self.manager.score_decimals)
+            return format_score(row.get("start_score", ""), self.score_decimals)
+        return format_score(row.get("cells", {}).get(column_name, ""), self.score_decimals)
 
     def _adjust_vertical_columns(self):
         for spec in self.vertical_column_specs:
@@ -1347,7 +1365,7 @@ class StatsWindowV2(StatsWindowControllerMixin):
         return self._start_editor(self.fin_tree, row_id, column_id, current_text, commit_edit)
 
     def _has_unsaved_changes(self) -> bool:
-        return self.ui_dirty or self.decimals_var.get().strip() != str(self.manager.score_decimals)
+        return self.ui_dirty or self.decimals_var.get().strip() != str(self.score_decimals)
 
     def open_puzzle_dialog(self):
         if not self._commit_active_editor():
@@ -1382,6 +1400,7 @@ def show_stats(
     settings_source: Any,
     puzzle_id: Optional[str] = None,
     log_lookup_handler: Optional[Callable[[Dict[str, Any]], Any]] = None,
+    save_manager_handler: Optional[Callable[[str, Optional[str], str], Any]] = None,
 ):
     backend_class = _get_selected_stats_window_class(settings_source, show_error=True)
     selected_puzzle_id = str(puzzle_id or "").strip()
@@ -1411,6 +1430,8 @@ def show_stats(
         open_instance = backend_class.get_open_instance()
         if open_instance is not None and hasattr(open_instance, "set_log_lookup_handler"):
             open_instance.set_log_lookup_handler(log_lookup_handler)
+        if open_instance is not None and hasattr(open_instance, "set_save_manager_handler"):
+            open_instance.set_save_manager_handler(save_manager_handler)
         return
 
     open_instance = backend_class.get_open_instance()
@@ -1418,9 +1439,18 @@ def show_stats(
         open_instance.open_puzzle(selected_puzzle_id)
         if hasattr(open_instance, "set_log_lookup_handler"):
             open_instance.set_log_lookup_handler(log_lookup_handler)
+        if hasattr(open_instance, "set_save_manager_handler"):
+            open_instance.set_save_manager_handler(save_manager_handler)
         return
 
-    backend_class(parent, stats_manager, selected_puzzle_id, settings_source, log_lookup_handler=log_lookup_handler)
+    backend_class(
+        parent,
+        stats_manager,
+        selected_puzzle_id,
+        settings_source,
+        log_lookup_handler=log_lookup_handler,
+        save_manager_handler=save_manager_handler,
+    )
 
 
 def _normalize_stats_ui_backend_name(raw_value: Any) -> str:

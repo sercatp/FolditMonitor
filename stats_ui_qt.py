@@ -641,6 +641,7 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
         puzzle_id: str,
         settings_source: Any,
         log_lookup_handler: Optional[Callable[[Dict[str, Any]], Any]] = None,
+        save_manager_handler: Optional[Callable[[str, Optional[str], str], Any]] = None,
     ):
         QtEventPump.ensure_started(pump_root)
         super().__init__(None)
@@ -651,6 +652,7 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
         self.settings_source = settings_source
         self.settings = resolve_settings_dict(settings_source)
         self.log_lookup_handler = log_lookup_handler
+        self.save_manager_handler = save_manager_handler
 
         display_settings = self.settings.get("display", {})
         row_appearance = display_settings.get("row_appearance", {})
@@ -748,7 +750,7 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
 
         self.decimals_spin = QSpinBox(central)
         self.decimals_spin.setRange(0, 6)
-        self.decimals_spin.setValue(int(self.manager.score_decimals))
+        self.decimals_spin.setValue(self.score_decimals)
         self.decimals_spin.setFixedWidth(56)
         top_row.addWidget(self.decimals_spin)
 
@@ -767,6 +769,10 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
         self.open_puzzle_button = QPushButton("Open Puzzle", central)
         self.open_puzzle_button.clicked.connect(self.open_puzzle_dialog)
         top_row.addWidget(self.open_puzzle_button)
+
+        self.saves_button = QPushButton("Saves", central)
+        self.saves_button.clicked.connect(self.open_save_manager)
+        top_row.addWidget(self.saves_button)
 
         self.notes_button = QPushButton("Notes", central)
         self.notes_button.clicked.connect(self.open_notes_file)
@@ -1126,7 +1132,7 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
     def _discard_unsaved_changes(self, reload_ui: bool = True):
         self._pending_manager_reload = False
         self.session.discard_unsaved_changes()
-        self._set_decimals_value(int(self.manager.score_decimals))
+        self._set_decimals_value(self.score_decimals)
         if reload_ui:
             self._refresh_all(preserve_selection=False)
 
@@ -1224,7 +1230,7 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
         entry = entries[row_idx]
         if value_type == "script":
             return str(entry.get("script", "")).strip()
-        return format_score(entry.get("score", ""), self.manager.score_decimals)
+        return format_score(entry.get("score", ""), self.score_decimals)
 
     def _vertical_tooltip_value(self, client_name: str, row_idx: int, value_type: str) -> str:
         entries = self.working_entries.get(client_name, [])
@@ -1233,7 +1239,7 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
         entry = entries[row_idx]
         if value_type == "script":
             return str(entry.get("script", "")).strip()
-        return format_score_line(entry.get("score", ""), self.manager.score_decimals)
+        return format_score_line(entry.get("score", ""), self.score_decimals)
 
     def _fin_value(self, row_idx: int, column_name: str, edit_mode: bool = False) -> str:
         if row_idx >= len(self.fin_rows):
@@ -1251,11 +1257,11 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
             raw_value = str(row.get("start_from", "")).strip()
             return raw_value if edit_mode else display_fin_client_name(raw_value)
         if column_name == "start_score":
-            return format_score(row.get("start_score", ""), self.manager.score_decimals)
+            return format_score(row.get("start_score", ""), self.score_decimals)
         raw_value = row.get("cells", {}).get(column_name, "")
         if edit_mode:
-            return encode_history_edit_value(raw_value, self.manager.score_decimals)
-        return format_score_latest(raw_value, self.manager.score_decimals)
+            return encode_history_edit_value(raw_value, self.score_decimals)
+        return format_score_latest(raw_value, self.score_decimals)
 
     def _fin_tooltip_value(self, row_idx: int, column_name: str) -> str:
         if row_idx >= len(self.fin_rows):
@@ -1266,13 +1272,27 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
         if column_name == "notes":
             return str(row.get("notes", "")).strip()
         if column_name == "start_score":
-            return format_score(row.get("start_score", ""), self.manager.score_decimals)
+            return format_score(row.get("start_score", ""), self.score_decimals)
         if column_name in {"client", "start_from"}:
             return self._fin_value(row_idx, column_name, edit_mode=True)
-        return format_score_history(row.get("cells", {}).get(column_name, ""), self.manager.score_decimals)
+        return format_score_history(row.get("cells", {}).get(column_name, ""), self.score_decimals)
 
     def set_log_lookup_handler(self, log_lookup_handler: Optional[Callable[[Dict[str, Any]], Any]] = None):
         self.log_lookup_handler = log_lookup_handler
+
+    def set_save_manager_handler(
+        self,
+        save_manager_handler: Optional[Callable[[str, Optional[str], str], Any]] = None,
+    ):
+        self.save_manager_handler = save_manager_handler
+
+    def open_save_manager(self):
+        if self.save_manager_handler is None:
+            return
+        try:
+            self.save_manager_handler(self.puzzle_id, None, "running")
+        except Exception as exc:
+            self._show_error("Save Manager", f"Failed to open Save Manager:\n{exc}")
 
     @staticmethod
     def _valid_log_query(query: Dict[str, Any]) -> bool:
@@ -1295,7 +1315,7 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
             "client_name": client_name,
             "puzzle_id": str(self.puzzle_id).strip(),
             "script_type": str(entry.get("script", "")).strip(),
-            "score": format_score(entry.get("score", ""), self.manager.score_decimals),
+            "score": format_score(entry.get("score", ""), self.score_decimals),
         }
         return query if self._valid_log_query(query) else None
 

@@ -104,7 +104,7 @@ class QtStatsLogQueryCases(unittest.TestCase):
         owner = SimpleNamespace(
             vertical_column_specs=[{"client": "foldit1", "type": "script"}],
             working_entries={"foldit1": [{"script": "DRW", "score": 4300.9}]},
-            manager=SimpleNamespace(score_decimals=1),
+            score_decimals=1,
             puzzle_id="1234",
             _valid_log_query=StatsWindowQt._valid_log_query,
         )

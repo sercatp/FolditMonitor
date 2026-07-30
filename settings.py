@@ -5,6 +5,49 @@ import sys
 from copy import deepcopy
 from typing import Dict, Any, Optional
 
+
+# User-selectable Foldit Speed Boost profiles. The public implementation keeps
+# the two return-address offsets that were already published; the offsets stay
+# encapsulated in foldit_speed_boost.py.
+SPEED_BOOST_PROFILES = {
+    "fastest": {
+        "label": "Fastest",
+        "replacement_sleep_ms": 1,
+        "timer_resolution_ms": 1,
+    },
+    "fast": {
+        "label": "Fast",
+        "replacement_sleep_ms": 2,
+        "timer_resolution_ms": 2,
+    },
+    "medium": {
+        "label": "Medium",
+        "replacement_sleep_ms": 5,
+        "timer_resolution_ms": 3,
+    },
+    "slower": {
+        "label": "Slower",
+        "replacement_sleep_ms": 15,
+        "timer_resolution_ms": 5,
+    },
+}
+DEFAULT_SPEED_BOOST_PROFILE = "fast"
+
+
+def _normalize_bool_setting(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    return bool(default)
+
+
 class Settings:
     def __init__(self, root_path: str):
         self.root_path = root_path
@@ -159,6 +202,9 @@ class Settings:
         self.SCRIPT_TYPE_FALLBACK_MAX_LENGTH = 10
         self.STATS_UI_BACKEND = "pyside6"
         self.STATS_LAST_PUZZLE = ""
+        self.SPEED_BOOST_PROFILES = deepcopy(SPEED_BOOST_PROFILES)
+        self.DEFAULT_SPEED_BOOST_PROFILE = DEFAULT_SPEED_BOOST_PROFILE
+        self.SPEED_BOOST_PROFILE = self.DEFAULT_SPEED_BOOST_PROFILE
 
         # Public starter profile. It retains the working script recognizers,
         # while exposing only part of the fixed FIN layout: 20/30/50/80.
@@ -322,6 +368,10 @@ class Settings:
                 "folder_name": self.BACKUP_FOLDER_NAME,
                 "save_to_backup": self.SAVE_TO_BACKUP
             },
+            "speed_boost": {
+                "enabled": True,
+                "profile": self.DEFAULT_SPEED_BOOST_PROFILE
+            },
             "script_type_mapping": self.SCRIPT_TYPE_MAPPING
         }
 
@@ -394,6 +444,12 @@ class Settings:
         if backend_text in {"qt", "pyside", "pyside6"}:
             return "pyside6"
         return "tk"
+
+    def _normalize_speed_boost_profile(self, profile_name: Any) -> str:
+        profile_text = str(profile_name).strip().lower()
+        if profile_text in self.SPEED_BOOST_PROFILES:
+            return profile_text
+        return self.DEFAULT_SPEED_BOOST_PROFILE
 
     def _migrate_stats_ui_backend_setting(self) -> bool:
         display_settings = self.user_settings.get("display")
@@ -488,6 +544,16 @@ class Settings:
         self.ROW_APPEARANCE = deepcopy(self.settings['display']['row_appearance'])
         self.STATS_UI_BACKEND = self.settings['display'].get('stats_ui_backend', self.STATS_UI_BACKEND)
         self.STATS_LAST_PUZZLE = str(self.settings['display'].get('stats_last_puzzle', self.STATS_LAST_PUZZLE)).strip()
+        speed_boost_settings = self.settings.get('speed_boost', {})
+        if not isinstance(speed_boost_settings, dict):
+            speed_boost_settings = {}
+        self.SPEED_BOOST_ENABLED = _normalize_bool_setting(
+            speed_boost_settings.get('enabled', False),
+            default=False,
+        )
+        self.SPEED_BOOST_PROFILE = self._normalize_speed_boost_profile(
+            speed_boost_settings.get('profile', self.DEFAULT_SPEED_BOOST_PROFILE)
+        )
         try:
             self.STALE_TICK_LIMIT = max(1, int(self.settings['display'].get('stale_tick_limit', self.STALE_TICK_LIMIT)))
         except (TypeError, ValueError):
@@ -580,6 +646,14 @@ class Settings:
         self._set_nested_value(self.settings, ('display', 'stats_last_puzzle'), clean_puzzle_id)
         self._set_nested_value(self.user_settings, ('display', 'stats_last_puzzle'), clean_puzzle_id)
         self.STATS_LAST_PUZZLE = clean_puzzle_id
+        self._save_user_settings()
+
+    def save_speed_boost_profile(self, profile_name: str):
+        """Persist the global Speed Boost timing profile."""
+        normalized_name = self._normalize_speed_boost_profile(profile_name)
+        self._set_nested_value(self.settings, ('speed_boost', 'profile'), normalized_name)
+        self._set_nested_value(self.user_settings, ('speed_boost', 'profile'), normalized_name)
+        self.SPEED_BOOST_PROFILE = normalized_name
         self._save_user_settings()
 
     def save_network_auto_reconnect(self, value: bool):

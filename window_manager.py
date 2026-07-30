@@ -406,8 +406,20 @@ def open_path(path):
 
 
 def open_folder(folder_path):
-    """Open the folder in the default file explorer."""
-    open_path(folder_path)
+    """Open a folder in the platform's default file manager."""
+    open_path(os.path.abspath(folder_path))
+
+
+def open_containing_folder(path):
+    """Open the directory containing *path* in the default file manager."""
+    absolute_path = os.path.abspath(path)
+    folder_path = absolute_path if os.path.isdir(absolute_path) else os.path.dirname(absolute_path)
+    open_folder(folder_path)
+
+
+def reveal_file(path):
+    """Compatibility alias: open the file's directory in the default file manager."""
+    open_containing_folder(path)
 
 
 def open_file(path, reveal_end=False):

@@ -1,8 +1,10 @@
 import ast
+import csv
 import json
 import os
 import re
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -88,14 +90,14 @@ def make_logger_settings():
     }
 
 
-def make_stats_manager(temp_dir: str, script_type_mapping=None) -> StatsManager:
+def make_stats_manager(temp_dir: str, script_type_mapping=None, score_decimals: int = 0) -> StatsManager:
     return StatsManager(
         temp_dir,
         {
             "logging": {
                 "logs_folder": "logs",
                 "stats_save_interval_minutes": 30,
-                "stats_score_decimals": 0,
+                "stats_score_decimals": score_decimals,
             },
             "script_type_mapping": dict(script_type_mapping or {}),
         },
@@ -405,6 +407,52 @@ class PublicStarterProfileCases(unittest.TestCase):
 
 
 class LoggerRewriteCases(unittest.TestCase):
+    def test_monitor_reuses_one_worker_thread_and_stops_it(self):
+        settings = make_logger_settings()
+        settings["CHECK_INTERVAL"] = 0.01
+        handler = LogFileHandler(settings, "unused-scriptlog.xml")
+        update_threads = []
+        enough_updates = threading.Event()
+
+        def record_update():
+            update_threads.append(threading.current_thread())
+            if len(update_threads) >= 4:
+                enough_updates.set()
+
+        handler._update_data = record_update
+        handler.start()
+        worker = handler._worker_thread
+        try:
+            completed = enough_updates.wait(timeout=1)
+        finally:
+            handler.stop()
+            worker.join(timeout=1)
+
+        self.assertTrue(completed)
+        self.assertIsNotNone(worker)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(all(thread is worker for thread in update_threads[1:]))
+        self.assertIsNone(handler._worker_thread)
+
+    def test_repeated_start_stop_does_not_accumulate_workers(self):
+        settings = make_logger_settings()
+        settings["CHECK_INTERVAL"] = 60
+        handler = LogFileHandler(settings, "unused-scriptlog.xml")
+        handler._update_data = lambda: None
+        workers = []
+
+        for _ in range(20):
+            handler.start()
+            worker = handler._worker_thread
+            self.assertIsNotNone(worker)
+            workers.append(worker)
+            handler.stop()
+            worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertIsNone(handler._worker_thread)
+
     def test_closed_drw_then_gab_rewrite_switches_script_type(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = os.path.join(temp_dir, "scriptlog.default.xml")
@@ -1060,6 +1108,63 @@ class StatsCopyFinalizationCases(unittest.TestCase):
                 [{"script": "from source", "score": 9711.0, "kind": "copy"}],
             )
             self.assertEqual(manager.get_entries_by_client("5678")["target"], [])
+
+
+class StatsScoreDecimalsCases(unittest.TestCase):
+    def test_new_puzzle_uses_global_default(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = make_stats_manager(temp_dir, score_decimals=2)
+
+            self.assertEqual(manager.get_puzzle_score_decimals("1234"), 2)
+
+    def test_each_puzzle_persists_its_own_decimals(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = make_stats_manager(temp_dir, score_decimals=1)
+            StatsEditorSession(manager, "1001").save(2)
+            StatsEditorSession(manager, "1002").save(4)
+
+            reloaded = make_stats_manager(temp_dir, score_decimals=6)
+
+            self.assertEqual(reloaded.get_puzzle_score_decimals("1001"), 2)
+            self.assertEqual(reloaded.get_puzzle_score_decimals("1002"), 4)
+            self.assertEqual(reloaded.get_puzzle_score_decimals("1003"), 6)
+
+    def test_live_updates_use_the_target_puzzles_decimals(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = make_stats_manager(temp_dir)
+            manager.set_puzzle_score_decimals("1001", 1)
+            manager.set_puzzle_score_decimals("1002", 2)
+            manager.set_puzzle_entries("1001", {"client1": [{"script": "DRW", "score": 100.129}]})
+            manager.set_puzzle_entries("1002", {"client2": [{"script": "DRW", "score": 100.129}]})
+
+            manager.handle_monitor_update("client1", "1001", "DRW", 100.987)
+            manager.handle_monitor_update("client2", "1002", "DRW", 100.987)
+
+            self.assertEqual(
+                manager.get_entries_by_client("1001")["client1"],
+                [{"script": "DRW", "score": "100.1→100.9"}],
+            )
+            self.assertEqual(
+                manager.get_entries_by_client("1002")["client2"],
+                [{"script": "DRW", "score": "100.12→100.98"}],
+            )
+
+    def test_flush_all_formats_each_puzzle_independently(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = make_stats_manager(temp_dir)
+            manager.set_puzzle_score_decimals("1001", 1)
+            manager.set_puzzle_score_decimals("1002", 3)
+            manager.set_puzzle_entries("1001", {"client1": [{"script": "DRW", "score": 100.9876}]})
+            manager.set_puzzle_entries("1002", {"client2": [{"script": "DRW", "score": 100.9876}]})
+
+            manager.flush_all()
+
+            with open(manager.get_csv_path("1001"), newline="", encoding="utf-8") as handle:
+                puzzle_one_rows = list(csv.reader(handle))
+            with open(manager.get_csv_path("1002"), newline="", encoding="utf-8") as handle:
+                puzzle_two_rows = list(csv.reader(handle))
+            self.assertEqual(puzzle_one_rows[1][1], "100.9")
+            self.assertEqual(puzzle_two_rows[1][1], "100.987")
 
 
 class StatsActiveTargetPersistenceCases(unittest.TestCase):

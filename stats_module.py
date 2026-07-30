@@ -45,6 +45,7 @@ class PuzzleData:
     fin_columns: List[Dict[str, Any]] = field(default_factory=list)
     active_targets: Dict[str, str] = field(default_factory=dict)
     active_fin_columns: Dict[str, str] = field(default_factory=dict)
+    score_decimals: int = 0
     loaded: bool = False
     dirty: bool = False
     last_save_ts: float = 0.0
@@ -78,18 +79,14 @@ class StatsManager:
 
         self.save_interval_minutes = int(logging_settings.get("stats_save_interval_minutes", 30))
         self.save_interval_seconds = max(60, self.save_interval_minutes * 60)
-        self.score_decimals = int(logging_settings.get("stats_score_decimals", 0))
+        self.default_score_decimals = max(0, int(logging_settings.get("stats_score_decimals", 0)))
 
         self.puzzles: Dict[str, PuzzleData] = {}
         self.active_clients: Dict[str, str] = {}  # client_name -> puzzle_id
         self.client_runtime: Dict[str, Dict[str, Any]] = {}  # client_name -> runtime status
         self._last_autosave_check = 0.0
-        self.table_domain = FinalizationDomain(settings, self.score_decimals)
+        self.table_domain = FinalizationDomain(settings)
         self._ui_bridge: Optional[StatsUiBridge] = None
-
-    def set_score_decimals(self, decimals: int):
-        self.score_decimals = max(0, int(decimals))
-        self.table_domain.set_score_decimals(self.score_decimals)
 
     def get_csv_path(self, puzzle_id: str) -> str:
         return os.path.join(self.logs_folder, f"{puzzle_id}.csv")
@@ -172,7 +169,7 @@ class StatsManager:
 
     def _get_or_create_puzzle(self, puzzle_id: str) -> PuzzleData:
         if puzzle_id not in self.puzzles:
-            self.puzzles[puzzle_id] = PuzzleData()
+            self.puzzles[puzzle_id] = PuzzleData(score_decimals=self.default_score_decimals)
         return self.puzzles[puzzle_id]
 
     @classmethod
@@ -319,6 +316,8 @@ class StatsManager:
             meta_row = rows[0]
             if len(meta_row) > 1:
                 puzzle.active_targets.update(self._deserialize_active_targets(meta_row[1]))
+            if len(meta_row) > 2 and str(meta_row[2]).strip():
+                puzzle.score_decimals = max(0, int(meta_row[2]))
             header_row = rows[1] if len(rows) > 1 else []
             fixed_indexes, dynamic_start = self._get_fin_header_layout(header_row)
             meta_dynamic_start = dynamic_start
@@ -427,17 +426,28 @@ class StatsManager:
             }
         )
 
-    def _build_state_text(self, script_name: str, score_value: Optional[float]) -> str:
+    def _build_state_text(
+        self,
+        script_name: str,
+        score_value: Optional[float],
+        score_decimals: int,
+    ) -> str:
         clean_script = normalize_state_value(script_name)
-        formatted_score = format_score(score_value, self.score_decimals)
+        formatted_score = format_score(score_value, score_decimals)
         if not clean_script:
             return formatted_score
         if not formatted_score:
             return clean_script
         return f"{clean_script} | {formatted_score}"
 
-    def _set_fin_state(self, row: Dict[str, Any], script_name: str, score_value: Optional[float]) -> bool:
-        state_text = self._build_state_text(script_name, score_value)
+    def _set_fin_state(
+        self,
+        row: Dict[str, Any],
+        script_name: str,
+        score_value: Optional[float],
+        score_decimals: int,
+    ) -> bool:
+        state_text = self._build_state_text(script_name, score_value, score_decimals)
         if not state_text:
             return False
 
@@ -521,7 +531,7 @@ class StatsManager:
         updated_value, changed = update_history(
             cells.get(column_key, ""),
             score_value,
-            self.score_decimals,
+            puzzle.score_decimals,
         )
         if changed:
             cells[column_key] = updated_value
@@ -529,7 +539,14 @@ class StatsManager:
 
         return row, changed
 
-    def _update_tail_main_anchor(self, entries: List[Dict[str, Any]], anchor_idx: int, script_name: str, score_value: float) -> bool:
+    def _update_tail_main_anchor(
+        self,
+        entries: List[Dict[str, Any]],
+        anchor_idx: int,
+        script_name: str,
+        score_value: float,
+        score_decimals: int,
+    ) -> bool:
         script_clean = str(script_name).strip()
         if anchor_idx < 0 or anchor_idx >= len(entries) or not script_clean:
             return False
@@ -540,8 +557,8 @@ class StatsManager:
             script_entry["script"] = script_clean
             changed = True
         # Keep where this script run started; the cell shows the end, tooltip the pair.
-        new_score = merge_score_line(script_entry.get("score"), score_value, self.score_decimals)
-        if format_score_line(script_entry.get("score"), self.score_decimals) != format_score_line(new_score, self.score_decimals):
+        new_score = merge_score_line(script_entry.get("score"), score_value, score_decimals)
+        if format_score_line(script_entry.get("score"), score_decimals) != format_score_line(new_score, score_decimals):
             script_entry["score"] = new_score
             changed = True
         return changed
@@ -552,6 +569,7 @@ class StatsManager:
         script_name: str,
         score_value: Optional[float],
         continue_tail: bool,
+        score_decimals: int,
     ) -> bool:
         script_clean = str(script_name).strip()
         if not script_clean or score_value is None:
@@ -563,13 +581,25 @@ class StatsManager:
             and anchor_idx is not None
             and self._scripts_match(entries[anchor_idx].get("script", ""), script_clean)
         ):
-            return self._update_tail_main_anchor(entries, anchor_idx, script_clean, score_value)
+            return self._update_tail_main_anchor(
+                entries,
+                anchor_idx,
+                script_clean,
+                score_value,
+                score_decimals,
+            )
 
         entries.append(self.normalize_main_entry({"script": script_clean, "score": score_value}))
         return True
 
-    def _upsert_tail_main_state(self, entries: List[Dict[str, Any]], script_name: str, score_value: Optional[float]) -> bool:
-        state_text = self._build_state_text(script_name, score_value)
+    def _upsert_tail_main_state(
+        self,
+        entries: List[Dict[str, Any]],
+        script_name: str,
+        score_value: Optional[float],
+        score_decimals: int,
+    ) -> bool:
+        state_text = self._build_state_text(script_name, score_value, score_decimals)
         if not state_text:
             return False
 
@@ -705,6 +735,7 @@ class StatsManager:
         puzzle.fin_columns.clear()
         puzzle.active_targets.clear()
         puzzle.active_fin_columns.clear()
+        puzzle.score_decimals = self.default_score_decimals
         puzzle.loaded = False
         puzzle.dirty = False
         puzzle.last_save_ts = 0.0
@@ -719,6 +750,24 @@ class StatsManager:
     def get_active_puzzles(self) -> List[str]:
         puzzles = {puzzle_id for puzzle_id in self.active_clients.values() if puzzle_id}
         return sorted(puzzles, key=natural_sort_key)
+
+    def get_puzzle_score_decimals(self, puzzle_id: str) -> int:
+        clean_puzzle_id = str(puzzle_id).strip()
+        if not clean_puzzle_id:
+            return self.default_score_decimals
+        self._ensure_puzzle_loaded(clean_puzzle_id)
+        return self._get_or_create_puzzle(clean_puzzle_id).score_decimals
+
+    def set_puzzle_score_decimals(self, puzzle_id: str, decimals: int):
+        clean_puzzle_id = str(puzzle_id).strip()
+        if not clean_puzzle_id:
+            return
+        self._ensure_puzzle_loaded(clean_puzzle_id)
+        puzzle = self._get_or_create_puzzle(clean_puzzle_id)
+        clean_decimals = max(0, int(decimals))
+        if puzzle.score_decimals != clean_decimals:
+            puzzle.score_decimals = clean_decimals
+            puzzle.dirty = True
 
     def get_client_order(self, puzzle_id: str) -> List[str]:
         puzzle_id = str(puzzle_id).strip()
@@ -923,6 +972,7 @@ class StatsManager:
                 clean_client_name,
                 script_clean,
                 score_value,
+                puzzle.score_decimals,
             )
 
         target_mode = puzzle.active_targets.get(clean_client_name, "vertical")
@@ -951,6 +1001,7 @@ class StatsManager:
             script_clean,
             score_value,
             continue_tail=bool(continue_tail),
+            score_decimals=puzzle.score_decimals,
         )
         if changed:
             puzzle.dirty = True
@@ -987,6 +1038,7 @@ class StatsManager:
             entries,
             script_clean,
             score_value,
+            puzzle.score_decimals,
         )
         if not changed:
             return
@@ -1037,7 +1089,7 @@ class StatsManager:
                     source_script_clean,
                     source_score_value,
                 )
-            self._set_fin_state(row, state_script, state_score_value)
+            self._set_fin_state(row, state_script, state_score_value, puzzle.score_decimals)
             puzzle.fin_rows.append(row)
             self.table_domain.prune_fin_data(puzzle)
             puzzle.dirty = True
@@ -1050,6 +1102,7 @@ class StatsManager:
                 puzzle.client_entries.setdefault(target_name, []),
                 state_script,
                 state_score_value,
+                puzzle.score_decimals,
             )
         puzzle.dirty = True
         self._push_update_to_open_window(puzzle_id)
@@ -1070,7 +1123,7 @@ class StatsManager:
                     row_values.extend(
                         [
                             str(entry.get("script", "")).strip(),
-                            format_score_line(entry.get("score", ""), self.score_decimals),
+                            format_score_line(entry.get("score", ""), puzzle.score_decimals),
                         ]
                     )
                 else:
@@ -1089,7 +1142,7 @@ class StatsManager:
                 [
                     self.FIN_META_MARKER,
                     self._serialize_active_targets(puzzle.active_targets),
-                    "",
+                    str(puzzle.score_decimals),
                     "",
                     "",
                     *[column["key"] for column in puzzle.fin_columns],
@@ -1108,10 +1161,10 @@ class StatsManager:
                     str(row.get("start_from", "")).strip(),
                     normalize_history_value(row.get("state", "")),
                     str(row.get("notes", "")).strip(),
-                    format_score(row.get("start_score", ""), self.score_decimals),
+                    format_score(row.get("start_score", ""), puzzle.score_decimals),
                 ]
                 for column in puzzle.fin_columns:
-                    row_values.append(format_score_history(cells.get(column["key"], ""), self.score_decimals))
+                    row_values.append(format_score_history(cells.get(column["key"], ""), puzzle.score_decimals))
                 writer.writerow(row_values)
 
     def save_puzzle(self, puzzle_id: str, force: bool = False):

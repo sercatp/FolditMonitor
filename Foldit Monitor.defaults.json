@@ -68,6 +68,10 @@
     "folder_name": "foldit_backup",
     "save_to_backup": true
   },
+  "speed_boost": {
+    "enabled": true,
+    "profile": "fast"
+  },
   "script_type_mapping": {
     "Deep Shake": {
       "name": "Deep Shake",

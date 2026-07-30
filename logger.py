@@ -275,7 +275,9 @@ class LogFileHandler:
             "stats_snapshot": None,
         }
         self.running = False
-        self.timer = None
+        self._stop_event = threading.Event()
+        self._worker_thread = None
+        self._lifecycle_lock = threading.Lock()
         self.last_mtime_ns = None
         self.last_size = None
         self.last_read_position = 0
@@ -299,23 +301,48 @@ class LogFileHandler:
         self.lock = threading.Lock()
 
     def start(self):
-        if self.running:
-            return
-        self.running = True
+        with self._lifecycle_lock:
+            if self.running:
+                return
+            self.running = True
+            stop_event = threading.Event()
+            self._stop_event = stop_event
+
+        # Preserve the previous behavior: the first snapshot is available before
+        # start() returns. Subsequent reads are handled by one persistent worker.
         self._update_data()
 
-    def stop(self):
-        self.running = False
-        if self.timer:
-            self.timer.cancel()
-
-    def _schedule_update(self):
-        if self.running:
-            self.timer = threading.Timer(
-                self.settings["CHECK_INTERVAL"],
-                self._update_data,
+        with self._lifecycle_lock:
+            if not self.running or self._stop_event is not stop_event:
+                return
+            worker = threading.Thread(
+                target=self._run_update_loop,
+                args=(stop_event,),
+                name=f"FolditLog:{os.path.basename(self.file_path)}",
+                daemon=True,
             )
-            self.timer.start()
+            self._worker_thread = worker
+            worker.start()
+
+    def stop(self):
+        with self._lifecycle_lock:
+            self.running = False
+            self._stop_event.set()
+
+    def _run_update_loop(self, stop_event):
+        try:
+            while True:
+                try:
+                    interval = max(0.01, float(self.settings["CHECK_INTERVAL"]))
+                except (KeyError, TypeError, ValueError):
+                    interval = 2.0
+                if stop_event.wait(interval):
+                    return
+                self._update_data()
+        finally:
+            with self._lifecycle_lock:
+                if self._worker_thread is threading.current_thread():
+                    self._worker_thread = None
 
     def _reset_cached_log_state(self):
         self._tail_lines.clear()
@@ -548,8 +575,6 @@ class LogFileHandler:
 
         except Exception as e:
             print(f"Error updating {self.file_path}: {e}")
-        finally:
-            self._schedule_update()
 
     def _reload_from_start(self, bootstrap_attach: bool = False):
         with self.lock:
