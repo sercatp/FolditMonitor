@@ -20,8 +20,6 @@ You need at least one local Foldit client and Python 3.11 or newer. Running the 
    python "Foldit Monitor.pyw"
    ```
 
-If your system calls Python `python3`, use that command instead of `python`.
-
 ### Alternative: Windows EXE
 
 If you do not want to install Python, open [the latest release](https://github.com/sercatp/FolditMonitor/releases/latest), download `FolditMonitor-windows-x64.zip`, extract the entire ZIP, and run `FolditMonitor.exe`. The ZIP already includes everything required.
