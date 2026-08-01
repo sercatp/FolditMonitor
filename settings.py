@@ -2,13 +2,15 @@ import os
 import json
 import re
 import sys
+import tempfile
+import threading
 from copy import deepcopy
 from typing import Dict, Any, Optional
 
 
-# User-selectable Foldit Speed Boost profiles. The public implementation keeps
-# the two return-address offsets that were already published; the offsets stay
-# encapsulated in foldit_speed_boost.py.
+# User-selectable Foldit Speed Boost profiles and the public fallback offsets.
+# A runtime JSON file may replace the offset list (the private installation does
+# this); no concrete game_library.dll offsets belong in the hook implementation.
 SPEED_BOOST_PROFILES = {
     "fastest": {
         "label": "Fastest",
@@ -32,6 +34,7 @@ SPEED_BOOST_PROFILES = {
     },
 }
 DEFAULT_SPEED_BOOST_PROFILE = "fast"
+DEFAULT_SPEED_BOOST_OFFSETS = ("0xDB729B", "0xE729B9")
 
 
 def _normalize_bool_setting(value: Any, default: bool = False) -> bool:
@@ -52,6 +55,7 @@ class Settings:
     def __init__(self, root_path: str):
         self.root_path = root_path
         self.settings_file = os.path.join(root_path, "Foldit Monitor.json")
+        self._settings_lock = threading.RLock()
         self.bundled_resource_root = getattr(
             sys,
             "_MEIPASS",
@@ -204,7 +208,10 @@ class Settings:
         self.STATS_LAST_PUZZLE = ""
         self.SPEED_BOOST_PROFILES = deepcopy(SPEED_BOOST_PROFILES)
         self.DEFAULT_SPEED_BOOST_PROFILE = DEFAULT_SPEED_BOOST_PROFILE
+        self.DEFAULT_SPEED_BOOST_OFFSETS = tuple(DEFAULT_SPEED_BOOST_OFFSETS)
         self.SPEED_BOOST_PROFILE = self.DEFAULT_SPEED_BOOST_PROFILE
+        self.SPEED_BOOST_OFFSETS = ()
+        self.SPEED_BOOST_CONFIG_ERROR = ""
 
         # Public starter profile. It retains the working script recognizers,
         # while exposing only part of the fixed FIN layout: 20/30/50/80.
@@ -369,8 +376,9 @@ class Settings:
                 "save_to_backup": self.SAVE_TO_BACKUP
             },
             "speed_boost": {
-                "enabled": True,
-                "profile": self.DEFAULT_SPEED_BOOST_PROFILE
+                "enabled": False,
+                "profile": self.DEFAULT_SPEED_BOOST_PROFILE,
+                "offsets": list(self.DEFAULT_SPEED_BOOST_OFFSETS),
             },
             "script_type_mapping": self.SCRIPT_TYPE_MAPPING
         }
@@ -399,6 +407,10 @@ class Settings:
             should_initialize_file = True
 
         should_initialize_file = self._migrate_stats_ui_backend_setting() or should_initialize_file
+        should_initialize_file = (
+            self._migrate_speed_boost_settings(default_settings)
+            or should_initialize_file
+        )
 
         effective_settings = deepcopy(self.user_settings)
         self._apply_defaults(effective_settings, default_settings)
@@ -451,6 +463,38 @@ class Settings:
             return profile_text
         return self.DEFAULT_SPEED_BOOST_PROFILE
 
+    def _normalize_speed_boost_offsets(self, offsets: Any) -> tuple[int, ...]:
+        if isinstance(offsets, (str, bytes)) or not isinstance(offsets, (list, tuple)):
+            raise ValueError("offsets must be a non-empty JSON array")
+        if not offsets:
+            raise ValueError("offsets must not be empty")
+
+        normalized = []
+        seen = set()
+        for raw_offset in offsets:
+            if isinstance(raw_offset, bool):
+                raise ValueError("boolean values are not valid offsets")
+            if isinstance(raw_offset, int):
+                offset = raw_offset
+            elif isinstance(raw_offset, str) and re.fullmatch(
+                r"0[xX][0-9a-fA-F]+",
+                raw_offset.strip(),
+            ):
+                offset = int(raw_offset.strip(), 16)
+            else:
+                raise ValueError(f"invalid offset value: {raw_offset!r}")
+
+            if offset < 0 or offset > 0xFFFFFFFF:
+                raise ValueError(f"offset is outside the 32-bit module range: {raw_offset!r}")
+            if offset in seen:
+                continue
+            seen.add(offset)
+            normalized.append(offset)
+
+        if not normalized:
+            raise ValueError("offsets must contain at least one unique value")
+        return tuple(normalized)
+
     def _migrate_stats_ui_backend_setting(self) -> bool:
         display_settings = self.user_settings.get("display")
         if not isinstance(display_settings, dict):
@@ -463,6 +507,30 @@ class Settings:
 
         display_settings["stats_ui_backend"] = normalized_value
         return True
+
+    def _migrate_speed_boost_settings(self, default_settings: Dict[str, Any]) -> bool:
+        """Persist missing Speed Boost keys without replacing explicit values."""
+        default_speed_boost = default_settings.get("speed_boost")
+        if not isinstance(default_speed_boost, dict):
+            default_speed_boost = {
+                "enabled": False,
+                "profile": self.DEFAULT_SPEED_BOOST_PROFILE,
+                "offsets": list(self.DEFAULT_SPEED_BOOST_OFFSETS),
+            }
+
+        current = self.user_settings.get("speed_boost")
+        if current is None:
+            self.user_settings["speed_boost"] = deepcopy(default_speed_boost)
+            return True
+        if not isinstance(current, dict):
+            return False
+
+        changed = False
+        for key in ("enabled", "profile", "offsets"):
+            if key not in current:
+                current[key] = deepcopy(default_speed_boost[key])
+                changed = True
+        return changed
 
     def _apply_defaults(self, target: Dict[str, Any], defaults: Dict[str, Any], path: tuple[str, ...] = ()) -> Dict[str, Any]:
         """Add only missing default values while preserving the user's order."""
@@ -493,9 +561,46 @@ class Settings:
             current = next_value
         current[path[-1]] = value
 
-    def _save_user_settings(self):
-        with open(self.settings_file, 'w', encoding='utf-8') as f:
-            json.dump(self.user_settings, f, indent=4, ensure_ascii=False)
+    def _get_nested_value(self, settings_dict: Dict[str, Any], path: tuple[str, ...]):
+        current = settings_dict
+        for key in path:
+            current = current[key]
+        return current
+
+    def _save_user_settings(self, changed_paths=()):
+        """Atomically persist settings while preserving unrelated disk edits."""
+        normalized_paths = tuple(tuple(path) for path in changed_paths)
+        with self._settings_lock:
+            settings_to_write = deepcopy(self.user_settings)
+            if normalized_paths and os.path.exists(self.settings_file):
+                try:
+                    with open(self.settings_file, "r", encoding="utf-8") as handle:
+                        latest_settings = json.load(handle)
+                    if not isinstance(latest_settings, dict):
+                        raise ValueError("Settings file root must be a JSON object.")
+                except (OSError, ValueError, json.JSONDecodeError) as error:
+                    print(f"Could not merge current settings file: {error}")
+                else:
+                    for path in normalized_paths:
+                        value = deepcopy(self._get_nested_value(settings_to_write, path))
+                        self._set_nested_value(latest_settings, path, value)
+                    settings_to_write = latest_settings
+                    self.user_settings = deepcopy(latest_settings)
+
+            fd, temporary_path = tempfile.mkstemp(
+                prefix=".Foldit Monitor.",
+                suffix=".tmp",
+                dir=self.root_path,
+                text=True,
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(settings_to_write, handle, indent=4, ensure_ascii=False)
+                    handle.write("\n")
+                os.replace(temporary_path, self.settings_file)
+            finally:
+                if os.path.exists(temporary_path):
+                    os.remove(temporary_path)
 
     def _resolve_runtime_or_bundled_file(self, file_name: Any) -> str:
         clean_file_name = str(file_name or "").strip()
@@ -545,15 +650,30 @@ class Settings:
         self.STATS_UI_BACKEND = self.settings['display'].get('stats_ui_backend', self.STATS_UI_BACKEND)
         self.STATS_LAST_PUZZLE = str(self.settings['display'].get('stats_last_puzzle', self.STATS_LAST_PUZZLE)).strip()
         speed_boost_settings = self.settings.get('speed_boost', {})
+        self.SPEED_BOOST_CONFIG_ERROR = ""
         if not isinstance(speed_boost_settings, dict):
-            speed_boost_settings = {}
-        self.SPEED_BOOST_ENABLED = _normalize_bool_setting(
-            speed_boost_settings.get('enabled', False),
-            default=False,
-        )
-        self.SPEED_BOOST_PROFILE = self._normalize_speed_boost_profile(
-            speed_boost_settings.get('profile', self.DEFAULT_SPEED_BOOST_PROFILE)
-        )
+            self.SPEED_BOOST_ENABLED = False
+            self.SPEED_BOOST_PROFILE = self.DEFAULT_SPEED_BOOST_PROFILE
+            self.SPEED_BOOST_OFFSETS = ()
+            self.SPEED_BOOST_CONFIG_ERROR = "speed_boost must be a JSON object"
+        else:
+            self.SPEED_BOOST_ENABLED = _normalize_bool_setting(
+                speed_boost_settings.get('enabled', False),
+                default=False,
+            )
+            self.SPEED_BOOST_PROFILE = self._normalize_speed_boost_profile(
+                speed_boost_settings.get('profile', self.DEFAULT_SPEED_BOOST_PROFILE)
+            )
+            try:
+                self.SPEED_BOOST_OFFSETS = self._normalize_speed_boost_offsets(
+                    speed_boost_settings.get('offsets')
+                )
+            except ValueError as error:
+                self.SPEED_BOOST_ENABLED = False
+                self.SPEED_BOOST_OFFSETS = ()
+                self.SPEED_BOOST_CONFIG_ERROR = str(error)
+        if self.SPEED_BOOST_CONFIG_ERROR:
+            print(f"Speed boost disabled: {self.SPEED_BOOST_CONFIG_ERROR}")
         try:
             self.STALE_TICK_LIMIT = max(1, int(self.settings['display'].get('stale_tick_limit', self.STALE_TICK_LIMIT)))
         except (TypeError, ValueError):
@@ -590,6 +710,7 @@ class Settings:
         self.low_cpu_threshold = self.LOW_CPU_THRESHOLD
         self.inactive_process_prefix = self.INACTIVE_PROCESS_PREFIX
         self.last_seen_foldit_parent = self.LAST_SEEN_FOLDIT_PARENT
+        self.speed_boost_offsets = self.SPEED_BOOST_OFFSETS
 
     def save_window_position(self, x: int, y: int):
         """Save the window position in the settings."""
@@ -597,7 +718,10 @@ class Settings:
         self._set_nested_value(self.settings, ('display', 'window_position', 'y'), y)
         self._set_nested_value(self.user_settings, ('display', 'window_position', 'x'), x)
         self._set_nested_value(self.user_settings, ('display', 'window_position', 'y'), y)
-        self._save_user_settings()
+        self._save_user_settings((
+            ('display', 'window_position', 'x'),
+            ('display', 'window_position', 'y'),
+        ))
 
     def save_stats_window_position(self, x: int, y: int):
         """Saves stats window position in settings."""
@@ -605,7 +729,10 @@ class Settings:
         self._set_nested_value(self.settings, ('display', 'stats_window_position', 'y'), y)
         self._set_nested_value(self.user_settings, ('display', 'stats_window_position', 'x'), x)
         self._set_nested_value(self.user_settings, ('display', 'stats_window_position', 'y'), y)
-        self._save_user_settings()
+        self._save_user_settings((
+            ('display', 'stats_window_position', 'x'),
+            ('display', 'stats_window_position', 'y'),
+        ))
 
     def save_active_display_palette(self, palette_name: str):
         """Persist the selected display palette and refresh effective settings."""
@@ -616,7 +743,7 @@ class Settings:
         self._apply_defaults(self.settings, self.get_default_settings())
         self._apply_display_palette(self.settings)
         self.update_globals()
-        self._save_user_settings()
+        self._save_user_settings((('display', 'active_palette'),))
 
     def save_last_seen_foldit_parent(self, folder_path: str):
         """Persist the last known parent directory that contains Foldit clients."""
@@ -629,14 +756,14 @@ class Settings:
         self._set_nested_value(self.user_settings, ('launch', 'last_seen_foldit_parent'), clean_path)
         self.LAST_SEEN_FOLDIT_PARENT = clean_path
         self.last_seen_foldit_parent = clean_path
-        self._save_user_settings()
+        self._save_user_settings((('launch', 'last_seen_foldit_parent'),))
 
     def save_stats_score_decimals(self, decimals: int):
         """Persist the score precision used by the stats window."""
         clean_decimals = max(0, int(decimals))
         self._set_nested_value(self.settings, ('logging', 'stats_score_decimals'), clean_decimals)
         self._set_nested_value(self.user_settings, ('logging', 'stats_score_decimals'), clean_decimals)
-        self._save_user_settings()
+        self._save_user_settings((('logging', 'stats_score_decimals'),))
 
     def save_stats_last_puzzle(self, puzzle_id: str):
         """Persist the puzzle last shown in the stats window."""
@@ -646,7 +773,7 @@ class Settings:
         self._set_nested_value(self.settings, ('display', 'stats_last_puzzle'), clean_puzzle_id)
         self._set_nested_value(self.user_settings, ('display', 'stats_last_puzzle'), clean_puzzle_id)
         self.STATS_LAST_PUZZLE = clean_puzzle_id
-        self._save_user_settings()
+        self._save_user_settings((('display', 'stats_last_puzzle'),))
 
     def save_speed_boost_profile(self, profile_name: str):
         """Persist the global Speed Boost timing profile."""
@@ -654,7 +781,7 @@ class Settings:
         self._set_nested_value(self.settings, ('speed_boost', 'profile'), normalized_name)
         self._set_nested_value(self.user_settings, ('speed_boost', 'profile'), normalized_name)
         self.SPEED_BOOST_PROFILE = normalized_name
-        self._save_user_settings()
+        self._save_user_settings((('speed_boost', 'profile'),))
 
     def save_network_auto_reconnect(self, value: bool):
         """Persist the default 'auto-reconnect' choice from the Connect dialog."""
@@ -664,4 +791,4 @@ class Settings:
         self.NETWORK_AUTO_RECONNECT = clean_value
         self._set_nested_value(self.settings, ('network', 'auto_reconnect'), clean_value)
         self._set_nested_value(self.user_settings, ('network', 'auto_reconnect'), clean_value)
-        self._save_user_settings()
+        self._save_user_settings((('network', 'auto_reconnect'),))

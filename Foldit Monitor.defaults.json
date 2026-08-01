@@ -69,8 +69,12 @@
     "save_to_backup": true
   },
   "speed_boost": {
-    "enabled": true,
-    "profile": "fast"
+    "enabled": false,
+    "profile": "fast",
+    "offsets": [
+      "0xDB729B",
+      "0xE729B9"
+    ]
   },
   "script_type_mapping": {
     "Deep Shake": {

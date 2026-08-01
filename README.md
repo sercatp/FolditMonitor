@@ -53,3 +53,8 @@ The app also creates `logs/`, `puzzle_logs/`, and `foldit_backup/` when needed. 
 - `save_catalog.py`, `save_manager_qt.py`, `savefile_api.py` — indexed save-file browsing and export.
 - `foldit_speed_boost*.py` — optional Frida-based speed-boost integration.
 - `alert.wav` — default alert sound.
+
+Speed Boost is disabled by default. To expose its menu, set
+`speed_boost.enabled` to `true` in the generated `Foldit Monitor.json` and
+restart the monitor. The same section contains the configured return-address
+`offsets`; invalid or empty lists keep the feature disabled.

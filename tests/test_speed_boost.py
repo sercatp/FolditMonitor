@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import unittest
@@ -7,12 +8,12 @@ from unittest.mock import patch
 import foldit_speed_boost as speed_boost_module
 from foldit_speed_boost_integration import FolditSpeedBoostIntegration
 from settings import (
+    DEFAULT_SPEED_BOOST_OFFSETS,
     DEFAULT_SPEED_BOOST_PROFILE,
     SPEED_BOOST_PROFILES,
     Settings,
 )
 from foldit_speed_boost import (
-    GAME_LIBRARY_SLEEP_OFFSETS,
     TARGET_SLEEP_MS,
     FolditSpeedBoostManager,
     SpeedBoostSession,
@@ -26,6 +27,8 @@ FAST_TIMING = SpeedBoostTiming(
     replacement_sleep_ms=FAST_PROFILE["replacement_sleep_ms"],
     timer_resolution_ms=FAST_PROFILE["timer_resolution_ms"],
 )
+DEFAULT_OFFSETS = tuple(int(value, 16) for value in DEFAULT_SPEED_BOOST_OFFSETS)
+FIRST_OFFSET_KEY = hex(DEFAULT_OFFSETS[0])
 MONITOR_SOURCE_PATH = Path(__file__).resolve().parents[1] / "Foldit Monitor.pyw"
 
 
@@ -34,7 +37,7 @@ class _Exports:
         return {
             "enabled": True,
             "patched": 7,
-            "matchedByOffset": {"0xdb729b": 7},
+            "matchedByOffset": {FIRST_OFFSET_KEY: 7},
         }
 
 
@@ -185,8 +188,9 @@ class SpeedBoostCases(unittest.TestCase):
     def test_selected_profile_is_persisted(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = Settings(temp_dir)
-            self.assertTrue(settings.SPEED_BOOST_ENABLED)
+            self.assertFalse(settings.SPEED_BOOST_ENABLED)
             self.assertEqual(settings.SPEED_BOOST_PROFILE, "fast")
+            self.assertEqual(settings.SPEED_BOOST_OFFSETS, DEFAULT_OFFSETS)
 
             settings.save_speed_boost_profile("medium")
             reloaded = Settings(temp_dir)
@@ -211,19 +215,94 @@ class SpeedBoostCases(unittest.TestCase):
             self.assertTrue(Settings(temp_dir).SPEED_BOOST_ENABLED)
 
             settings_path.write_text('{"speed_boost": []}', encoding="utf-8")
-            self.assertFalse(Settings(temp_dir).SPEED_BOOST_ENABLED)
+            malformed = Settings(temp_dir)
+            self.assertFalse(malformed.SPEED_BOOST_ENABLED)
+            self.assertEqual(malformed.SPEED_BOOST_OFFSETS, ())
+            self.assertTrue(malformed.SPEED_BOOST_CONFIG_ERROR)
 
-    def test_verified_wiggle_offsets_are_internal_to_speed_boost(self):
-        self.assertEqual(
-            GAME_LIBRARY_SLEEP_OFFSETS,
-            (0xDB729B, 0xE729B9),
-        )
+    def test_default_offsets_are_loaded_from_settings(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(temp_dir)
+
+        self.assertEqual(settings.SPEED_BOOST_OFFSETS, DEFAULT_OFFSETS)
         self.assertEqual(TARGET_SLEEP_MS, 100)
+
+    def test_custom_json_offsets_replace_defaults_and_preserve_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "Foldit Monitor.json"
+            settings_path.write_text(
+                '{"speed_boost": {"enabled": true, "profile": "fast", '
+                '"offsets": ["0x10", "0x20", "0x10", "0x30"]}}',
+                encoding="utf-8",
+            )
+
+            settings = Settings(temp_dir)
+
+        self.assertTrue(settings.SPEED_BOOST_ENABLED)
+        self.assertEqual(settings.SPEED_BOOST_OFFSETS, (0x10, 0x20, 0x30))
+
+    def test_missing_json_is_created_with_disabled_public_offsets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "Foldit Monitor.json"
+
+            settings = Settings(temp_dir)
+            saved = settings_path.read_text(encoding="utf-8")
+
+        self.assertFalse(settings.SPEED_BOOST_ENABLED)
+        self.assertIn('"enabled": false', saved)
+        for configured_offset in DEFAULT_SPEED_BOOST_OFFSETS:
+            self.assertIn(f'"{configured_offset}"', saved)
+
+    def test_existing_json_missing_speed_boost_is_migrated_on_disk(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "Foldit Monitor.json"
+            settings_path.write_text("{}", encoding="utf-8")
+
+            settings = Settings(temp_dir)
+            migrated = json.loads(settings_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(settings.SPEED_BOOST_ENABLED)
+        self.assertEqual(
+            migrated["speed_boost"],
+            {
+                "enabled": False,
+                "profile": DEFAULT_SPEED_BOOST_PROFILE,
+                "offsets": list(DEFAULT_SPEED_BOOST_OFFSETS),
+            },
+        )
+
+    def test_hook_engine_contains_no_concrete_default_offsets(self):
+        engine_source = Path(speed_boost_module.__file__).read_text(encoding="utf-8")
+        for configured_offset in DEFAULT_SPEED_BOOST_OFFSETS:
+            self.assertNotIn(configured_offset.lower(), engine_source.lower())
+            self.assertNotIn(str(int(configured_offset, 16)), engine_source)
+
+    def test_runtime_save_preserves_external_speed_boost_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings = Settings(temp_dir)
+            settings_path = Path(temp_dir) / "Foldit Monitor.json"
+            latest = json.loads(settings_path.read_text(encoding="utf-8"))
+            latest["speed_boost"] = {
+                "enabled": True,
+                "profile": "fast",
+                "offsets": ["0x10", "0x20", "0x30"],
+            }
+            settings_path.write_text(
+                json.dumps(latest, indent=4),
+                encoding="utf-8",
+            )
+
+            settings.save_window_position(123, 456)
+            preserved = json.loads(settings_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(preserved["speed_boost"], latest["speed_boost"])
+        self.assertEqual(preserved["display"]["window_position"], {"x": 123, "y": 456})
 
     def test_selected_timing_is_embedded_in_new_script(self):
         timing = SpeedBoostTiming(replacement_sleep_ms=1, timer_resolution_ms=1)
-        source = _script_source(timing)
-        for offset in GAME_LIBRARY_SLEEP_OFFSETS:
+        custom_offsets = (0x10, 0x20, 0x30)
+        source = _script_source(timing, custom_offsets)
+        for offset in custom_offsets:
             self.assertIn(str(offset), source)
         self.assertIn("let replaceMs = 1;", source)
         self.assertIn("let timerResolutionMs = 1;", source)
@@ -250,8 +329,14 @@ class SpeedBoostCases(unittest.TestCase):
         with self.assertRaises(ValueError):
             SpeedBoostTiming(replacement_sleep_ms=1, timer_resolution_ms=True)
 
+    def test_manager_requires_valid_configured_offsets(self):
+        with self.assertRaises(ValueError):
+            FolditSpeedBoostManager(timing=FAST_TIMING, offsets=())
+        with self.assertRaises(ValueError):
+            FolditSpeedBoostManager(timing=FAST_TIMING, offsets=(True,))
+
     def test_manager_applies_timing_to_current_and_future_sessions(self):
-        manager = FolditSpeedBoostManager(timing=FAST_TIMING)
+        manager = FolditSpeedBoostManager(timing=FAST_TIMING, offsets=DEFAULT_OFFSETS)
         script = _TimingScript()
         managed = SpeedBoostSession(
             pid=123,
@@ -274,6 +359,7 @@ class SpeedBoostCases(unittest.TestCase):
     def test_manager_reports_session_timing_failure_but_keeps_global_choice(self):
         manager = FolditSpeedBoostManager(
             timing=FAST_TIMING,
+            offsets=DEFAULT_OFFSETS,
             log_callback=lambda _message: None,
         )
         script = _TimingScript(result={"ok": False, "error": "unsupported resolution"})
@@ -296,7 +382,7 @@ class SpeedBoostCases(unittest.TestCase):
         self.assertIn("unsupported resolution", managed.last_error)
 
     def test_get_stats_returns_live_hook_counters(self):
-        manager = FolditSpeedBoostManager(timing=FAST_TIMING)
+        manager = FolditSpeedBoostManager(timing=FAST_TIMING, offsets=DEFAULT_OFFSETS)
         manager.sessions[123] = SpeedBoostSession(
             pid=123,
             client_name="Foldit9",
@@ -309,11 +395,11 @@ class SpeedBoostCases(unittest.TestCase):
         stats = manager.get_stats(123)
 
         self.assertEqual(stats["patched"], 7)
-        self.assertEqual(stats["matchedByOffset"], {"0xdb729b": 7})
+        self.assertEqual(stats["matchedByOffset"], {FIRST_OFFSET_KEY: 7})
         self.assertIsNone(manager.get_stats(999))
 
     def test_fast_detach_releases_timer_period_before_detaching(self):
-        manager = FolditSpeedBoostManager(timing=FAST_TIMING)
+        manager = FolditSpeedBoostManager(timing=FAST_TIMING, offsets=DEFAULT_OFFSETS)
         script = _CleanupScript()
         session = _Session()
         manager.sessions[123] = SpeedBoostSession(
@@ -332,7 +418,7 @@ class SpeedBoostCases(unittest.TestCase):
         self.assertFalse(manager.is_managed(123))
 
     def test_abandon_all_releases_timer_period_without_slow_detach(self):
-        manager = FolditSpeedBoostManager(timing=FAST_TIMING)
+        manager = FolditSpeedBoostManager(timing=FAST_TIMING, offsets=DEFAULT_OFFSETS)
         script = _CleanupScript()
         session = _Session()
         manager.sessions[123] = SpeedBoostSession(

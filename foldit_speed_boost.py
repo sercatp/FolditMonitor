@@ -12,11 +12,8 @@ FRIDA_IMPORT_ERROR = None
 _FRIDA_IMPORT_ATTEMPTED = False
 _FRIDA_IMPORT_LOCK = threading.Lock()
 
-# Exact Sleep return-address offsets for the currently verified Foldit
-# game_library.dll. Revalidate these together with TARGET_SLEEP_MS after a
-# Foldit update.
-GAME_LIBRARY_SLEEP_RETURN_OFFSETS = (0xDB729B, 0xE729B9)
-GAME_LIBRARY_SLEEP_OFFSETS = GAME_LIBRARY_SLEEP_RETURN_OFFSETS
+# Concrete game_library.dll return-address offsets are runtime configuration.
+# Keep this engine identical for public and private installations.
 TARGET_SLEEP_MS = 100
 
 
@@ -268,19 +265,37 @@ def unavailable_message() -> str:
     )
 
 
-def _script_source(timing: SpeedBoostTiming) -> str:
+def _normalize_offsets(offsets) -> tuple[int, ...]:
+    if isinstance(offsets, (str, bytes)):
+        raise ValueError("offsets must be a non-empty sequence of integers")
+    try:
+        normalized = tuple(offsets)
+    except TypeError as error:
+        raise ValueError("offsets must be a non-empty sequence of integers") from error
+    if not normalized:
+        raise ValueError("offsets must not be empty")
+    for offset in normalized:
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            raise ValueError("offsets must contain only integers")
+        if offset < 0 or offset > 0xFFFFFFFF:
+            raise ValueError("offsets must fit in the 32-bit module range")
+    return normalized
+
+
+def _script_source(timing: SpeedBoostTiming, offsets) -> str:
     if not isinstance(timing, SpeedBoostTiming):
         raise TypeError("timing must be a SpeedBoostTiming instance")
+    normalized_offsets = _normalize_offsets(offsets)
     return (
         SPEED_BOOST_JS.replace("TARGET_MS_PLACEHOLDER", str(TARGET_SLEEP_MS))
         .replace("REPLACEMENT_MS_PLACEHOLDER", str(timing.replacement_sleep_ms))
         .replace("TIMER_RESOLUTION_MS_PLACEHOLDER", str(timing.timer_resolution_ms))
-        .replace("GAME_OFFSETS_PLACEHOLDER", ", ".join(str(offset) for offset in GAME_LIBRARY_SLEEP_OFFSETS))
+        .replace("GAME_OFFSETS_PLACEHOLDER", ", ".join(str(offset) for offset in normalized_offsets))
     )
 
 
 class FolditSpeedBoostManager:
-    def __init__(self, timing: SpeedBoostTiming, log_callback=None):
+    def __init__(self, timing: SpeedBoostTiming, offsets, log_callback=None):
         if not isinstance(timing, SpeedBoostTiming):
             raise TypeError("timing must be a SpeedBoostTiming instance")
         self.sessions: Dict[int, SpeedBoostSession] = {}
@@ -288,6 +303,7 @@ class FolditSpeedBoostManager:
         self._lock = threading.RLock()
         self._operation_lock = threading.RLock()
         self._timing = timing
+        self._offsets = _normalize_offsets(offsets)
 
     def log(self, message: str) -> None:
         if self.log_callback:
@@ -378,7 +394,7 @@ class FolditSpeedBoostManager:
                 return True
 
             session = frida_module.attach(pid)
-            script = session.create_script(_script_source(timing))
+            script = session.create_script(_script_source(timing, self._offsets))
 
             def on_message(message, data):
                 payload = message.get("payload") if isinstance(message, dict) else None

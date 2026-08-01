@@ -32,7 +32,8 @@ class FolditSpeedBoostIntegration:
             value=settings_manager.SPEED_BOOST_PROFILE,
         )
         self.manager = FolditSpeedBoostManager(
-            timing=self._timing_for_profile(settings_manager.SPEED_BOOST_PROFILE)
+            timing=self._timing_for_profile(settings_manager.SPEED_BOOST_PROFILE),
+            offsets=settings_manager.SPEED_BOOST_OFFSETS,
         )
         self.armed_pids = set()
         self.script_running_pids = set()
