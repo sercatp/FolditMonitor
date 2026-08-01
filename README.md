@@ -2,6 +2,11 @@
 
 Foldit Monitor is a desktop helper for watching local Foldit clients, tracking scores and logs, viewing puzzle statistics, and connecting monitors over a local network.
 
+[![Main window](https://github.com/sercatp/FolditMonitor/raw/main/images/main-window.png)](https://github.com/sercatp/FolditMonitor/blob/main/images/main-window.png)
+
+[![Stats window](https://github.com/sercatp/FolditMonitor/raw/main/images/stats-window.jpg)](https://github.com/sercatp/FolditMonitor/blob/main/images/stats-window.jpg)
+
+
 ## Install and run
 
 You need at least one local Foldit client and Python 3.11 or newer. Running the Python version is recommended: it is easier to update and shows useful error messages if something needs attention.
@@ -31,12 +36,6 @@ If you do not want to install Python, open [the latest release](https://github.c
 - **Windows:** fully supported. The Python installation receives `pywin32` and the shortcut helper; the ZIP release is also available for Windows x64.
 - **Linux:** install the system Tk package as well as the Python requirements (for example, `python3-tk` on Debian/Ubuntu). Client-window detection and activation require an X11 session or XWayland; a pure Wayland session is not supported by the current window manager.
 - **macOS:** install a Python build with Tk support; the requirements install the Cocoa bridge automatically. The app can start, but macOS client-window discovery and activation are still experimental: the current backend does not reliably read windows belonging to another application. There is no packaged macOS release.
-
-## Screenshots
-
-[![Main window](https://github.com/sercatp/FolditMonitor/raw/main/images/main-window.png)](https://github.com/sercatp/FolditMonitor/blob/main/images/main-window.png)
-
-[![Stats window](https://github.com/sercatp/FolditMonitor/raw/main/images/stats-window.jpg)](https://github.com/sercatp/FolditMonitor/blob/main/images/stats-window.jpg)
 
 ## First launch
 
