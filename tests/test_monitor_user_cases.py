@@ -164,6 +164,21 @@ def build_get_post_copy_shortcut_function():
     return namespace["get_post_copy_shortcut"]
 
 
+def build_optional_pygame_loader():
+    source = MONITOR_SOURCE_PATH.read_text(encoding="utf-8-sig")
+    module = ast.parse(source, filename=str(MONITOR_SOURCE_PATH))
+    function_node = next(
+        node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "_load_optional_pygame"
+    )
+    messages = []
+    namespace = {"__builtins__": __builtins__, "print": messages.append}
+    exec(
+        compile(ast.Module(body=[function_node], type_ignores=[]), str(MONITOR_SOURCE_PATH), "exec"),
+        namespace,
+    )
+    return namespace["_load_optional_pygame"], messages
+
+
 class FakeProcess:
     def __init__(self, pid: int, exe_path: str):
         self.pid = pid
@@ -1837,6 +1852,16 @@ class StatsStartEndScoreCases(unittest.TestCase):
             session = StatsEditorSession(manager, "1")
             session.update_fin_cell(0, "h:4", "100->120")
             self.assertEqual(session.fin_rows[0]["cells"]["h:4"], "100→120")
+
+
+class OptionalAudioCases(unittest.TestCase):
+    def test_missing_pygame_disables_audio_without_crashing_monitor(self):
+        loader, messages = build_optional_pygame_loader()
+
+        with patch.dict("sys.modules", {"pygame": None}):
+            self.assertIsNone(loader())
+
+        self.assertTrue(any("Python 3.11-3.13" in message for message in messages))
 
 
 if __name__ == "__main__":

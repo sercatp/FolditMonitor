@@ -1,6 +1,9 @@
+# Supported Python versions: 3.11-3.13 (3.13 recommended).
 psutil>=5.9
 Pillow>=10
-pygame>=2.5
+# pygame does not currently publish macOS wheels for Python 3.14. On that
+# unsupported Python version the monitor runs without optional alert sounds.
+pygame>=2.5; python_version < "3.14"
 PySide6>=6.7
 numpy>=1.26
 
@@ -12,3 +15,4 @@ pywin32>=306; sys_platform == "win32"
 keyboard>=0.13.5; sys_platform == "win32"
 python-xlib>=0.33; sys_platform == "linux"
 pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
