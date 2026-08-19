@@ -251,11 +251,13 @@ class RemoteTreeView:
             for tag_name in tags:
                 self._ensure_dynamic_tag(tag_name)
 
-            # Use the full folder path as the stable row key.
-            item_key = next(
-                (tag for tag in tags if isinstance(tag, str) and ('\\' in tag or '/' in tag)),
-                values[2] if len(values) > 2 else repr(values)
-            )
+            # row_id separates several Track processes that share one data folder.
+            item_key = str(item_data.get("row_id") or item_data.get("client_id") or "").strip()
+            if not item_key:
+                item_key = next(
+                    (tag for tag in tags if isinstance(tag, str) and ('\\' in tag or '/' in tag)),
+                    values[2] if len(values) > 2 else repr(values)
+                )
             
             if item_key in self.items:
                 # Update the existing item
@@ -331,6 +333,7 @@ class NetworkManager:
         self.build_artifact_query = callbacks.get('build_artifact_query')
         self.artifact_received = callbacks.get('artifact_received')
         self.artifact_error = callbacks.get('artifact_error')
+        self.get_row_payload = callbacks.get('get_row_payload')
         
         # Store objects
         self.process_tree = tree
@@ -745,11 +748,15 @@ class NetworkManager:
             for item in self.process_tree.get_children():
                 values = list(self.process_tree.item(item)['values'])
                 tags = self.process_tree.item(item)['tags']
+                row_payload = self.get_row_payload(item) if self.get_row_payload else None
+                row_payload = row_payload if isinstance(row_payload, dict) else {}
 
                 pid = next((tag for tag in tags if isinstance(tag, (int, str)) and str(tag).isdigit()), None)
 
                 log_lines = []
-                if pid and int(pid) in self.monitored_processes:
+                if row_payload.get('log_lines'):
+                    log_lines = list(row_payload.get('log_lines', ()))
+                elif pid and int(pid) in self.monitored_processes:
                     log_lines = list(self.monitored_processes[int(pid)]['last_log_lines'])
 
                 # Strip the local user name out of the folder path before sending; the
@@ -763,7 +770,12 @@ class NetworkManager:
                     'values': values,
                     'tags': masked_tags,
                     'log_lines': log_lines,
-                    'row_id': str(pid).strip() if pid is not None else "",
+                    'row_id': str(row_payload.get('row_id') or item).strip(),
+                    'client_id': str(row_payload.get('client_id') or ""),
+                    'track': str(row_payload.get('track') or ""),
+                    'log_path': mask_user_path(str(row_payload.get('log_path') or "")),
+                    'binding_status': str(row_payload.get('binding_status') or ""),
+                    'binding_source': str(row_payload.get('binding_source') or ""),
                 })
                 
             return data
@@ -904,6 +916,11 @@ class NetworkManager:
                 'tags': tags,
                 'log_lines': log_lines,
                 'row_id': str(row_id).strip() if row_id is not None else "",
+                'client_id': str(item.get('client_id') or ""),
+                'track': str(item.get('track') or ""),
+                'log_path': str(item.get('log_path') or ""),
+                'binding_status': str(item.get('binding_status') or ""),
+                'binding_source': str(item.get('binding_source') or ""),
             })
 
         return normalized_items

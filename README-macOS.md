@@ -1,18 +1,15 @@
 # Foldit Monitor on macOS
 
 Python 3.11-3.13 is supported; Python 3.13 is recommended. Use a Python build
-with Tk support and install the application in a virtual environment:
+with Tk support:
 
 ```bash
-python3.13 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python "Foldit Monitor.pyw"
+python3.13 -m pip install -r requirements.txt
+python3.13 "Foldit Monitor.pyw"
 ```
 
 Homebrew Python may require the matching Tk formula, for example
-`brew install python-tk@3.13`, before the virtual environment is created.
+`brew install python-tk@3.13`.
 
 Foldit Monitor discovers the executable inside `Foldit.app`, but reads script
 logs and puzzle data from `Foldit.app/Contents/Resources`. **New Client** first
@@ -37,9 +34,6 @@ the supported range, and pygame currently has no macOS package for that Python
 version. `requirements.txt` therefore skips pygame automatically on Python
 3.14. The monitor can still run, but sound alerts are unavailable; use Python
 3.13 for full functionality.
-
-Do not remove `psutil` from `requirements.txt`: it is required for process
-discovery and is not the package causing this Python 3.14 installation issue.
 
 ### One Foldit installation with multiple Tracks
 

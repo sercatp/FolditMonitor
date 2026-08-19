@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import os
 import re
 import shutil
@@ -9,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from window_manager import open_file as open_exported_file
 
 APPEND_PROBE_BYTES = 64
+INTERRUPTED_LOG_PROCESS_TOLERANCE_SECONDS = 2.0
 
 
 class FolditLogHandler:
@@ -16,6 +18,8 @@ class FolditLogHandler:
         self.settings = settings
         self.current_handlers: Dict[str, "LogFileHandler"] = {}
         self.managed_exports: Dict[str, dict] = {}
+        self.interrupted_exports: Dict[str, dict] = {}
+        self.client_contexts: Dict[str, dict] = {}
         self.lock = threading.Lock()
 
     def start_monitoring(self, file_path: str):
@@ -56,15 +60,12 @@ class FolditLogHandler:
 
     def get_fresh_data(self, file_path: str) -> Optional[dict]:
         """Read the current file contents immediately and return a fresh snapshot."""
-        with self.lock:
-            handler = self.current_handlers.get(file_path)
-
-        if handler is not None:
-            return handler.refresh_now()
-
         if not os.path.exists(file_path):
             return None
 
+        # A fresh read is an isolated snapshot.  Refreshing the live handler would
+        # reset its parser baseline and discard stats events that the Monitor has
+        # not consumed yet.
         temp_handler = LogFileHandler(self.settings, file_path)
         return temp_handler.refresh_now()
 
@@ -92,11 +93,342 @@ class FolditLogHandler:
         data = self.get_fresh_data(file_path) if fresh else self.get_data(file_path)
         return self._extract_stats_snapshot_from_data(data)
 
+    def remember_client_context(
+        self,
+        file_path: str,
+        *,
+        folder_path: Optional[str] = None,
+        puzzle_id: Optional[str] = None,
+        client_name: Optional[str] = None,
+    ):
+        clean_path = str(file_path or "").strip()
+        if not clean_path:
+            return
+        context = {
+            "folder_path": str(folder_path or os.path.dirname(clean_path)).strip(),
+            "puzzle_id": "" if puzzle_id is None else str(puzzle_id).strip(),
+            "client_name": "" if client_name is None else str(client_name).strip(),
+        }
+        with self.lock:
+            previous = dict(self.client_contexts.get(clean_path, {}))
+            previous.update({key: value for key, value in context.items() if value})
+            self.client_contexts[clean_path] = previous
+
+    def get_client_context(self, file_path: str) -> dict:
+        with self.lock:
+            return dict(self.client_contexts.get(file_path, {}))
+
     def _managed_exports_enabled(self) -> bool:
         value = self.settings.get("managed_log_exports", True)
         if isinstance(value, str):
             return value.strip().lower() not in {"0", "false", "no", "off"}
         return bool(value)
+
+    def _interrupted_log_tolerance_seconds(self) -> float:
+        try:
+            value = float(
+                self.settings.get(
+                    "interrupted_log_process_tolerance_seconds",
+                    INTERRUPTED_LOG_PROCESS_TOLERANCE_SECONDS,
+                )
+            )
+        except (TypeError, ValueError, AttributeError):
+            value = INTERRUPTED_LOG_PROCESS_TOLERANCE_SECONDS
+        return max(0.0, value)
+
+    @staticmethod
+    def _source_stat_key(stat_result) -> tuple[int, int]:
+        return int(stat_result.st_size), int(
+            getattr(
+                stat_result,
+                "st_mtime_ns",
+                int(float(stat_result.st_mtime) * 1_000_000_000),
+            )
+        )
+
+    @staticmethod
+    def _hash_file(file_path: str) -> str:
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @classmethod
+    def _find_interrupted_export_by_digest(
+        cls,
+        folder_path: str,
+        digest: str,
+        source_size: int,
+    ) -> Optional[str]:
+        try:
+            names = os.listdir(folder_path)
+        except OSError:
+            return None
+        for name in names:
+            if not re.search(r"\.interrupted(?:\.\d+)?\.txt$", name, re.IGNORECASE):
+                continue
+            candidate = os.path.join(folder_path, name)
+            try:
+                if os.path.getsize(candidate) != source_size:
+                    continue
+                if cls._hash_file(candidate).lower() == digest.lower():
+                    return candidate
+            except OSError:
+                continue
+        return None
+
+    @staticmethod
+    def _source_client_name(folder_path: str, script_path: Optional[str] = None) -> str:
+        folder_name = os.path.basename(folder_path)
+        if script_path:
+            match = re.match(r"^scriptlog\.(.*)\.xml$", os.path.basename(script_path), re.IGNORECASE)
+            track = match.group(1) if match else ""
+            if track and track.casefold() != "default":
+                folder_name = f"{folder_name}[{track}]"
+        return folder_name
+
+    @staticmethod
+    def _build_interrupted_export_stem(
+        folder_path: str,
+        data: dict,
+        puzzle_id: Optional[str],
+        source_mtime: float,
+        script_path: Optional[str] = None,
+    ) -> str:
+        timestamp = datetime.datetime.fromtimestamp(source_mtime).strftime("%Y%m%d.%H%M%S")
+        highest_score = int(data["highest_score"]) if data.get("highest_score") else None
+        script_type = str(data.get("script_type", "")).strip() or "script"
+        folder_name = FolditLogHandler._source_client_name(folder_path, script_path)
+        folder_name_short = folder_name.replace("oldit", "")
+        puzzle_text = "" if puzzle_id is None else str(puzzle_id).strip()
+        puzzle_prefix = f".{puzzle_text} " if puzzle_text else "."
+        return f"{folder_name_short}{puzzle_prefix}{script_type}.{highest_score}.{timestamp}"
+
+    def _remember_interrupted_export(
+        self,
+        script_path: str,
+        data: dict,
+        source_key: tuple[int, int],
+        digest: str,
+        export_path: str,
+    ):
+        try:
+            run_token = max(0, int(data.get("script_change_token", 0) or 0))
+        except (TypeError, ValueError):
+            run_token = 0
+
+        record = {
+            "source_key": source_key,
+            "source_size": source_key[0],
+            "source_mtime_ns": source_key[1],
+            "digest": digest,
+            "run_token": run_token,
+            "export_path": export_path,
+            "script": str(data.get("script_type", "")).strip(),
+            "score": data.get("highest_score"),
+        }
+        old_partial_path = None
+        with self.lock:
+            previous_managed = self.managed_exports.get(script_path)
+            if previous_managed and not bool(previous_managed.get("final", False)):
+                old_partial_path = previous_managed.get("export_path")
+            self.interrupted_exports[script_path] = record
+            # An interrupted export is a final snapshot of this exact source
+            # generation.  Registering it here makes live-export/double-click reuse
+            # the immutable archive instead of manufacturing an identical .part.
+            self.managed_exports[script_path] = {
+                "run_token": run_token,
+                "source_size": source_key[0],
+                "source_mtime_ns": source_key[1],
+                "export_path": export_path,
+                "final": True,
+                "interrupted": True,
+            }
+
+        if old_partial_path and old_partial_path != export_path:
+            self._safe_remove_managed_partial(old_partial_path)
+
+    def get_interrupted_stats_snapshot(self, file_path: str) -> Optional[dict]:
+        """Return the script/score cached while archiving an interrupted source."""
+        with self.lock:
+            record = dict(self.interrupted_exports.get(file_path, {}))
+        script_value = str(record.get("script", "")).strip()
+        if not script_value:
+            return None
+        return {
+            "script": script_value,
+            "score": record.get("score"),
+        }
+
+    def source_predates_process(self, file_path: str, process_create_time: float) -> bool:
+        """Whether the current raw log must belong to an older Foldit process."""
+        try:
+            process_started = float(process_create_time)
+            source_mtime = float(os.stat(file_path).st_mtime)
+        except (OSError, TypeError, ValueError):
+            return False
+        if process_started <= 0:
+            return False
+        return source_mtime + self._interrupted_log_tolerance_seconds() < process_started
+
+    def _archive_interrupted_source(
+        self,
+        script_path: str,
+        puzzle_id: Optional[str],
+        expected_source_key: Optional[tuple[int, int]] = None,
+    ) -> Optional[str]:
+        script_path = os.path.abspath(str(script_path))
+        folder_path = os.path.dirname(script_path)
+        try:
+            source_stat = os.stat(script_path)
+        except OSError:
+            return None
+        source_key = self._source_stat_key(source_stat)
+        if expected_source_key is not None and source_key != expected_source_key:
+            return None
+
+        with self.lock:
+            remembered = self.interrupted_exports.get(script_path)
+            if (
+                remembered
+                and remembered.get("source_key") == source_key
+                and os.path.exists(str(remembered.get("export_path", "")))
+            ):
+                return remembered["export_path"]
+
+        # Use an isolated parser. Refreshing a live handler here would clear its
+        # pending stats events and could turn recovery itself into a run boundary.
+        data = LogFileHandler(self.settings, script_path).refresh_now()
+        if not data or not bool(data.get("run_open", False)):
+            return None
+
+        try:
+            parsed_stat = os.stat(script_path)
+        except OSError:
+            return None
+        if self._source_stat_key(parsed_stat) != source_key:
+            return None
+
+        try:
+            digest = self._hash_file(script_path)
+            hashed_stat = os.stat(script_path)
+        except OSError:
+            return None
+        if self._source_stat_key(hashed_stat) != source_key:
+            return None
+
+        export_path = self._find_interrupted_export_by_digest(
+            folder_path,
+            digest,
+            source_key[0],
+        )
+        if not export_path:
+            stem = self._build_interrupted_export_stem(
+                folder_path,
+                data,
+                puzzle_id,
+                source_stat.st_mtime,
+                script_path,
+            )
+            export_path = self._get_unique_interrupted_export_path(folder_path, stem)
+            temp_path = f"{export_path}.tmp-{os.getpid()}-{threading.get_ident()}"
+            try:
+                shutil.copyfile(script_path, temp_path)
+                copied_stat = os.stat(script_path)
+                if self._source_stat_key(copied_stat) != source_key:
+                    try:
+                        os.remove(temp_path)
+                    except OSError:
+                        pass
+                    return None
+                os.replace(temp_path, export_path)
+            except OSError as exc:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+                print(f"Error archiving interrupted log file: {exc}")
+                return None
+
+        self._remember_interrupted_export(
+            script_path,
+            data,
+            source_key,
+            digest,
+            export_path,
+        )
+        return export_path
+
+    def recover_interrupted_log(
+        self,
+        folder_path: str,
+        *,
+        process_create_time: float,
+        puzzle_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Archive an open script log that predates the current Foldit process."""
+        if not self._managed_exports_enabled():
+            return None
+
+        try:
+            process_started = float(process_create_time)
+        except (TypeError, ValueError):
+            return None
+        if process_started <= 0:
+            return None
+
+        script_path = os.path.join(folder_path, "scriptlog.default.xml")
+        return self.recover_interrupted_log_file(
+            script_path,
+            process_create_time=process_started,
+            puzzle_id=puzzle_id,
+        )
+
+    def recover_interrupted_log_file(
+        self,
+        script_path: str,
+        *,
+        process_create_time: float,
+        puzzle_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Path-first interrupted-run recovery for named Track logs."""
+        if not self._managed_exports_enabled():
+            return None
+
+        try:
+            process_started = float(process_create_time)
+        except (TypeError, ValueError):
+            return None
+        if process_started <= 0:
+            return None
+
+        script_path = os.path.abspath(str(script_path))
+        try:
+            source_stat = os.stat(script_path)
+        except OSError:
+            return None
+
+        if not self.source_predates_process(script_path, process_started):
+            return None
+        return self._archive_interrupted_source(
+            script_path,
+            puzzle_id,
+            expected_source_key=self._source_stat_key(source_stat),
+        )
+
+    def archive_interrupted_on_disappearance(self, file_path: str) -> Optional[str]:
+        """Finalize an open run immediately when its Foldit process disappears."""
+        if not self._managed_exports_enabled():
+            return None
+        with self.lock:
+            handler = self.current_handlers.get(file_path)
+            context = dict(self.client_contexts.get(file_path, {}))
+        if handler is None or not bool(handler.get_data().get("run_open", False)):
+            return None
+
+        puzzle_id = context.get("puzzle_id")
+        return self._archive_interrupted_source(file_path, puzzle_id)
 
     @staticmethod
     def _get_log_source_identity(script_path: str, data: dict) -> Optional[tuple[int, int, int]]:
@@ -139,15 +471,35 @@ class FolditLogHandler:
         raise RuntimeError("Cannot allocate log export filename")
 
     @staticmethod
-    def _build_export_stem(folder_path: str, data: dict, puzzle_id: Optional[str], include_seconds: bool = False) -> str:
+    def _get_unique_interrupted_export_path(folder_path: str, stem: str) -> str:
+        candidate = os.path.join(folder_path, f"{stem}.interrupted.txt")
+        if not os.path.exists(candidate):
+            return candidate
+
+        for index in range(2, 1000):
+            candidate = os.path.join(folder_path, f"{stem}.interrupted.{index}.txt")
+            if not os.path.exists(candidate):
+                return candidate
+
+        raise RuntimeError("Cannot allocate interrupted log export filename")
+
+    @staticmethod
+    def _build_export_stem(
+        folder_path: str,
+        data: dict,
+        puzzle_id: Optional[str],
+        include_seconds: bool = False,
+        script_path: Optional[str] = None,
+    ) -> str:
         timestamp_format = "%Y%m%d.%H%M%S" if include_seconds else "%Y%m%d.%H%M"
         clpbrd = datetime.datetime.now().strftime(timestamp_format)
         highest_score = int(data["highest_score"]) if data["highest_score"] else None
         script_type = data["script_type"]
 
-        folder_name = os.path.basename(folder_path)
+        folder_name = FolditLogHandler._source_client_name(folder_path, script_path)
         folder_name_short = folder_name.replace("oldit", "")
-        puzzle_prefix = f".{str(puzzle_id).strip()} " if str(puzzle_id).strip() else "."
+        puzzle_text = "" if puzzle_id is None else str(puzzle_id).strip()
+        puzzle_prefix = f".{puzzle_text} " if puzzle_text else "."
         return f"{folder_name_short}{puzzle_prefix}{script_type}.{highest_score}.{clpbrd}"
 
     def _export_log_legacy(
@@ -158,7 +510,7 @@ class FolditLogHandler:
         open_file: bool,
         puzzle_id: Optional[str],
     ) -> Optional[str]:
-        stem = self._build_export_stem(folder_path, data, puzzle_id)
+        stem = self._build_export_stem(folder_path, data, puzzle_id, script_path=script_path)
         clpbrd_path = os.path.join(folder_path, f"{stem}.txt")
 
         try:
@@ -210,7 +562,13 @@ class FolditLogHandler:
                 old_partial_path = remembered.get("export_path")
 
         status = "part" if run_open else "fin"
-        stem = self._build_export_stem(folder_path, data, puzzle_id, include_seconds=True)
+        stem = self._build_export_stem(
+            folder_path,
+            data,
+            puzzle_id,
+            include_seconds=True,
+            script_path=script_path,
+        )
         try:
             export_path = self._get_unique_export_path(folder_path, stem, status)
             shutil.copy(script_path, export_path)
@@ -242,6 +600,12 @@ class FolditLogHandler:
     def export_log(self, folder_path: str, open_file: bool = True, puzzle_id: Optional[str] = None):
         """Export log file with formatted name."""
         script_path = os.path.join(folder_path, "scriptlog.default.xml")
+        return self.export_log_file(script_path, open_file=open_file, puzzle_id=puzzle_id)
+
+    def export_log_file(self, script_path: str, open_file: bool = True, puzzle_id: Optional[str] = None):
+        """Export an exact script log path, including a named Track log."""
+        script_path = os.path.abspath(str(script_path))
+        folder_path = os.path.dirname(script_path)
         data = self.get_data(script_path)
         if not data:
             data = self.get_fresh_data(script_path)
@@ -256,9 +620,10 @@ class FolditLogHandler:
 
 
 class LogFileHandler:
-    def __init__(self, settings, file_path):
+    def __init__(self, settings, file_path, initial_attach_as_new: bool = False):
         self.settings = settings
         self.file_path = file_path
+        self._initial_attach_as_new = bool(initial_attach_as_new)
         self.tail_capacity = max(
             int(self.settings["MAX_LINES"]),
             int(self.settings["tooltip_lines"]),
@@ -431,7 +796,7 @@ class LogFileHandler:
         self._last_emitted_state_payload = state_payload
         self._tail_mode = "continue"
 
-    def _queue_stats_events(self):
+    def _queue_stats_events(self, bootstrap_attach: bool = False):
         if not self._run_open:
             self._sync_stats_event_baseline()
             return
@@ -445,14 +810,15 @@ class LogFileHandler:
                 float(self._highest_score),
             )
             if run_started or script_payload != self._last_emitted_script_payload:
-                self._enqueue_stats_event(
-                    {
-                        "kind": "script",
-                        "script": script_payload[0],
-                        "score": script_payload[1],
-                        "continue_tail": not run_started,
-                    }
-                )
+                event = {
+                    "kind": "script",
+                    "script": script_payload[0],
+                    "score": script_payload[1],
+                    "continue_tail": not run_started,
+                }
+                if bootstrap_attach:
+                    event["bootstrap_attach"] = True
+                self._enqueue_stats_event(event)
             self._last_emitted_script_payload = script_payload
 
         state_payload = None
@@ -560,8 +926,13 @@ class LogFileHandler:
             if not full_reload and not self._looks_like_append(current_size, last_size):
                 full_reload = True
 
+            bootstrap_attach = False
             if full_reload:
-                self._reload_from_start(bootstrap_attach=last_size is None)
+                bootstrap_attach = last_size is None and not self._initial_attach_as_new
+                self._reload_from_start(
+                    bootstrap_attach=bootstrap_attach
+                )
+                self._initial_attach_as_new = False
             else:
                 self._read_appended_tail()
 
@@ -569,7 +940,7 @@ class LogFileHandler:
 
             with self.lock:
                 self._publish_cached_data()
-                self._queue_stats_events()
+                self._queue_stats_events(bootstrap_attach=bootstrap_attach)
                 self.last_mtime_ns = current_mtime_ns
                 self.last_size = current_size
 

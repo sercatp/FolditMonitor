@@ -9,7 +9,6 @@ from typing import Any, Callable, Dict, List, Optional
 from stats_domain import (
     FIN_FIXED_COLUMNS,
     FinalizationDomain,
-    append_score_history_if_changed,
     append_text_history_if_changed,
     format_score,
     format_score_history,
@@ -515,6 +514,8 @@ class StatsManager:
         row: Dict[str, Any],
         script_name: Any,
         score_value: Optional[float],
+        continue_tail: bool = True,
+        bootstrap_attach: bool = False,
     ) -> tuple[Dict[str, Any], bool]:
         if score_value is None:
             return row, False
@@ -523,16 +524,31 @@ class StatsManager:
         cells = row.setdefault("cells", {})
         previous_run_key = str(puzzle.active_fin_columns.get(client_name, "")).strip()
         column_key = self.table_domain.ensure_script_column(puzzle, row, script_clean)
-        update_history = (
-            replace_latest_score_history_if_changed
-            if previous_run_key == column_key
-            else append_score_history_if_changed
+        resumes_known_run = previous_run_key == column_key or (
+            bool(bootstrap_attach) and not previous_run_key
         )
-        updated_value, changed = update_history(
-            cells.get(column_key, ""),
-            score_value,
-            puzzle.score_decimals,
-        )
+        if bool(continue_tail) and resumes_known_run:
+            updated_value, changed = replace_latest_score_history_if_changed(
+                cells.get(column_key, ""),
+                score_value,
+                puzzle.score_decimals,
+            )
+        else:
+            # A real run boundary must remain visible even when the next run starts
+            # at exactly the previous run's end score.  The generic append helper
+            # deduplicates equal end values, which is useful for editor operations
+            # but would erase this execution-history boundary.
+            new_line = format_score_line(score_value, puzzle.score_decimals)
+            current_history = format_score_history(
+                cells.get(column_key, ""),
+                puzzle.score_decimals,
+            )
+            if not new_line:
+                updated_value, changed = cells.get(column_key, ""), False
+            elif current_history:
+                updated_value, changed = f"{current_history}\n{new_line}", True
+            else:
+                updated_value, changed = normalize_score_value(new_line), True
         if changed:
             cells[column_key] = updated_value
         puzzle.active_fin_columns[client_name] = column_key
@@ -590,6 +606,63 @@ class StatsManager:
             )
 
         entries.append(self.normalize_main_entry({"script": script_clean, "score": score_value}))
+        return True
+
+    def finalize_interrupted_run(
+        self,
+        client_name: str,
+        puzzle_id: str,
+        script_name: Any,
+        score: Any,
+    ) -> bool:
+        """Update and close the stats tail represented by an interrupted raw log."""
+        clean_client_name = str(client_name or "").strip()
+        clean_puzzle_id = str(puzzle_id or "").strip()
+        script_clean = str(script_name or "").strip()
+        score_value = parse_numeric_score(score)
+        if not clean_client_name or not clean_puzzle_id or not script_clean or score_value is None:
+            return False
+
+        self._ensure_puzzle_loaded(clean_puzzle_id)
+        self._sync_from_open_window(clean_puzzle_id)
+        puzzle = self._get_or_create_puzzle(clean_puzzle_id)
+        self.touch_client(clean_client_name, clean_puzzle_id)
+
+        target_mode = puzzle.active_targets.get(clean_client_name, "vertical")
+        if target_mode == "horizontal":
+            closed_marker = "__interrupted_run_closed__"
+            if puzzle.active_fin_columns.get(clean_client_name) == closed_marker:
+                return False
+            row = self._get_or_create_live_fin_row(puzzle, clean_client_name)
+            _, changed = self._write_fin_score_to_script_column(
+                puzzle,
+                clean_client_name,
+                row,
+                script_clean,
+                score_value,
+                continue_tail=True,
+                bootstrap_attach=True,
+            )
+            puzzle.active_fin_columns[clean_client_name] = closed_marker
+            if changed:
+                self.table_domain.prune_fin_data(puzzle, recompute_gaps=True)
+                puzzle.dirty = True
+                self._push_update_to_open_window(clean_puzzle_id)
+            return True
+
+        entries = puzzle.client_entries.setdefault(clean_client_name, [])
+        if entries and self._is_blank_main_entry(entries[-1]):
+            return False
+        self._update_tail_main_script(
+            entries,
+            script_clean,
+            score_value,
+            continue_tail=True,
+            score_decimals=puzzle.score_decimals,
+        )
+        entries.append(self.normalize_main_entry({"script": "", "score": ""}))
+        puzzle.dirty = True
+        self._push_update_to_open_window(clean_puzzle_id)
         return True
 
     def _upsert_tail_main_state(
@@ -946,6 +1019,7 @@ class StatsManager:
         script_name: Any,
         score: Any,
         continue_tail: bool = True,
+        bootstrap_attach: bool = False,
     ):
         if not client_name or not puzzle_id:
             return
@@ -988,6 +1062,8 @@ class StatsManager:
                 row,
                 script_clean,
                 score_value,
+                continue_tail=bool(continue_tail),
+                bootstrap_attach=bool(bootstrap_attach),
             )
 
             if changed:
