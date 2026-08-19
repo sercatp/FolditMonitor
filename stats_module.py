@@ -43,7 +43,6 @@ class PuzzleData:
     fin_rows: List[Dict[str, Any]] = field(default_factory=list)
     fin_columns: List[Dict[str, Any]] = field(default_factory=list)
     active_targets: Dict[str, str] = field(default_factory=dict)
-    active_fin_columns: Dict[str, str] = field(default_factory=dict)
     score_decimals: int = 0
     loaded: bool = False
     dirty: bool = False
@@ -303,7 +302,6 @@ class StatsManager:
         puzzle.fin_rows.clear()
         puzzle.fin_columns.clear()
         puzzle.active_targets.clear()
-        puzzle.active_fin_columns.clear()
 
         with open(file_path, "r", newline="", encoding="utf-8") as f:
             rows = list(csv.reader(f))
@@ -510,24 +508,18 @@ class StatsManager:
     def _write_fin_score_to_script_column(
         self,
         puzzle: PuzzleData,
-        client_name: str,
         row: Dict[str, Any],
         script_name: Any,
         score_value: Optional[float],
-        continue_tail: bool = True,
-        bootstrap_attach: bool = False,
+        run_event: str = "update",
     ) -> tuple[Dict[str, Any], bool]:
         if score_value is None:
             return row, False
 
         script_clean = str(script_name).strip() if script_name is not None else ""
         cells = row.setdefault("cells", {})
-        previous_run_key = str(puzzle.active_fin_columns.get(client_name, "")).strip()
         column_key = self.table_domain.ensure_script_column(puzzle, row, script_clean)
-        resumes_known_run = previous_run_key == column_key or (
-            bool(bootstrap_attach) and not previous_run_key
-        )
-        if bool(continue_tail) and resumes_known_run:
+        if run_event in {"update", "resume"}:
             updated_value, changed = replace_latest_score_history_if_changed(
                 cells.get(column_key, ""),
                 score_value,
@@ -551,7 +543,6 @@ class StatsManager:
                 updated_value, changed = normalize_score_value(new_line), True
         if changed:
             cells[column_key] = updated_value
-        puzzle.active_fin_columns[client_name] = column_key
 
         return row, changed
 
@@ -584,7 +575,7 @@ class StatsManager:
         entries: List[Dict[str, Any]],
         script_name: str,
         score_value: Optional[float],
-        continue_tail: bool,
+        run_event: str,
         score_decimals: int,
     ) -> bool:
         script_clean = str(script_name).strip()
@@ -593,7 +584,7 @@ class StatsManager:
 
         anchor_idx = self._find_tail_main_anchor_index(entries)
         if (
-            continue_tail
+            run_event in {"update", "resume"}
             and anchor_idx is not None
             and self._scripts_match(entries[anchor_idx].get("script", ""), script_clean)
         ):
@@ -630,40 +621,32 @@ class StatsManager:
 
         target_mode = puzzle.active_targets.get(clean_client_name, "vertical")
         if target_mode == "horizontal":
-            closed_marker = "__interrupted_run_closed__"
-            if puzzle.active_fin_columns.get(clean_client_name) == closed_marker:
-                return False
             row = self._get_or_create_live_fin_row(puzzle, clean_client_name)
             _, changed = self._write_fin_score_to_script_column(
                 puzzle,
-                clean_client_name,
                 row,
                 script_clean,
                 score_value,
-                continue_tail=True,
-                bootstrap_attach=True,
+                run_event="update",
             )
-            puzzle.active_fin_columns[clean_client_name] = closed_marker
             if changed:
                 self.table_domain.prune_fin_data(puzzle, recompute_gaps=True)
                 puzzle.dirty = True
                 self._push_update_to_open_window(clean_puzzle_id)
-            return True
+            return changed
 
         entries = puzzle.client_entries.setdefault(clean_client_name, [])
-        if entries and self._is_blank_main_entry(entries[-1]):
-            return False
-        self._update_tail_main_script(
+        changed = self._update_tail_main_script(
             entries,
             script_clean,
             score_value,
-            continue_tail=True,
+            run_event="update",
             score_decimals=puzzle.score_decimals,
         )
-        entries.append(self.normalize_main_entry({"script": "", "score": ""}))
-        puzzle.dirty = True
-        self._push_update_to_open_window(clean_puzzle_id)
-        return True
+        if changed:
+            puzzle.dirty = True
+            self._push_update_to_open_window(clean_puzzle_id)
+        return changed
 
     def _upsert_tail_main_state(
         self,
@@ -807,7 +790,6 @@ class StatsManager:
         puzzle.fin_rows.clear()
         puzzle.fin_columns.clear()
         puzzle.active_targets.clear()
-        puzzle.active_fin_columns.clear()
         puzzle.score_decimals = self.default_score_decimals
         puzzle.loaded = False
         puzzle.dirty = False
@@ -1018,8 +1000,7 @@ class StatsManager:
         puzzle_id: str,
         script_name: Any,
         score: Any,
-        continue_tail: bool = True,
-        bootstrap_attach: bool = False,
+        run_event: str = "update",
     ):
         if not client_name or not puzzle_id:
             return
@@ -1036,6 +1017,9 @@ class StatsManager:
         score_value = parse_numeric_score(score)
         if score_value is None:
             return
+        normalized_run_event = str(run_event or "update").strip().lower()
+        if normalized_run_event not in {"start", "update", "resume"}:
+            normalized_run_event = "update"
 
         puzzle = self._get_or_create_puzzle(clean_puzzle_id)
         entries = puzzle.client_entries.setdefault(clean_client_name, [])
@@ -1058,12 +1042,10 @@ class StatsManager:
             )
             _, changed = self._write_fin_score_to_script_column(
                 puzzle,
-                clean_client_name,
                 row,
                 script_clean,
                 score_value,
-                continue_tail=bool(continue_tail),
-                bootstrap_attach=bool(bootstrap_attach),
+                run_event=normalized_run_event,
             )
 
             if changed:
@@ -1076,7 +1058,7 @@ class StatsManager:
             entries,
             script_clean,
             score_value,
-            continue_tail=bool(continue_tail),
+            run_event=normalized_run_event,
             score_decimals=puzzle.score_decimals,
         )
         if changed:
@@ -1160,7 +1142,6 @@ class StatsManager:
             if use_source_script_column:
                 row, _ = self._write_fin_score_to_script_column(
                     puzzle,
-                    target_name,
                     row,
                     source_script_clean,
                     source_score_value,

@@ -1512,14 +1512,13 @@ def check_client_changes(clients=None):
             if handler:
                 for event in handler.consume_stats_events():
                     event_kind = str(event.get('kind', '')).strip().lower()
-                    if event_kind == 'script' and puzzle_id:
+                    if event_kind in {'start', 'update', 'resume'} and puzzle_id:
                         stats_manager.handle_monitor_update(
                             client_name=client_name,
                             puzzle_id=puzzle_id,
                             script_name=event.get('script'),
                             score=event.get('score'),
-                            continue_tail=bool(event.get('continue_tail', True)),
-                            bootstrap_attach=bool(event.get('bootstrap_attach', False)),
+                            run_event=event_kind,
                         )
                     elif event_kind == 'state' and puzzle_id:
                         stats_manager.handle_script_state_snapshot(

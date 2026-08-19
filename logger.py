@@ -24,10 +24,28 @@ class FolditLogHandler:
 
     def start_monitoring(self, file_path: str):
         """Start monitoring for a specific file or return the existing handler."""
+        marker_path = os.path.abspath(str(file_path))
+        try:
+            source_key = self._source_stat_key(os.stat(file_path))
+        except OSError:
+            source_key = None
+
         with self.lock:
             handler = self.current_handlers.get(file_path)
             if handler is None:
-                handler = LogFileHandler(self.settings, file_path)
+                interrupted = self.interrupted_exports.get(marker_path)
+                initial_attach_as_new = bool(
+                    source_key is not None
+                    and interrupted
+                    and interrupted.get("source_key") != source_key
+                )
+                if initial_attach_as_new:
+                    self.interrupted_exports.pop(marker_path, None)
+                handler = LogFileHandler(
+                    self.settings,
+                    file_path,
+                    initial_attach_as_new=initial_attach_as_new,
+                )
                 self.current_handlers[file_path] = handler
                 handler.start()
         return handler
@@ -657,10 +675,11 @@ class LogFileHandler:
         self._script_state_snapshot = None
         self._current_state_rules = []
         self._run_open = False
-        self._tail_mode = "continue"
         self._stats_events = deque()
         self._last_emitted_script_payload = None
+        self._last_emitted_script_token = None
         self._last_emitted_state_payload = None
+        self._resume_run_token = None
         self._append_probe = b""
         self._append_probe_size = 0
         self.lock = threading.Lock()
@@ -718,13 +737,12 @@ class LogFileHandler:
         self._script_name = ""
         self._script_type = ""
         self._script_column_number = 0
-        self._script_change_token = 0
         self._script_state_snapshot = None
         self._current_state_rules = []
         self._run_open = False
-        self._tail_mode = "continue"
         self._last_emitted_script_payload = None
         self._last_emitted_state_payload = None
+        self._resume_run_token = None
         self._append_probe = b""
         self._append_probe_size = 0
 
@@ -771,7 +789,6 @@ class LogFileHandler:
 
     def _sync_stats_event_baseline(self):
         if not self._run_open:
-            self._tail_mode = "continue"
             self._last_emitted_script_payload = None
             self._last_emitted_state_payload = None
             return
@@ -783,6 +800,8 @@ class LogFileHandler:
                 float(self._highest_score),
             )
         self._last_emitted_script_payload = script_payload
+        if script_payload is not None:
+            self._last_emitted_script_token = self._script_change_token
 
         state_payload = None
         snapshot = self._build_stats_snapshot()
@@ -794,35 +813,41 @@ class LogFileHandler:
                     snapshot.get("score"),
                 )
         self._last_emitted_state_payload = state_payload
-        self._tail_mode = "continue"
 
-    def _queue_stats_events(self, bootstrap_attach: bool = False):
-        if not self._run_open:
-            self._sync_stats_event_baseline()
+    def _queue_script_event(self):
+        if not self._script_type or self._highest_score is None:
             return
 
-        run_started = self._tail_mode != "continue"
+        script_payload = (
+            str(self._script_type).strip(),
+            float(self._highest_score),
+        )
+        first_score_for_run = self._last_emitted_script_token != self._script_change_token
+        if not first_score_for_run and script_payload == self._last_emitted_script_payload:
+            return
 
-        script_payload = None
-        if self._script_type and self._highest_score is not None:
-            script_payload = (
-                str(self._script_type).strip(),
-                float(self._highest_score),
+        if first_score_for_run:
+            event_kind = (
+                "resume"
+                if self._resume_run_token == self._script_change_token
+                else "start"
             )
-            if run_started or script_payload != self._last_emitted_script_payload:
-                event = {
-                    "kind": "script",
-                    "script": script_payload[0],
-                    "score": script_payload[1],
-                    "continue_tail": not run_started,
-                }
-                if bootstrap_attach:
-                    event["bootstrap_attach"] = True
-                self._enqueue_stats_event(event)
-            self._last_emitted_script_payload = script_payload
+        else:
+            event_kind = "update"
 
-        state_payload = None
+        self._enqueue_stats_event(
+            {
+                "kind": event_kind,
+                "script": script_payload[0],
+                "score": script_payload[1],
+            }
+        )
+        self._last_emitted_script_payload = script_payload
+        self._last_emitted_script_token = self._script_change_token
+
+    def _queue_state_event(self):
         snapshot = self._build_stats_snapshot()
+        state_payload = None
         if isinstance(snapshot, dict):
             script_value = str(snapshot.get("script", "")).strip()
             if script_value:
@@ -830,17 +855,23 @@ class LogFileHandler:
                     script_value,
                     snapshot.get("score"),
                 )
-                if run_started or state_payload != self._last_emitted_state_payload:
+                if state_payload != self._last_emitted_state_payload:
                     self._enqueue_stats_event(
                         {
                             "kind": "state",
                             "script": state_payload[0],
                             "score": state_payload[1],
-                            "continue_tail": not run_started,
                         }
                     )
         self._last_emitted_state_payload = state_payload
-        self._tail_mode = "continue"
+
+    def _queue_stats_events(self):
+        if not self._run_open:
+            self._sync_stats_event_baseline()
+            return
+
+        self._queue_script_event()
+        self._queue_state_event()
 
     def _get_append_probe_bytes(self) -> int:
         try:
@@ -940,7 +971,7 @@ class LogFileHandler:
 
             with self.lock:
                 self._publish_cached_data()
-                self._queue_stats_events(bootstrap_attach=bootstrap_attach)
+                self._queue_stats_events()
                 self.last_mtime_ns = current_mtime_ns
                 self.last_size = current_size
 
@@ -1042,7 +1073,7 @@ class LogFileHandler:
     def _begin_script_run(self, script_name: str, boot_attached: bool = False):
         self._script_change_token += 1
         self._run_open = True
-        self._tail_mode = "continue" if boot_attached else "new"
+        self._resume_run_token = self._script_change_token if boot_attached else None
         self._highest_pattern_scores = self._new_pattern_score_state()
         self._highest_score = None
         self._script_state_snapshot = None
@@ -1054,12 +1085,17 @@ class LogFileHandler:
     def _close_script_run(self, boot_attached: bool = False):
         if not self._run_open:
             return
+        if not boot_attached:
+            # A whole short script can appear between two polls. Publish its final
+            # score before the close event so it is not omitted from statistics.
+            self._queue_script_event()
+            self._queue_state_event()
         self._run_open = False
-        self._tail_mode = "continue"
         if not boot_attached:
             self._enqueue_stats_event({"kind": "finish"})
         self._last_emitted_script_payload = None
         self._last_emitted_state_payload = None
+        self._resume_run_token = None
 
     @staticmethod
     def _is_script_close_line(line: str) -> bool:

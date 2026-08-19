@@ -36,6 +36,9 @@ DRW_CLOSED = DRW_OPEN + """Canceled
 </Foldit:Script>
 """
 
+DRW_BEFORE_SCORE = DRW_OPEN.split("+++Starting score", 1)[0]
+DRW_SCORE_LINE = "+++Starting score 4299.941 saved to slot 1\n"
+
 GAB_OPEN = """<?xml version="1.0" encoding="UTF-8"?>
 <Foldit:Script xmlns:Foldit="http://fold.it/scriptlog">
 <Foldit:Head>
@@ -234,7 +237,19 @@ class PollingLogHandler:
     def start_monitoring(self, file_path: str):
         handler = self.current_handlers.get(file_path)
         if handler is None:
-            handler = LogFileHandler(self.settings, file_path)
+            marker_path = os.path.abspath(file_path)
+            interrupted = self.recovery_handler.interrupted_exports.get(marker_path)
+            source_key = self.recovery_handler._source_stat_key(os.stat(file_path))
+            initial_attach_as_new = bool(
+                interrupted and interrupted.get("source_key") != source_key
+            )
+            if initial_attach_as_new:
+                self.recovery_handler.interrupted_exports.pop(marker_path, None)
+            handler = LogFileHandler(
+                self.settings,
+                file_path,
+                initial_attach_as_new=initial_attach_as_new,
+            )
             self.current_handlers[file_path] = handler
         handler._update_data()
         return handler
@@ -476,10 +491,9 @@ class LoggerRewriteCases(unittest.TestCase):
                 handler.consume_stats_events(),
                 [
                     {
-                        "kind": "script",
+                        "kind": "start",
                         "script": "GAB",
                         "score": 4299.942,
-                        "continue_tail": False,
                     }
                 ],
             )
@@ -507,10 +521,9 @@ class LoggerRewriteCases(unittest.TestCase):
                 handler.consume_stats_events(),
                 [
                     {
-                        "kind": "script",
+                        "kind": "start",
                         "script": "GAB",
                         "score": 4299.942,
-                        "continue_tail": False,
                     }
                 ],
             )
@@ -537,10 +550,9 @@ class LoggerRewriteCases(unittest.TestCase):
                 handler.consume_stats_events(),
                 [
                     {
-                        "kind": "script",
+                        "kind": "update",
                         "script": "DRW",
                         "score": 4300.5,
-                        "continue_tail": True,
                     }
                 ],
             )
@@ -587,10 +599,9 @@ class LoggerBootstrapCases(unittest.TestCase):
                 live_handler.consume_stats_events(),
                 [
                     {
-                        "kind": "script",
+                        "kind": "start",
                         "script": "DRW",
                         "score": 4299.941,
-                        "continue_tail": False,
                     }
                 ],
             )
@@ -611,11 +622,9 @@ class LoggerBootstrapCases(unittest.TestCase):
                 second_handler.consume_stats_events(),
                 [
                     {
-                        "kind": "script",
+                        "kind": "resume",
                         "script": "DRW",
                         "score": 4299.941,
-                        "continue_tail": True,
-                        "bootstrap_attach": True,
                     }
                 ],
             )
@@ -645,15 +654,63 @@ class LoggerBootstrapCases(unittest.TestCase):
                 handler.consume_stats_events(),
                 [
                     {
-                        "kind": "script",
+                        "kind": "start",
                         "script": "DRW",
                         "score": 4299.941,
-                        "continue_tail": False,
                     }
                 ],
             )
             self.assertTrue(handler.get_data()["run_open"])
-            self.assertEqual(handler.get_data()["script_change_token"], 1)
+            self.assertEqual(handler.get_data()["script_change_token"], 2)
+
+    def test_same_script_header_does_not_consume_boundary_before_first_score(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(path, DRW_OPEN)
+
+            handler = LogFileHandler(make_logger_settings(), path)
+            handler._update_data()
+            handler.consume_stats_events()
+
+            write_windows_text(path, DRW_CLOSED)
+            handler._update_data()
+            handler.consume_stats_events()
+
+            write_windows_text(path, DRW_BEFORE_SCORE)
+            handler._update_data()
+            self.assertEqual(handler.consume_stats_events(), [])
+            self.assertEqual(handler.get_data()["script_change_token"], 2)
+
+            append_windows_text(path, DRW_SCORE_LINE)
+            handler._update_data()
+
+            self.assertEqual(
+                handler.consume_stats_events(),
+                [
+                    {
+                        "kind": "start",
+                        "script": "DRW",
+                        "score": 4299.941,
+                    }
+                ],
+            )
+
+    def test_complete_same_script_between_polls_emits_start_before_finish(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(path, DRW_CLOSED)
+
+            handler = LogFileHandler(make_logger_settings(), path)
+            handler._update_data()
+            handler.consume_stats_events()
+
+            write_windows_text(path, DRW_CLOSED.replace("4299.941", "4305.000"))
+            handler._update_data()
+
+            events = handler.consume_stats_events()
+            self.assertEqual([event["kind"] for event in events], ["start", "finish"])
+            self.assertEqual(events[0]["script"], "DRW")
+            self.assertEqual(events[0]["score"], 4305.0)
 
     def test_finish_event_emitted_when_open_run_closes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -668,7 +725,9 @@ class LoggerBootstrapCases(unittest.TestCase):
             handler._update_data()
 
             self.assertFalse(handler.get_data()["run_open"])
-            self.assertIn({"kind": "finish"}, handler.consume_stats_events())
+            self.assertTrue(
+                any(event.get("kind") == "finish" for event in handler.consume_stats_events())
+            )
 
     def test_finish_event_not_emitted_for_bootstrap_closed_log(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -679,7 +738,9 @@ class LoggerBootstrapCases(unittest.TestCase):
             handler._update_data()
 
             self.assertFalse(handler.get_data()["run_open"])
-            self.assertNotIn({"kind": "finish"}, handler.consume_stats_events())
+            self.assertFalse(
+                any(event.get("kind") == "finish" for event in handler.consume_stats_events())
+            )
 
 
 class ManagedLogExportCases(unittest.TestCase):
@@ -719,6 +780,23 @@ class ManagedLogExportCases(unittest.TestCase):
             self.assertNotEqual(first_path, second_path)
             self.assertFalse(os.path.exists(first_path))
             self.assertTrue(os.path.exists(second_path))
+            self.assertTrue(second_path.endswith(".part.txt"))
+
+    def test_managed_export_preserves_partial_from_previous_same_named_run(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
+            log_handler, handler, _script_path = self._build_handler(temp_dir)
+
+            first_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            write_windows_text(script_path, DRW_OPEN.replace("4299.941", "4305.000"))
+            handler._update_data()
+            second_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+
+            self.assertNotEqual(first_path, second_path)
+            self.assertTrue(os.path.exists(first_path))
+            self.assertTrue(os.path.exists(second_path))
+            self.assertTrue(first_path.endswith(".part.txt"))
             self.assertTrue(second_path.endswith(".part.txt"))
 
     def test_managed_final_export_removes_remembered_partial(self):
@@ -820,6 +898,30 @@ class ManagedLogExportCases(unittest.TestCase):
 
             self.assertEqual(opened_path, interrupted_path)
             self.assertEqual(list(Path(temp_dir).glob("*.part.txt")), [])
+
+    def test_replaced_interrupted_source_attaches_as_new_run(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
+            old_mtime = time.time() - 60
+            os.utime(script_path, (old_mtime, old_mtime))
+            log_handler = FolditLogHandler(make_logger_settings())
+            log_handler.recover_interrupted_log(
+                temp_dir,
+                process_create_time=old_mtime + 30,
+                puzzle_id="1234",
+            )
+
+            write_windows_text(script_path, DRW_OPEN.replace("4299.941", "4305.000"))
+            handler = log_handler.start_monitoring(script_path)
+            try:
+                self.assertEqual(
+                    handler.consume_stats_events(),
+                    [{"kind": "start", "script": "DRW", "score": 4305.0}],
+                )
+                self.assertNotIn(script_path, log_handler.interrupted_exports)
+            finally:
+                log_handler.stop_monitoring(script_path)
 
     def test_disappearance_promotes_partial_to_interrupted(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -925,13 +1027,14 @@ class PuzzleSwitchCases(unittest.TestCase):
             manager.touch_client("client1", "1234")
 
             for event in handler.consume_stats_events():
-                if str(event.get("kind", "")).strip().lower() == "script":
+                event_kind = str(event.get("kind", "")).strip().lower()
+                if event_kind in {"start", "update", "resume"}:
                     manager.handle_monitor_update(
                         "client1",
                         "1234",
                         event.get("script"),
                         event.get("score"),
-                        continue_tail=bool(event.get("continue_tail", True)),
+                        run_event=event_kind,
                     )
 
             self.assertEqual(
@@ -951,15 +1054,16 @@ class PuzzleSwitchCases(unittest.TestCase):
             handler._update_data()
 
             for event in handler.consume_stats_events():
-                if str(event.get("kind", "")).strip().lower() == "script":
+                event_kind = str(event.get("kind", "")).strip().lower()
+                if event_kind in {"start", "update", "resume"}:
                     manager.handle_monitor_update(
                         "client1",
                         "5678",
                         event.get("script"),
                         event.get("score"),
-                        continue_tail=bool(event.get("continue_tail", True)),
+                        run_event=event_kind,
                     )
-                elif str(event.get("kind", "")).strip().lower() == "state":
+                elif event_kind == "state":
                     manager.handle_script_state_snapshot(
                         "client1",
                         "5678",
@@ -1064,6 +1168,44 @@ class MonitorIntegrationCases(unittest.TestCase):
                 ],
             )
 
+    def test_finished_same_named_run_waits_for_score_then_gets_new_main_row(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client_dir = os.path.join(temp_dir, "client1")
+            os.makedirs(client_dir, exist_ok=True)
+            script_path = os.path.join(client_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
+
+            harness = MonitorIntegrationHarness(temp_dir)
+            harness.set_processes([FakeProcess(1001, os.path.join(client_dir, "Foldit.exe"))])
+            harness.monitored_processes[1001] = {"puzzle_number": 1234, "score_stale_ticks": 0}
+            harness.run()
+
+            write_windows_text(script_path, DRW_CLOSED)
+            harness.run()
+
+            write_windows_text(script_path, DRW_BEFORE_SCORE)
+            harness.run()
+            self.assertEqual(
+                harness.stats_manager.get_entries_by_client("1234")["client1"],
+                [{"script": "DRW", "score": 4299.941}],
+            )
+
+            append_windows_text(
+                script_path,
+                DRW_SCORE_LINE.replace("4299.941", "4305.000"),
+            )
+            harness.run()
+            append_windows_text(script_path, "new run score 4310.000\n")
+            harness.run()
+
+            self.assertEqual(
+                harness.stats_manager.get_entries_by_client("1234")["client1"],
+                [
+                    {"script": "DRW", "score": 4299.941},
+                    {"script": "DRW", "score": "4305→4310"},
+                ],
+            )
+
     def test_check_client_changes_exports_final_log_on_finish_event(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             client_dir = os.path.join(temp_dir, "client1")
@@ -1132,7 +1274,6 @@ class MonitorIntegrationCases(unittest.TestCase):
                 harness.stats_manager.get_entries_by_client("1234")["client1"],
                 [
                     {"script": "DRW", "score": 4299.941},
-                    {"script": "", "score": ""},
                 ],
             )
 
@@ -1143,7 +1284,6 @@ class MonitorIntegrationCases(unittest.TestCase):
                 harness.stats_manager.get_entries_by_client("1234")["client1"],
                 [
                     {"script": "DRW", "score": 4299.941},
-                    {"script": "", "score": ""},
                     {"script": "DRW", "score": 4305.0},
                 ],
             )
@@ -1190,7 +1330,6 @@ class MonitorIntegrationCases(unittest.TestCase):
                 harness.stats_manager.get_entries_by_client("1234")["client1"],
                 [
                     {"script": "DRW", "score": 4299.941},
-                    {"script": "", "score": ""},
                     {"script": "DRW", "score": 4305.0},
                 ],
             )
@@ -1283,7 +1422,6 @@ class MonitorIntegrationCases(unittest.TestCase):
                 new_monitor.stats_manager.get_entries_by_client("1234")["client1"],
                 [
                     {"script": "DRW", "score": "4299→4305"},
-                    {"script": "", "score": ""},
                 ],
             )
 
@@ -1298,7 +1436,6 @@ class MonitorIntegrationCases(unittest.TestCase):
                 new_monitor.stats_manager.get_entries_by_client("1234")["client1"],
                 [
                     {"script": "DRW", "score": "4299→4305"},
-                    {"script": "", "score": ""},
                     {"script": "DRW", "score": "4305→4310"},
                 ],
             )
@@ -1747,7 +1884,7 @@ class StatsFinalizationHistoryCases(unittest.TestCase):
             manager.handle_monitor_update("client1", "1234", "H4", 100)
             manager.handle_monitor_update("client1", "1234", "H4", 110)
 
-            self.assertTrue(manager.finalize_interrupted_run("client1", "1234", "H4", 110))
+            self.assertFalse(manager.finalize_interrupted_run("client1", "1234", "H4", 110))
             self.assertFalse(manager.finalize_interrupted_run("client1", "1234", "H4", 110))
 
             manager.handle_monitor_update(
@@ -1755,8 +1892,7 @@ class StatsFinalizationHistoryCases(unittest.TestCase):
                 "1234",
                 "H4",
                 110,
-                continue_tail=True,
-                bootstrap_attach=True,
+                run_event="start",
             )
             manager.handle_monitor_update("client1", "1234", "H4", 120)
 
@@ -1773,7 +1909,7 @@ class StatsFinalizationHistoryCases(unittest.TestCase):
                 active_targets={"client1": "horizontal"},
             )
 
-            manager.handle_monitor_update("client1", "1234", "H4", 104)
+            manager.handle_monitor_update("client1", "1234", "H4", 104, run_event="start")
             manager.handle_monitor_update("client1", "1234", "H4", 105)
 
             row = manager.get_fin_rows("1234")[0]
@@ -1791,10 +1927,10 @@ class StatsFinalizationHistoryCases(unittest.TestCase):
                 active_targets={"client1": "horizontal"},
             )
 
-            manager.handle_monitor_update("client1", "1234", "H4", 100, continue_tail=False)
-            manager.handle_monitor_update("client1", "1234", "H4", 110, continue_tail=True)
-            manager.handle_monitor_update("client1", "1234", "H4", 110, continue_tail=False)
-            manager.handle_monitor_update("client1", "1234", "H4", 120, continue_tail=True)
+            manager.handle_monitor_update("client1", "1234", "H4", 100, run_event="start")
+            manager.handle_monitor_update("client1", "1234", "H4", 110, run_event="update")
+            manager.handle_monitor_update("client1", "1234", "H4", 110, run_event="start")
+            manager.handle_monitor_update("client1", "1234", "H4", 120, run_event="update")
 
             row = manager.get_fin_rows("1234")[0]
             self.assertEqual(row["cells"]["h:4"], "100→110\n110→120")
@@ -1862,9 +1998,9 @@ class StatsFinalizationHistoryCases(unittest.TestCase):
                 active_targets={"client1": "horizontal"},
             )
 
-            manager.handle_monitor_update("client1", "1234", "H4", 104)
-            manager.handle_monitor_update("client1", "1234", "H10", 110)
-            manager.handle_monitor_update("client1", "1234", "H4", 105)
+            manager.handle_monitor_update("client1", "1234", "H4", 104, run_event="start")
+            manager.handle_monitor_update("client1", "1234", "H10", 110, run_event="start")
+            manager.handle_monitor_update("client1", "1234", "H4", 105, run_event="start")
             # A running script's live state snapshots must not touch the fin `state`
             # cell, so they are intentionally not exercised here (see
             # StatsCopyFinalizationCases.test_running_script_on_fin_row_keeps_copied_state).
@@ -1893,8 +2029,7 @@ class StatsFinalizationHistoryCases(unittest.TestCase):
                 "1234",
                 "H4",
                 120,
-                continue_tail=True,
-                bootstrap_attach=True,
+                run_event="resume",
             )
 
             row = reloaded.get_fin_rows("1234")[0]
@@ -2043,12 +2178,12 @@ class StatsTailCases(unittest.TestCase):
         manager.save_puzzle("1234", force=True)
         manager.reload_puzzle("1234")
 
-    def test_continue_tail_true_after_reload_keeps_same_run(self):
+    def test_resume_after_reload_keeps_same_run(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = make_stats_manager(temp_dir)
             self._seed_loaded_csv(manager)
 
-            manager.handle_monitor_update("client1", "1234", "DRW", 9653, continue_tail=True)
+            manager.handle_monitor_update("client1", "1234", "DRW", 9653, run_event="resume")
             manager.handle_script_state_snapshot("client1", "1234", "99", 4)
 
             self.assertEqual(
@@ -2059,12 +2194,12 @@ class StatsTailCases(unittest.TestCase):
                 ],
             )
 
-    def test_continue_tail_false_after_reload_starts_new_run(self):
+    def test_start_after_reload_starts_new_run(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = make_stats_manager(temp_dir)
             self._seed_loaded_csv(manager)
 
-            manager.handle_monitor_update("client1", "1234", "DRW", 9653, continue_tail=False)
+            manager.handle_monitor_update("client1", "1234", "DRW", 9653, run_event="start")
             manager.handle_script_state_snapshot("client1", "1234", "99", 4)
 
             self.assertEqual(
@@ -2088,7 +2223,6 @@ class StatsTailCases(unittest.TestCase):
                 manager.get_entries_by_client("1234")["client1"],
                 [
                     {"script": "DRW", "score": "100→110"},
-                    {"script": "", "score": ""},
                 ],
             )
 
@@ -2097,8 +2231,7 @@ class StatsTailCases(unittest.TestCase):
                 "1234",
                 "DRW",
                 110,
-                continue_tail=True,
-                bootstrap_attach=True,
+                run_event="start",
             )
             manager.handle_monitor_update("client1", "1234", "DRW", 120)
 
@@ -2106,7 +2239,6 @@ class StatsTailCases(unittest.TestCase):
                 manager.get_entries_by_client("1234")["client1"],
                 [
                     {"script": "DRW", "score": "100→110"},
-                    {"script": "", "score": ""},
                     {"script": "DRW", "score": "110→120"},
                 ],
             )
@@ -2263,7 +2395,7 @@ class StatsStartEndScoreCases(unittest.TestCase):
             manager.touch_client("c", "1")
             manager.set_puzzle_entries("1", {"c": [{"script": "DRW", "score": 9650}]})
 
-            manager.handle_monitor_update("c", "1", "DRW", 9660, continue_tail=True)
+            manager.handle_monitor_update("c", "1", "DRW", 9660, run_event="update")
             self.assertEqual(
                 manager.get_entries_by_client("1")["c"],
                 [{"script": "DRW", "score": "9650→9660"}],

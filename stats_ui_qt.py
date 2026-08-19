@@ -4,7 +4,17 @@ import weakref
 from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QKeySequence, QPainter, QPen, QShortcut
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QFontDatabase,
+    QFontMetrics,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -463,7 +473,7 @@ class MainTableModel(QAbstractTableModel):
                 return QBrush(QColor(self._owner.idle_main_foreground_color))
 
             if role == Qt.ItemDataRole.FontRole and self._owner._main_client_is_target(client_name):
-                font = QFont(self._owner.stats_font)
+                font = QFont(self._owner.main_table_font)
                 font.setBold(True)
                 return font
 
@@ -704,6 +714,8 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
             str(font_settings.get("family", "DejaVu Sans Mono")),
             int(font_settings.get("stats_size", 8)),
         )
+        self.main_table_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont)
+        self.main_table_font.setPointSize(int(font_settings.get("stats_size", 8)))
 
         self._interaction_timer = QTimer(self)
         self._interaction_timer.setSingleShot(True)
@@ -808,7 +820,7 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
 
         self.main_table = MainStatsTableView(self)
         self.main_table.setModel(MainTableModel(self))
-        self.main_table.setFont(self.stats_font)
+        self.main_table.setFont(self.main_table_font)
         self.main_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.main_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         self.main_table.setEditTriggers(
@@ -822,11 +834,11 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
         self.main_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.main_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         self.main_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self.main_table.verticalHeader().setVisible(False)
         self.main_table.horizontalHeader().setDefaultAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
-        self.main_table.horizontalHeader().setFont(self.stats_font)
-        self.main_table.verticalHeader().setFont(self.stats_font)
+        self.main_table.horizontalHeader().setFont(self.main_table_font)
         self.main_table.horizontalHeader().setStretchLastSection(False)
         self._main_delegate = TrackingItemDelegate(self, self.main_table)
         self.main_table.setItemDelegate(self._main_delegate)
@@ -890,8 +902,8 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
         self.fin_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         self.fin_table.horizontalHeader().setSectionsMovable(True)
         self.fin_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self.fin_table.verticalHeader().setVisible(False)
         self.fin_table.horizontalHeader().setFont(self.stats_font)
-        self.fin_table.verticalHeader().setFont(self.stats_font)
         self.fin_table.horizontalHeader().setStretchLastSection(False)
         self._fin_delegate = TrackingItemDelegate(self, self.fin_table)
         self.fin_table.setItemDelegate(self._fin_delegate)
@@ -1379,8 +1391,8 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
 
         self._show_error("Logs", "No matching log found.")
 
-    def _measure_text_width(self, values: List[str]) -> int:
-        metrics = QFontMetrics(self.stats_font)
+    def _measure_text_width(self, values: List[str], table_font: QFont) -> int:
+        metrics = QFontMetrics(table_font)
         texts = [str(value) for value in values if value is not None]
         if not texts:
             return 0
@@ -1388,7 +1400,7 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
 
     def _preferred_column_width(self, table: QTableView, column_idx: int, header_text: str) -> int:
         content_width = max(0, int(table.sizeHintForColumn(column_idx)))
-        header_width = self._measure_text_width([header_text])
+        header_width = self._measure_text_width([header_text], table.horizontalHeader().font())
         return max(content_width, header_width)
 
     def _apply_main_column_widths(self):
@@ -1417,14 +1429,14 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
                 self.fin_table.setColumnWidth(idx, min(max(width, 46), 120))
 
     def _apply_table_layout(self):
-        text_height = QFontMetrics(self.stats_font).height()
-        row_height = max(13, text_height + 1)
-        self.main_table.verticalHeader().setMinimumSectionSize(row_height)
-        self.fin_table.verticalHeader().setMinimumSectionSize(row_height)
-        self.main_table.verticalHeader().setDefaultSectionSize(row_height)
-        self.fin_table.verticalHeader().setDefaultSectionSize(row_height)
-        self.main_table.horizontalHeader().setFixedHeight(row_height)
-        self.fin_table.horizontalHeader().setFixedHeight(row_height)
+        main_row_height = max(13, QFontMetrics(self.main_table_font).height() + 1)
+        fin_row_height = max(13, QFontMetrics(self.stats_font).height() + 1)
+        self.main_table.verticalHeader().setMinimumSectionSize(main_row_height)
+        self.fin_table.verticalHeader().setMinimumSectionSize(fin_row_height)
+        self.main_table.verticalHeader().setDefaultSectionSize(main_row_height)
+        self.fin_table.verticalHeader().setDefaultSectionSize(fin_row_height)
+        self.main_table.horizontalHeader().setFixedHeight(main_row_height)
+        self.fin_table.horizontalHeader().setFixedHeight(fin_row_height)
 
         self._apply_main_column_widths()
         self._apply_fin_column_widths()
@@ -1434,8 +1446,8 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
             fin_rows = min(max(6, len(self.fin_rows)), 18)
             self.content_splitter.setSizes(
                 [
-                    self.main_table.horizontalHeader().height() + row_height * main_rows + 90,
-                    self.fin_table.horizontalHeader().height() + row_height * fin_rows + 90,
+                    self.main_table.horizontalHeader().height() + main_row_height * main_rows + 90,
+                    self.fin_table.horizontalHeader().height() + fin_row_height * fin_rows + 90,
                 ]
             )
             self._splitter_sizes_initialized = True
@@ -1490,12 +1502,12 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
         self.main_table.updateGeometry()
         self.fin_table.updateGeometry()
 
-        main_width = self.main_table.verticalHeader().width()
+        main_width = 0
         for idx in range(self.main_table.model().columnCount()):
             main_width += self.main_table.columnWidth(idx)
         main_width += self.main_table.verticalScrollBar().sizeHint().width() + 24
 
-        fin_width = self.fin_table.verticalHeader().width()
+        fin_width = 0
         for idx in range(self.fin_table.model().columnCount()):
             fin_width += self.fin_table.columnWidth(idx)
         fin_width += self.fin_table.verticalScrollBar().sizeHint().width() + 24
