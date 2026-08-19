@@ -3,7 +3,7 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 INSTALL_COMMAND = "python -m pip install frida==17.15.4"
@@ -15,6 +15,9 @@ _FRIDA_IMPORT_LOCK = threading.Lock()
 # Concrete game_library.dll return-address offsets are runtime configuration.
 # Keep this engine identical for public and private installations.
 TARGET_SLEEP_MS = 100
+RPC_TIMEOUT_SECONDS = 5.0
+SHUTDOWN_RPC_TIMEOUT_SECONDS = 0.5
+SHUTDOWN_TOTAL_TIMEOUT_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -37,11 +40,6 @@ let replaceMs = REPLACEMENT_MS_PLACEHOLDER;
 let timerResolutionMs = TIMER_RESOLUTION_MS_PLACEHOLDER;
 const gameOffsets = [GAME_OFFSETS_PLACEHOLDER];
 const stats = {
-    patched: 0,
-    passed: 0,
-    skippedByCaller: 0,
-    matchedByOffset: {},
-    patchedByOffset: {},
     enabled: false,
     timerPeriodActive: false,
     timerPeriodBeginResult: null,
@@ -50,7 +48,10 @@ const stats = {
     timerResolutionMs: timerResolutionMs,
     activeTimerResolutionMs: null,
 };
-const hookedAddresses = {};
+const gameModule = Process.getModuleByName("game_library.dll");
+const targetReturnAddresses = gameOffsets.map(offset => gameModule.base.add(offset));
+let hookListeners = [];
+let hookedApis = [];
 
 function findExport(moduleName, exportName) {
     let module = Process.findModuleByName(moduleName);
@@ -135,84 +136,136 @@ function setTiming(nextReplaceMs, nextTimerResolutionMs) {
     };
 }
 
-function matchingCallerOffset(returnAddress) {
-    const module = Process.findModuleByAddress(returnAddress);
-    if (module === null || module.name.toLowerCase() !== "game_library.dll") {
-        return null;
+function isTargetCaller(returnAddress) {
+    for (let index = 0; index !== targetReturnAddresses.length; index++) {
+        if (returnAddress.equals(targetReturnAddresses[index])) {
+            return true;
+        }
     }
-    const offset = returnAddress.sub(module.base).toUInt32();
-    return gameOffsets.indexOf(offset) !== -1 ? offset : null;
+    return false;
 }
 
-function incrementByOffset(target, offset) {
-    const key = "0x" + offset.toString(16);
-    target[key] = (target[key] || 0) + 1;
-}
-
-function attachSleep(moduleName) {
+function attachSleep(moduleName, seenAddresses) {
     const address = findExport(moduleName, "Sleep");
     if (address === null) {
         return false;
     }
     const addressKey = address.toString();
-    if (hookedAddresses[addressKey] !== undefined) {
+    if (seenAddresses[addressKey] !== undefined) {
         return false;
     }
-    hookedAddresses[addressKey] = moduleName + "!Sleep";
-    Interceptor.attach(address, {
+    seenAddresses[addressKey] = true;
+    const listener = Interceptor.attach(address, {
         onEnter(args) {
-            const ms = args[0].toUInt32();
-            const offset = ms === targetMs ? matchingCallerOffset(this.returnAddress) : null;
-            if (offset !== null) {
-                incrementByOffset(stats.matchedByOffset, offset);
-                if (stats.enabled) {
-                    args[0] = ptr(replaceMs);
-                    stats.patched += 1;
-                    incrementByOffset(stats.patchedByOffset, offset);
-                } else {
-                    stats.passed += 1;
-                }
-            } else if (ms === targetMs) {
-                stats.skippedByCaller += 1;
-            } else {
-                stats.passed += 1;
+            if (!stats.enabled) {
+                return;
             }
+            const ms = args[0].toUInt32();
+            if (ms !== targetMs || !isTargetCaller(this.returnAddress)) {
+                return;
+            }
+            args[0] = ptr(replaceMs);
         }
     });
-    send({ type: "hook", api: moduleName + "!Sleep", address: addressKey });
+    hookListeners.push(listener);
+    hookedApis.push({ api: moduleName + "!Sleep", address: addressKey });
     return true;
 }
 
-attachSleep("KERNELBASE.dll");
-attachSleep("KERNEL32.dll");
+function installHooks() {
+    if (hookListeners.length !== 0) {
+        return true;
+    }
+
+    const seenAddresses = {};
+    try {
+        attachSleep("KERNELBASE.dll", seenAddresses);
+        attachSleep("KERNEL32.dll", seenAddresses);
+        Interceptor.flush();
+        return hookListeners.length !== 0;
+    } catch (error) {
+        removeHooks();
+        throw error;
+    }
+}
+
+function removeHooks() {
+    const listeners = hookListeners;
+    hookListeners = [];
+    hookedApis = [];
+    listeners.forEach(listener => {
+        try {
+            listener.detach();
+        } catch (_) {
+        }
+    });
+    Interceptor.flush();
+}
+
+function currentStats() {
+    return {
+        enabled: stats.enabled,
+        hooksActive: hookListeners.length !== 0,
+        hookedApis: hookedApis.slice(),
+        timerPeriodActive: stats.timerPeriodActive,
+        timerPeriodBeginResult: stats.timerPeriodBeginResult,
+        timerPeriodEndResult: stats.timerPeriodEndResult,
+        replacementSleepMs: replaceMs,
+        timerResolutionMs: timerResolutionMs,
+        activeTimerResolutionMs: stats.activeTimerResolutionMs,
+    };
+}
 
 rpc.exports = {
     setenabled(value) {
         const nextEnabled = !!value;
         if (nextEnabled) {
-            beginTimerPeriod();
+            if (stats.enabled && hookListeners.length !== 0) {
+                return true;
+            }
+            stats.enabled = true;
+            try {
+                if (!installHooks()) {
+                    stats.enabled = false;
+                    endTimerPeriod();
+                    return false;
+                }
+                beginTimerPeriod();
+            } catch (error) {
+                stats.enabled = false;
+                removeHooks();
+                endTimerPeriod();
+                throw error;
+            }
         } else {
+            // Stop patching before detach/cleanup work begins.
+            stats.enabled = false;
+            removeHooks();
             endTimerPeriod();
         }
-        stats.enabled = nextEnabled;
         return stats.enabled;
     },
     getstats() {
-        return stats;
+        return currentStats();
     },
     settiming(replacementSleepMs, requestedTimerResolutionMs) {
         return setTiming(replacementSleepMs, requestedTimerResolutionMs);
     },
     cleanup() {
         stats.enabled = false;
+        removeHooks();
         endTimerPeriod();
-        return stats;
+        return currentStats();
     }
 };
 """
 
 
 class SpeedBoostUnavailable(RuntimeError):
+    pass
+
+
+class SpeedBoostTimeout(TimeoutError):
     pass
 
 
@@ -226,6 +279,7 @@ class SpeedBoostSession:
     started_at: float
     timing: Optional[SpeedBoostTiming] = None
     last_error: str = ""
+    rpc_lock: object = field(default_factory=threading.RLock, repr=False)
 
 
 def _load_frida():
@@ -295,15 +349,24 @@ def _script_source(timing: SpeedBoostTiming, offsets) -> str:
 
 
 class FolditSpeedBoostManager:
-    def __init__(self, timing: SpeedBoostTiming, offsets, log_callback=None):
+    def __init__(
+        self,
+        timing: SpeedBoostTiming,
+        offsets,
+        log_callback=None,
+        rpc_timeout_seconds: float = RPC_TIMEOUT_SECONDS,
+    ):
         if not isinstance(timing, SpeedBoostTiming):
             raise TypeError("timing must be a SpeedBoostTiming instance")
+        if isinstance(rpc_timeout_seconds, bool) or rpc_timeout_seconds <= 0:
+            raise ValueError("rpc_timeout_seconds must be positive")
         self.sessions: Dict[int, SpeedBoostSession] = {}
         self.log_callback = log_callback
         self._lock = threading.RLock()
         self._operation_lock = threading.RLock()
         self._timing = timing
         self._offsets = _normalize_offsets(offsets)
+        self._rpc_timeout_seconds = float(rpc_timeout_seconds)
 
     def log(self, message: str) -> None:
         if self.log_callback:
@@ -331,16 +394,52 @@ class FolditSpeedBoostManager:
         with self._lock:
             return self._timing
 
+    def _call_with_timeout(self, operation_name: str, callback, timeout=None):
+        """Run one Frida call with a bounded wait on the calling thread."""
+        cancellable_class = getattr(frida, "Cancellable", None)
+        if cancellable_class is None:
+            # Unit-test fakes do not need to implement Frida's cancellation API.
+            return callback()
+
+        timeout_seconds = (
+            self._rpc_timeout_seconds if timeout is None else float(timeout)
+        )
+        cancellable = cancellable_class()
+        timed_out = threading.Event()
+
+        def cancel_operation():
+            timed_out.set()
+            cancellable.cancel()
+
+        timer = threading.Timer(timeout_seconds, cancel_operation)
+        timer.daemon = True
+        timer.start()
+        try:
+            with cancellable:
+                return callback()
+        except Exception as exc:
+            if timed_out.is_set():
+                raise SpeedBoostTimeout(
+                    f"{operation_name} timed out after {timeout_seconds:g}s"
+                ) from exc
+            raise
+        finally:
+            timer.cancel()
+
     def _apply_timing_to_session(
         self,
         managed: SpeedBoostSession,
         timing: SpeedBoostTiming,
     ) -> bool:
         try:
-            result = managed.script.exports_sync.settiming(
-                timing.replacement_sleep_ms,
-                timing.timer_resolution_ms,
-            )
+            with managed.rpc_lock:
+                result = self._call_with_timeout(
+                    f"set_timing pid={managed.pid}",
+                    lambda: managed.script.exports_sync.settiming(
+                        timing.replacement_sleep_ms,
+                        timing.timer_resolution_ms,
+                    ),
+                )
             applied = bool(result.get("ok")) if isinstance(result, dict) else bool(result)
             if not applied:
                 detail = result.get("error", "unknown error") if isinstance(result, dict) else str(result)
@@ -367,14 +466,20 @@ class FolditSpeedBoostManager:
             }
 
     def get_stats(self, pid: int) -> Optional[dict]:
-        """Return live hook counters for diagnostics and UI status checks."""
+        """Return lightweight hook state for diagnostics and UI checks."""
         pid = int(pid)
         with self._lock:
             managed = self.sessions.get(pid)
         if managed is None:
             return None
         try:
-            return dict(managed.script.exports_sync.getstats())
+            with managed.rpc_lock:
+                result = self._call_with_timeout(
+                    f"get_stats pid={pid}",
+                    lambda: managed.script.exports_sync.getstats(),
+                )
+            managed.last_error = ""
+            return dict(result)
         except Exception as exc:
             managed.last_error = str(exc)
             self.log(f"Speed boost pid={pid}: get_stats failed: {exc}")
@@ -393,18 +498,52 @@ class FolditSpeedBoostManager:
                 self.set_enabled(pid, enabled)
                 return True
 
-            session = frida_module.attach(pid)
-            script = session.create_script(_script_source(timing, self._offsets))
+            session = None
+            script = None
+            try:
+                session = self._call_with_timeout(
+                    f"attach pid={pid}",
+                    lambda: frida_module.attach(pid),
+                )
+                script = self._call_with_timeout(
+                    f"create_script pid={pid}",
+                    lambda: session.create_script(_script_source(timing, self._offsets)),
+                )
 
-            def on_message(message, data):
-                payload = message.get("payload") if isinstance(message, dict) else None
-                if payload:
-                    self.log(f"Speed boost pid={pid}: {payload}")
-                else:
-                    self.log(f"Speed boost pid={pid}: {message}")
+                def on_message(message, data):
+                    payload = message.get("payload") if isinstance(message, dict) else None
+                    if payload:
+                        self.log(f"Speed boost pid={pid}: {payload}")
+                    else:
+                        self.log(f"Speed boost pid={pid}: {message}")
 
-            script.on("message", on_message)
-            script.load()
+                script.on("message", on_message)
+                self._call_with_timeout(f"load_script pid={pid}", script.load)
+                self._call_with_timeout(
+                    f"verify_script pid={pid}",
+                    lambda: script.exports_sync.getstats(),
+                )
+            except Exception:
+                if script is not None:
+                    try:
+                        self._call_with_timeout(
+                            f"unload_failed_script pid={pid}",
+                            script.unload,
+                            timeout=SHUTDOWN_RPC_TIMEOUT_SECONDS,
+                        )
+                    except Exception:
+                        pass
+                if session is not None:
+                    try:
+                        self._call_with_timeout(
+                            f"detach_failed_session pid={pid}",
+                            session.detach,
+                            timeout=SHUTDOWN_RPC_TIMEOUT_SECONDS,
+                        )
+                    except Exception:
+                        pass
+                raise
+
             managed = SpeedBoostSession(
                 pid=pid,
                 client_name=client_name or str(pid),
@@ -425,13 +564,20 @@ class FolditSpeedBoostManager:
             managed = self.sessions.get(pid)
         if managed is None:
             return False
-        if managed.enabled == bool(enabled):
+        if managed.enabled == bool(enabled) and not managed.last_error:
             return managed.enabled
         try:
-            result = bool(managed.script.exports_sync.setenabled(bool(enabled)))
+            with managed.rpc_lock:
+                result = bool(
+                    self._call_with_timeout(
+                        f"set_enabled pid={pid}",
+                        lambda: managed.script.exports_sync.setenabled(bool(enabled)),
+                    )
+                )
             with self._lock:
                 if self.sessions.get(pid) is managed:
                     managed.enabled = result
+                    managed.last_error = ""
             return result
         except Exception as exc:
             managed.last_error = str(exc)
@@ -451,17 +597,24 @@ class FolditSpeedBoostManager:
             managed = self.sessions.pop(pid, None)
         if managed is None:
             return
-        try:
-            stats = managed.script.exports_sync.cleanup()
-            if not fast:
-                self.log(f"Speed boost pid={pid}: cleanup={stats}")
-        except Exception as exc:
-            if not fast:
-                self.log(f"Speed boost pid={pid}: cleanup failed: {exc}")
-        try:
-            managed.session.detach()
-        except Exception:
-            pass
+        with managed.rpc_lock:
+            try:
+                stats = self._call_with_timeout(
+                    f"cleanup pid={pid}",
+                    lambda: managed.script.exports_sync.cleanup(),
+                )
+                if not fast:
+                    self.log(f"Speed boost pid={pid}: cleanup={stats}")
+            except Exception as exc:
+                if not fast:
+                    self.log(f"Speed boost pid={pid}: cleanup failed: {exc}")
+            try:
+                self._call_with_timeout(
+                    f"detach pid={pid}",
+                    managed.session.detach,
+                )
+            except Exception:
+                pass
 
     def stop(self, pid: int, fast: bool = True) -> None:
         self.detach(pid, fast=fast)
@@ -477,17 +630,50 @@ class FolditSpeedBoostManager:
             self.detach(pid, fast=True)
 
     def abandon_all(self) -> None:
-        """Release timer-period requests and forget sessions during shutdown.
-
-        Explicit Frida detach can take seconds per busy Foldit process. When the
-        monitor process exits, Frida sessions are torn down by process shutdown.
-        Use this only when the Python app is closing immediately.
-        """
+        """Best-effort parallel cleanup with one bounded shutdown deadline."""
         with self._lock:
             managed_sessions = list(self.sessions.values())
             self.sessions.clear()
-        for managed in managed_sessions:
+
+        def cleanup_session(managed):
+            acquired = managed.rpc_lock.acquire(
+                timeout=SHUTDOWN_RPC_TIMEOUT_SECONDS
+            )
+            if not acquired:
+                return
             try:
-                managed.script.exports_sync.cleanup()
-            except Exception:
-                pass
+                try:
+                    self._call_with_timeout(
+                        f"shutdown_cleanup pid={managed.pid}",
+                        lambda: managed.script.exports_sync.cleanup(),
+                        timeout=SHUTDOWN_RPC_TIMEOUT_SECONDS,
+                    )
+                except Exception:
+                    pass
+                try:
+                    self._call_with_timeout(
+                        f"shutdown_detach pid={managed.pid}",
+                        managed.session.detach,
+                        timeout=SHUTDOWN_RPC_TIMEOUT_SECONDS,
+                    )
+                except Exception:
+                    pass
+            finally:
+                managed.rpc_lock.release()
+
+        workers = []
+        for managed in managed_sessions:
+            worker = threading.Thread(
+                target=cleanup_session,
+                args=(managed,),
+                daemon=True,
+            )
+            worker.start()
+            workers.append(worker)
+
+        deadline = time.monotonic() + SHUTDOWN_TOTAL_TIMEOUT_SECONDS
+        for worker in workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(remaining)

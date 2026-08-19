@@ -15,24 +15,13 @@ update and shows useful error messages if something needs attention.
 
 1. Install [Python](https://www.python.org/downloads/).
 2. Download this repository with **Code → Download ZIP**, then extract the archive.
-3. Open a terminal in the extracted project folder and create a virtual
-   environment:
+3. Open a terminal in the extracted project folder and install the packages:
 
    ```bash
-   python -m venv .venv
-   ```
-
-   Activate it with `.venv\Scripts\activate` on Windows or
-   `source .venv/bin/activate` on Linux and macOS.
-
-4. Install the packages:
-
-   ```bash
-   python -m pip install --upgrade pip
    python -m pip install -r requirements.txt
    ```
 
-5. Start the monitor:
+4. Start the monitor:
 
    ```bash
    python "Foldit Monitor.pyw"
@@ -83,9 +72,6 @@ the supported range, and pygame currently has no macOS package for that Python
 version. `requirements.txt` therefore skips pygame automatically on Python
 3.14. The monitor can still run, but sound alerts are unavailable; use Python
 3.13 for full functionality.
-
-Do not remove `psutil` from `requirements.txt`: it is required for process
-discovery and is not the package causing this Python 3.14 installation issue.
 
 ### One installation with multiple Tracks
 

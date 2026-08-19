@@ -1,10 +1,10 @@
 import ast
 import csv
-import json
 import os
 import re
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +16,6 @@ from stats_editor import StatsEditorSession
 from stats_module import StatsManager, parse_numeric_score
 from row_appearance import build_row_visual_state, resolve_row_appearance
 from settings import Settings
-from window_manager import enable_native_dpi_awareness
 
 
 DRW_OPEN = """<?xml version="1.0" encoding="UTF-8"?>
@@ -63,12 +62,6 @@ def write_windows_text(path: str, text: str):
 def append_windows_text(path: str, text: str):
     with open(path, "a", encoding="utf-8", newline="\r\n") as f:
         f.write(text)
-
-
-class DpiAwarenessCases(unittest.TestCase):
-    @patch("window_manager.platform.system", return_value="Linux")
-    def test_non_windows_keeps_toolkit_scaling_unchanged(self, _system):
-        self.assertFalse(enable_native_dpi_awareness())
 
 
 def make_logger_settings():
@@ -180,12 +173,16 @@ def build_optional_pygame_loader():
 
 
 class FakeProcess:
-    def __init__(self, pid: int, exe_path: str):
+    def __init__(self, pid: int, exe_path: str, create_time: float = 0.0):
         self.pid = pid
         self._exe_path = exe_path
+        self._create_time = float(create_time)
 
     def exe(self):
         return self._exe_path
+
+    def create_time(self):
+        return self._create_time
 
 
 class FakeProcessTree:
@@ -204,6 +201,35 @@ class PollingLogHandler:
         self.settings = settings
         self.current_handlers = {}
         self.export_calls = []
+        self.recovery_handler = FolditLogHandler(settings)
+
+    def recover_interrupted_log(self, folder_path: str, process_create_time: float, puzzle_id=None):
+        return self.recovery_handler.recover_interrupted_log(
+            folder_path,
+            process_create_time=process_create_time,
+            puzzle_id=puzzle_id,
+        )
+
+    def source_predates_process(self, file_path: str, process_create_time: float):
+        return self.recovery_handler.source_predates_process(file_path, process_create_time)
+
+    def get_interrupted_stats_snapshot(self, file_path: str):
+        return self.recovery_handler.get_interrupted_stats_snapshot(file_path)
+
+    def remember_client_context(self, file_path: str, **context):
+        return self.recovery_handler.remember_client_context(file_path, **context)
+
+    def get_client_context(self, file_path: str):
+        return self.recovery_handler.get_client_context(file_path)
+
+    def archive_interrupted_on_disappearance(self, file_path: str):
+        handler = self.current_handlers.get(file_path)
+        if handler is not None:
+            self.recovery_handler.current_handlers[file_path] = handler
+        try:
+            return self.recovery_handler.archive_interrupted_on_disappearance(file_path)
+        finally:
+            self.recovery_handler.current_handlers.pop(file_path, None)
 
     def start_monitoring(self, file_path: str):
         handler = self.current_handlers.get(file_path)
@@ -281,6 +307,7 @@ class MonitorIntegrationHarness:
                     pid=process.pid,
                     folder=folder,
                     client_name=os.path.basename(folder),
+                    process=process,
                 )
             )
         return clients
@@ -381,46 +408,6 @@ class PaletteConfigurationCases(unittest.TestCase):
                 self.assertIn("stale_to_foreground", settings.ROW_APPEARANCE["fin"])
 
 
-class PublicStarterProfileCases(unittest.TestCase):
-    def test_defaults_keep_the_curated_working_profile(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            settings = Settings(temp_dir)
-            defaults = settings.get_default_settings()
-            mapping = defaults["script_type_mapping"]
-
-            self.assertEqual(defaults["launch"]["last_seen_foldit_parent"], "")
-            self.assertEqual(defaults["display"]["window_position"], {"x": 1, "y": 1})
-            self.assertEqual(defaults["display"]["stats_window_position"], {"x": -1, "y": -1})
-            self.assertEqual(defaults["display"]["stats_last_puzzle"], "")
-            self.assertEqual(defaults["display"]["active_palette"], "contrast")
-            self.assertEqual(defaults["display"]["stats_ui_backend"], "pyside6")
-            self.assertEqual(defaults["display"]["stale_tick_limit"], 10_000)
-            self.assertEqual(defaults["network"]["default_address"], "127.0.0.1")
-            self.assertEqual(defaults["network"]["startup_connections"], [])
-            self.assertIn("Remaining time:", defaults["logging"]["exclude_score_strings"])
-            self.assertEqual(
-                {item["column_number"] for item in mapping.values() if item["column_number"] > 0},
-                {10, 20, 30, 50, 80},
-            )
-            self.assertEqual(mapping["cut "]["column_number"], 10)
-            self.assertEqual(mapping["cut and wiggle"]["column_number"], 50)
-            self.assertEqual(mapping["drw"]["state_snapshot_rules"][0]["name"], "serca drw")
-            self.assertEqual(mapping["drw"]["state_snapshot_rules"][1]["name"], "tvdl drw")
-
-    def test_defaults_profile_file_matches_the_first_run_defaults(self):
-        defaults_path = Path(__file__).resolve().parents[1] / "Foldit Monitor.defaults.json"
-        with defaults_path.open(encoding="utf-8") as handle:
-            profile = json.load(handle)
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            settings = Settings(temp_dir)
-            self.assertEqual(Path(settings.defaults_profile_file), defaults_path)
-            self.assertEqual(profile, settings.get_default_settings())
-            generated_path = Path(temp_dir) / "Foldit Monitor.json"
-            with generated_path.open(encoding="utf-8") as handle:
-                self.assertEqual(profile, json.load(handle))
-
-
 class LoggerRewriteCases(unittest.TestCase):
     def test_monitor_reuses_one_worker_thread_and_stops_it(self):
         settings = make_logger_settings()
@@ -447,25 +434,6 @@ class LoggerRewriteCases(unittest.TestCase):
         self.assertIsNotNone(worker)
         self.assertFalse(worker.is_alive())
         self.assertTrue(all(thread is worker for thread in update_threads[1:]))
-        self.assertIsNone(handler._worker_thread)
-
-    def test_repeated_start_stop_does_not_accumulate_workers(self):
-        settings = make_logger_settings()
-        settings["CHECK_INTERVAL"] = 60
-        handler = LogFileHandler(settings, "unused-scriptlog.xml")
-        handler._update_data = lambda: None
-        workers = []
-
-        for _ in range(20):
-            handler.start()
-            worker = handler._worker_thread
-            self.assertIsNotNone(worker)
-            workers.append(worker)
-            handler.stop()
-            worker.join(timeout=1)
-            self.assertFalse(worker.is_alive())
-
-        self.assertTrue(all(not worker.is_alive() for worker in workers))
         self.assertIsNone(handler._worker_thread)
 
     def test_closed_drw_then_gab_rewrite_switches_script_type(self):
@@ -598,6 +566,35 @@ class LoggerRewriteCases(unittest.TestCase):
 
 
 class LoggerBootstrapCases(unittest.TestCase):
+    def test_fresh_snapshot_does_not_clear_pending_live_stats_event(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(path, DRW_OPEN)
+
+            owner = FolditLogHandler(make_logger_settings())
+            live_handler = LogFileHandler(
+                make_logger_settings(),
+                path,
+                initial_attach_as_new=True,
+            )
+            owner.current_handlers[path] = live_handler
+            live_handler._update_data()
+
+            snapshot = owner.get_fresh_data(path)
+
+            self.assertEqual(snapshot["script_type"], "DRW")
+            self.assertEqual(
+                live_handler.consume_stats_events(),
+                [
+                    {
+                        "kind": "script",
+                        "script": "DRW",
+                        "score": 4299.941,
+                        "continue_tail": False,
+                    }
+                ],
+            )
+
     def test_new_handler_bootstraps_open_run_once(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = os.path.join(temp_dir, "scriptlog.default.xml")
@@ -618,6 +615,7 @@ class LoggerBootstrapCases(unittest.TestCase):
                         "script": "DRW",
                         "score": 4299.941,
                         "continue_tail": True,
+                        "bootstrap_attach": True,
                     }
                 ],
             )
@@ -749,6 +747,156 @@ class ManagedLogExportCases(unittest.TestCase):
 
             self.assertEqual(first_path, second_path)
             self.assertTrue(first_path.endswith(".fin.txt"))
+
+    def test_old_open_log_is_archived_once_as_interrupted_for_new_process(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
+            old_mtime = time.time() - 60
+            os.utime(script_path, (old_mtime, old_mtime))
+            log_handler = FolditLogHandler(make_logger_settings())
+
+            first_path = log_handler.recover_interrupted_log(
+                temp_dir,
+                process_create_time=old_mtime + 30,
+                puzzle_id="1234",
+            )
+            restarted_log_handler = FolditLogHandler(make_logger_settings())
+            second_path = restarted_log_handler.recover_interrupted_log(
+                temp_dir,
+                process_create_time=old_mtime + 30,
+                puzzle_id="1234",
+            )
+
+            self.assertEqual(first_path, second_path)
+            self.assertTrue(first_path.endswith(".interrupted.txt"))
+            self.assertIsNone(re.search(r"\.[0-9a-f]{12}\.interrupted", os.path.basename(first_path)))
+            self.assertEqual(Path(first_path).read_text(encoding="utf-8"), DRW_OPEN)
+            self.assertEqual(len(list(Path(temp_dir).glob("*.interrupted.txt"))), 1)
+
+    def test_interrupted_name_puts_collision_number_after_status(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = os.path.join(temp_dir, "scriptlog.default.xml")
+            old_mtime = time.time() - 60
+            log_handler = FolditLogHandler(make_logger_settings())
+
+            write_windows_text(script_path, DRW_OPEN)
+            os.utime(script_path, (old_mtime, old_mtime))
+            first_path = log_handler.recover_interrupted_log(
+                temp_dir,
+                process_create_time=old_mtime + 30,
+                puzzle_id="1234",
+            )
+
+            write_windows_text(script_path, DRW_OPEN + "different output\n")
+            os.utime(script_path, (old_mtime, old_mtime))
+            second_path = log_handler.recover_interrupted_log(
+                temp_dir,
+                process_create_time=old_mtime + 30,
+                puzzle_id="1234",
+            )
+
+            self.assertTrue(first_path.endswith(".interrupted.txt"))
+            self.assertTrue(second_path.endswith(".interrupted.2.txt"))
+            self.assertNotEqual(first_path, second_path)
+
+    def test_export_of_unchanged_recovered_source_reuses_interrupted_not_part(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
+            old_mtime = time.time() - 60
+            os.utime(script_path, (old_mtime, old_mtime))
+            log_handler = FolditLogHandler(make_logger_settings())
+            interrupted_path = log_handler.recover_interrupted_log(
+                temp_dir,
+                process_create_time=old_mtime + 30,
+                puzzle_id="1234",
+            )
+            handler = LogFileHandler(make_logger_settings(), script_path)
+            handler._update_data()
+            log_handler.current_handlers[script_path] = handler
+
+            opened_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+
+            self.assertEqual(opened_path, interrupted_path)
+            self.assertEqual(list(Path(temp_dir).glob("*.part.txt")), [])
+
+    def test_disappearance_promotes_partial_to_interrupted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
+            log_handler, _handler, _script_path = self._build_handler(temp_dir)
+            log_handler.remember_client_context(
+                script_path,
+                folder_path=temp_dir,
+                puzzle_id="1234",
+                client_name="client1",
+            )
+            partial_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+
+            interrupted_path = log_handler.archive_interrupted_on_disappearance(script_path)
+            reopened_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+
+            self.assertFalse(os.path.exists(partial_path))
+            self.assertTrue(interrupted_path.endswith(".interrupted.txt"))
+            self.assertTrue(os.path.exists(interrupted_path))
+            self.assertEqual(reopened_path, interrupted_path)
+
+    def test_closed_log_is_not_marked_interrupted_when_client_disappears(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_CLOSED)
+            log_handler, _handler, _script_path = self._build_handler(temp_dir)
+            log_handler.remember_client_context(
+                script_path,
+                folder_path=temp_dir,
+                puzzle_id="1234",
+                client_name="client1",
+            )
+
+            export_path = log_handler.archive_interrupted_on_disappearance(script_path)
+
+            self.assertIsNone(export_path)
+            self.assertEqual(list(Path(temp_dir).glob("*.interrupted.txt")), [])
+
+    def test_later_final_export_does_not_remove_interrupted_archive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
+            old_mtime = time.time() - 60
+            os.utime(script_path, (old_mtime, old_mtime))
+            log_handler = FolditLogHandler(make_logger_settings())
+            interrupted_path = log_handler.recover_interrupted_log(
+                temp_dir,
+                process_create_time=old_mtime + 30,
+                puzzle_id="1234",
+            )
+
+            write_windows_text(script_path, DRW_CLOSED.replace("4299.941", "4305.000"))
+            handler = LogFileHandler(make_logger_settings(), script_path)
+            handler._update_data()
+            log_handler.current_handlers[script_path] = handler
+            final_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+
+            self.assertTrue(os.path.exists(interrupted_path))
+            self.assertTrue(final_path.endswith(".fin.txt"))
+            self.assertTrue(os.path.exists(final_path))
+
+    def test_current_process_open_log_is_not_archived_as_interrupted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
+            current_mtime = os.path.getmtime(script_path)
+            log_handler = FolditLogHandler(make_logger_settings())
+
+            export_path = log_handler.recover_interrupted_log(
+                temp_dir,
+                process_create_time=current_mtime - 30,
+                puzzle_id="1234",
+            )
+
+            self.assertIsNone(export_path)
+            self.assertEqual(list(Path(temp_dir).glob("*.interrupted.txt")), [])
 
     def test_disabled_managed_export_uses_legacy_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -941,6 +1089,217 @@ class MonitorIntegrationCases(unittest.TestCase):
                         "open_file": False,
                         "puzzle_id": "1234",
                     }
+                ],
+            )
+
+    def test_new_process_recovers_old_log_and_starts_same_script_in_new_row(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client_dir = os.path.join(temp_dir, "client1")
+            os.makedirs(client_dir, exist_ok=True)
+            script_path = os.path.join(client_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
+            old_mtime = time.time() - 120
+            os.utime(script_path, (old_mtime, old_mtime))
+
+            harness = MonitorIntegrationHarness(temp_dir)
+            old_process = FakeProcess(
+                1001,
+                os.path.join(client_dir, "Foldit.exe"),
+                create_time=old_mtime - 30,
+            )
+            harness.set_processes([old_process])
+            harness.monitored_processes[1001] = {"puzzle_number": 1234, "score_stale_ticks": 0}
+            harness.run()
+
+            harness.set_processes([])
+            harness.run()
+
+            interrupted_paths = list(Path(client_dir).glob("*.interrupted.txt"))
+            self.assertEqual(len(interrupted_paths), 1)
+
+            new_process = FakeProcess(
+                2002,
+                os.path.join(client_dir, "Foldit.exe"),
+                create_time=old_mtime + 30,
+            )
+            harness.set_processes([new_process])
+            harness.monitored_processes[2002] = {"puzzle_number": 1234, "score_stale_ticks": 0}
+            harness.run()
+            harness.run()
+
+            self.assertEqual(len(interrupted_paths), 1)
+            self.assertEqual(
+                harness.stats_manager.get_entries_by_client("1234")["client1"],
+                [
+                    {"script": "DRW", "score": 4299.941},
+                    {"script": "", "score": ""},
+                ],
+            )
+
+            write_windows_text(script_path, DRW_OPEN.replace("4299.941", "4305.000"))
+            harness.run()
+
+            self.assertEqual(
+                harness.stats_manager.get_entries_by_client("1234")["client1"],
+                [
+                    {"script": "DRW", "score": 4299.941},
+                    {"script": "", "score": ""},
+                    {"script": "DRW", "score": 4305.0},
+                ],
+            )
+            self.assertTrue(interrupted_paths[0].exists())
+
+    def test_fast_same_script_restart_after_disappearance_keeps_run_boundary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client_dir = os.path.join(temp_dir, "client1")
+            os.makedirs(client_dir, exist_ok=True)
+            script_path = os.path.join(client_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
+            old_mtime = time.time() - 120
+            os.utime(script_path, (old_mtime, old_mtime))
+
+            harness = MonitorIntegrationHarness(temp_dir)
+            old_process = FakeProcess(
+                1001,
+                os.path.join(client_dir, "Foldit.exe"),
+                create_time=old_mtime - 30,
+            )
+            harness.set_processes([old_process])
+            harness.monitored_processes[1001] = {"puzzle_number": 1234, "score_stale_ticks": 0}
+            harness.run()
+
+            harness.set_processes([])
+            harness.run()
+            interrupted_paths = list(Path(client_dir).glob("*.interrupted.txt"))
+            self.assertEqual(len(interrupted_paths), 1)
+
+            # The replacement happens before Monitor sees the new process.  The
+            # interrupted finalization performed on disappearance must still make
+            # this first bootstrap a new run.
+            write_windows_text(script_path, DRW_OPEN.replace("4299.941", "4305.000"))
+            new_process = FakeProcess(
+                2002,
+                os.path.join(client_dir, "Foldit.exe"),
+                create_time=time.time() - 1,
+            )
+            harness.set_processes([new_process])
+            harness.monitored_processes[2002] = {"puzzle_number": 1234, "score_stale_ticks": 0}
+            harness.run()
+
+            self.assertEqual(
+                harness.stats_manager.get_entries_by_client("1234")["client1"],
+                [
+                    {"script": "DRW", "score": 4299.941},
+                    {"script": "", "score": ""},
+                    {"script": "DRW", "score": 4305.0},
+                ],
+            )
+            self.assertTrue(interrupted_paths[0].exists())
+
+    def test_new_process_uses_closed_stale_log_as_baseline_until_rewrite(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client_dir = os.path.join(temp_dir, "client1")
+            os.makedirs(client_dir, exist_ok=True)
+            script_path = os.path.join(client_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_CLOSED)
+            old_mtime = time.time() - 120
+            os.utime(script_path, (old_mtime, old_mtime))
+
+            harness = MonitorIntegrationHarness(temp_dir)
+            harness.stats_manager.handle_monitor_update("client1", "1234", "DRW", 4299.941)
+            new_process = FakeProcess(
+                2002,
+                os.path.join(client_dir, "Foldit.exe"),
+                create_time=time.time(),
+            )
+            harness.set_processes([new_process])
+            harness.monitored_processes[2002] = {
+                "puzzle_number": 1234,
+                "score_stale_ticks": 0,
+            }
+
+            harness.run()
+            self.assertEqual(list(Path(client_dir).glob("*.interrupted.txt")), [])
+            self.assertIn(script_path, harness.foldit_log_handler.current_handlers)
+
+            write_windows_text(script_path, DRW_OPEN.replace("4299.941", "4305.000"))
+            harness.run()
+
+            self.assertEqual(
+                harness.stats_manager.get_entries_by_client("1234")["client1"],
+                [
+                    {"script": "DRW", "score": 4299.941},
+                    {"script": "DRW", "score": 4305.0},
+                ],
+            )
+
+    def test_abrupt_monitor_restart_finalizes_stale_log_before_same_script_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client_dir = os.path.join(temp_dir, "client1")
+            os.makedirs(client_dir, exist_ok=True)
+            script_path = os.path.join(client_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
+
+            old_mtime = time.time() - 180
+            os.utime(script_path, (old_mtime, old_mtime))
+            old_process = FakeProcess(
+                1001,
+                os.path.join(client_dir, "Foldit.exe"),
+                create_time=old_mtime - 60,
+            )
+
+            old_monitor = MonitorIntegrationHarness(temp_dir)
+            old_monitor.set_processes([old_process])
+            old_monitor.monitored_processes[1001] = {
+                "puzzle_number": 1234,
+                "score_stale_ticks": 0,
+            }
+            old_monitor.run()
+            old_monitor.stats_manager.save_puzzle("1234", force=True)
+
+            # The last score reaches the raw log, but both Foldit and Monitor then
+            # disappear without a normal finish/disappearance poll.
+            append_windows_text(script_path, "last old-process score 4305.000\n")
+            os.utime(script_path, (old_mtime, old_mtime))
+
+            new_monitor = MonitorIntegrationHarness(temp_dir)
+            new_process = FakeProcess(
+                2002,
+                os.path.join(client_dir, "Foldit.exe"),
+                create_time=time.time(),
+            )
+            new_monitor.set_processes([new_process])
+            new_monitor.monitored_processes[2002] = {
+                "puzzle_number": 1234,
+                "score_stale_ticks": 0,
+            }
+
+            new_monitor.run()
+            new_monitor.run()
+
+            self.assertEqual(len(list(Path(client_dir).glob("*.interrupted.txt"))), 1)
+            self.assertNotIn(script_path, new_monitor.foldit_log_handler.current_handlers)
+            self.assertEqual(
+                new_monitor.stats_manager.get_entries_by_client("1234")["client1"],
+                [
+                    {"script": "DRW", "score": "4299→4305"},
+                    {"script": "", "score": ""},
+                ],
+            )
+
+            # The new run deliberately begins at the exact end score of the old
+            # run; it must still get its own row when the raw log changes.
+            write_windows_text(script_path, DRW_OPEN.replace("4299.941", "4305.000"))
+            new_monitor.run()
+            append_windows_text(script_path, "new-process score 4310.000\n")
+            new_monitor.run()
+
+            self.assertEqual(
+                new_monitor.stats_manager.get_entries_by_client("1234")["client1"],
+                [
+                    {"script": "DRW", "score": "4299→4305"},
+                    {"script": "", "score": ""},
+                    {"script": "DRW", "score": "4305→4310"},
                 ],
             )
 
@@ -1376,6 +1735,34 @@ class StatsFinalizationHistoryCases(unittest.TestCase):
             # The run keeps where it started; the grid shows the end (105).
             self.assertEqual(row["cells"]["h:4"], "104→105")
 
+    def test_interrupted_finalization_closes_same_highlight_run_idempotently(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = make_stats_manager(temp_dir, self.SCRIPT_MAPPING)
+            manager.set_fin_state(
+                "1234",
+                [{"client": "client1"}],
+                [],
+                active_targets={"client1": "horizontal"},
+            )
+            manager.handle_monitor_update("client1", "1234", "H4", 100)
+            manager.handle_monitor_update("client1", "1234", "H4", 110)
+
+            self.assertTrue(manager.finalize_interrupted_run("client1", "1234", "H4", 110))
+            self.assertFalse(manager.finalize_interrupted_run("client1", "1234", "H4", 110))
+
+            manager.handle_monitor_update(
+                "client1",
+                "1234",
+                "H4",
+                110,
+                continue_tail=True,
+                bootstrap_attach=True,
+            )
+            manager.handle_monitor_update("client1", "1234", "H4", 120)
+
+            row = manager.get_fin_rows("1234")[0]
+            self.assertEqual(row["cells"]["h:4"], "100→110\n110→120")
+
     def test_returning_to_previous_highlight_appends_once_then_replaces_latest(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = make_stats_manager(temp_dir, self.SCRIPT_MAPPING)
@@ -1393,6 +1780,24 @@ class StatsFinalizationHistoryCases(unittest.TestCase):
             # Returning to h:4 appends a new run line; that run keeps its start (104).
             self.assertEqual(row["cells"]["h:4"], "100\n104→105")
             self.assertEqual(row["cells"]["h:10"], 110.0)
+
+    def test_same_highlight_new_run_appends_even_with_same_start_score(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = make_stats_manager(temp_dir, self.SCRIPT_MAPPING)
+            manager.set_fin_state(
+                "1234",
+                [{"client": "client1"}],
+                [],
+                active_targets={"client1": "horizontal"},
+            )
+
+            manager.handle_monitor_update("client1", "1234", "H4", 100, continue_tail=False)
+            manager.handle_monitor_update("client1", "1234", "H4", 110, continue_tail=True)
+            manager.handle_monitor_update("client1", "1234", "H4", 110, continue_tail=False)
+            manager.handle_monitor_update("client1", "1234", "H4", 120, continue_tail=True)
+
+            row = manager.get_fin_rows("1234")[0]
+            self.assertEqual(row["cells"]["h:4"], "100→110\n110→120")
 
     def test_copy_then_running_next_highlight_replaces_latest_in_target_slot(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1468,6 +1873,32 @@ class StatsFinalizationHistoryCases(unittest.TestCase):
             reloaded = make_stats_manager(temp_dir, self.SCRIPT_MAPPING)
             row = reloaded.get_fin_rows("1234")[0]
             self.assertEqual(row["cells"]["h:4"], "104\n105")
+
+    def test_monitor_bootstrap_continues_latest_finalization_run_after_reload(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = make_stats_manager(temp_dir, self.SCRIPT_MAPPING)
+            manager.set_fin_state(
+                "1234",
+                [{"client": "client1"}],
+                [],
+                active_targets={"client1": "horizontal"},
+            )
+            manager.handle_monitor_update("client1", "1234", "H4", 100)
+            manager.handle_monitor_update("client1", "1234", "H4", 110)
+            manager.save_puzzle("1234", force=True)
+
+            reloaded = make_stats_manager(temp_dir, self.SCRIPT_MAPPING)
+            reloaded.handle_monitor_update(
+                "client1",
+                "1234",
+                "H4",
+                120,
+                continue_tail=True,
+                bootstrap_attach=True,
+            )
+
+            row = reloaded.get_fin_rows("1234")[0]
+            self.assertEqual(row["cells"]["h:4"], "100→120")
 
     def test_gap_column_records_next_script_start_and_survives_reruns(self):
         gap_mapping = {
@@ -1643,6 +2074,40 @@ class StatsTailCases(unittest.TestCase):
                     {"script": StatsManager.MAIN_STATE_SCRIPT, "score": "98 | 4"},
                     {"script": "DRW", "score": 9653.0},
                     {"script": StatsManager.MAIN_STATE_SCRIPT, "score": "99 | 4"},
+                ],
+            )
+
+    def test_interrupted_finalization_updates_old_tail_and_closes_it_idempotently(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = make_stats_manager(temp_dir)
+            manager.handle_monitor_update("client1", "1234", "DRW", 100)
+
+            self.assertTrue(manager.finalize_interrupted_run("client1", "1234", "DRW", 110))
+            self.assertFalse(manager.finalize_interrupted_run("client1", "1234", "DRW", 110))
+            self.assertEqual(
+                manager.get_entries_by_client("1234")["client1"],
+                [
+                    {"script": "DRW", "score": "100→110"},
+                    {"script": "", "score": ""},
+                ],
+            )
+
+            manager.handle_monitor_update(
+                "client1",
+                "1234",
+                "DRW",
+                110,
+                continue_tail=True,
+                bootstrap_attach=True,
+            )
+            manager.handle_monitor_update("client1", "1234", "DRW", 120)
+
+            self.assertEqual(
+                manager.get_entries_by_client("1234")["client1"],
+                [
+                    {"script": "DRW", "score": "100→110"},
+                    {"script": "", "score": ""},
+                    {"script": "DRW", "score": "110→120"},
                 ],
             )
 

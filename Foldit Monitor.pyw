@@ -15,6 +15,8 @@ from window_manager import (
     open_file,
     open_folder,
 )
+from client_resolver import ClientResolver, normalize_path
+from track_saves import replace_track_save_tree, resolve_track_copy_paths, track_directory_name
 
 enable_native_dpi_awareness()
 
@@ -149,8 +151,8 @@ def init_fonts():
 backup_folder_name = "foldit_backup"
 save2backup = True  # Whether to create a backup for destination folder when copying saves
 
-# Process monitoring dictionary
-monitored_processes = defaultdict(lambda: {
+def new_monitor_state():
+    return {
     'cpu_history': deque(maxlen=settings_manager.MONITOR_DURATION // settings_manager.CHECK_INTERVAL), 
     'high_cpu_count': 0, 
     'low_cpu_count': 0, 
@@ -163,12 +165,19 @@ monitored_processes = defaultdict(lambda: {
     'score_stale_ticks': 0,
     'was_idle': False,
     'alarm_on_change': False,  # one-shot: beep when score changes, then auto-disarm
-})
+    }
+
+
+# Runtime process metrics remain PID-keyed; configured log-only clients use client_id.
+monitored_processes = defaultdict(new_monitor_state)
+monitored_logical_clients = defaultdict(new_monitor_state)
+monitored_process_start_times = {}
+monitored_process_client_ids = {}
 
 selected_rows = []  # Array for storing selected rows
 artifact_row_cache = {}
 artifact_row_cache_lock = threading.Lock()
-client_log_roots_by_client = defaultdict(set)
+client_log_paths_by_client = defaultdict(set)
 last_double_click_time = 0
 stats_button = None
 stats_puzzle_menu = None
@@ -192,7 +201,27 @@ def get_foldit_parent_dir(folder_path):
     clean_path = str(folder_path).strip()
     if not clean_path:
         return ''
+    normalized = os.path.normpath(clean_path)
+    if (
+        os.path.basename(normalized).casefold() == "resources"
+        and os.path.basename(os.path.dirname(normalized)).casefold() == "contents"
+    ):
+        app_path = os.path.dirname(os.path.dirname(normalized))
+        if app_path.casefold().endswith(".app"):
+            return os.path.dirname(app_path)
     return os.path.dirname(clean_path)
+
+
+def get_data_root_display_name(folder_path):
+    normalized = os.path.normpath(str(folder_path or ""))
+    if (
+        os.path.basename(normalized).casefold() == "resources"
+        and os.path.basename(os.path.dirname(normalized)).casefold() == "contents"
+    ):
+        app_path = os.path.dirname(os.path.dirname(normalized))
+        if app_path.casefold().endswith(".app"):
+            return os.path.splitext(os.path.basename(app_path))[0]
+    return os.path.basename(normalized)
 
 
 def get_running_foldit_parent_dirs():
@@ -267,6 +296,23 @@ def get_cached_artifact_row(row_id):
         return dict(row) if row else None
 
 
+def get_row_log_path(row_id):
+    row = get_cached_artifact_row(row_id)
+    return str(row.get("log_path", "")).strip() if row else ""
+
+
+def is_shared_data_root(folder_path):
+    root_key = normalize_path(folder_path)
+    with artifact_row_cache_lock:
+        matches = {
+            str(row.get("row_id", ""))
+            for row in artifact_row_cache.values()
+            if str(row.get("data_root", "")).strip()
+            and normalize_path(row.get("data_root")) == root_key
+        }
+    return len(matches) > 1
+
+
 def find_latest_ir_solution(folder):
     ir_files = [
         os.path.join(folder, name)
@@ -290,9 +336,9 @@ def build_remote_artifact(kind, row_id, address, connection_id):
         raise RuntimeError("Client folder is no longer available")
 
     if clean_kind == "log":
-        script_path = os.path.join(folder, "scriptlog.default.xml")
+        script_path = str(row.get("log_path", "")).strip()
         if not os.path.exists(script_path):
-            raise FileNotFoundError("scriptlog.default.xml was not found")
+            raise FileNotFoundError("The resolved Foldit script log was not found")
 
         log_data = foldit_log_handler.get_fresh_data(script_path)
         if log_data:
@@ -309,6 +355,10 @@ def build_remote_artifact(kind, row_id, address, connection_id):
     if clean_kind == "pdb":
         if export_pdb is None:
             raise RuntimeError("savefile_api is unavailable")
+        if is_shared_data_root(folder):
+            raise RuntimeError(
+                "PDB export is disabled because several Track clients share this data folder"
+            )
 
         ir_path = find_latest_ir_solution(folder)
         if not ir_path:
@@ -398,19 +448,33 @@ def client_lookup_keys(client_name):
     return {key for key in keys if key}
 
 
-def remember_client_log_root(client_name, folder):
-    clean_folder = str(folder or "").strip()
-    if not clean_folder:
+def remember_client_log_path(client_name, log_path):
+    clean_path = str(log_path or "").strip()
+    if not clean_path:
         return
     for key in client_lookup_keys(client_name):
-        client_log_roots_by_client[key].add(clean_folder)
+        client_log_paths_by_client[key].add(normalize_path(clean_path))
+
+
+def remember_client_log_root(client_name, folder):
+    """Legacy helper retained for callers that only know a default-log folder."""
+    clean_folder = str(folder or "").strip()
+    if clean_folder:
+        remember_client_log_path(client_name, os.path.join(clean_folder, "scriptlog.default.xml"))
 
 
 def get_known_client_log_roots(client_name):
     roots = set()
     for key in client_lookup_keys(client_name):
-        roots.update(client_log_roots_by_client.get(key, set()))
+        roots.update(os.path.dirname(path) for path in client_log_paths_by_client.get(key, set()))
     return sorted(roots)
+
+
+def get_known_client_log_paths(client_name):
+    paths = set()
+    for key in client_lookup_keys(client_name):
+        paths.update(client_log_paths_by_client.get(key, set()))
+    return sorted(paths)
 
 
 def _score_from_log_data(log_data):
@@ -421,8 +485,7 @@ def _score_from_log_data(log_data):
 
 def export_matching_live_log(query, open_after=False):
     clean_query = dict(query or {})
-    for folder in get_known_client_log_roots(clean_query.get("client_name")):
-        script_path = os.path.join(folder, "scriptlog.default.xml")
+    for script_path in get_known_client_log_paths(clean_query.get("client_name")):
         if not os.path.exists(script_path):
             continue
         log_data = foldit_log_handler.get_data(script_path) or foldit_log_handler.get_fresh_data(script_path)
@@ -436,8 +499,8 @@ def export_matching_live_log(query, open_after=False):
             score=_score_from_log_data(log_data),
         ):
             continue
-        return foldit_log_handler.export_log(
-            folder,
+        return foldit_log_handler.export_log_file(
+            script_path,
             open_file=bool(open_after),
             puzzle_id=clean_query.get("puzzle_id"),
         )
@@ -582,6 +645,13 @@ def update_process_cpu_usage(clients):
         proc = client.process
         pid = client.pid
         try:
+            process_start = float(getattr(client, "process_start_time", 0.0) or 0.0)
+            previous_start = monitored_process_start_times.get(pid)
+            if previous_start is not None and process_start and previous_start != process_start:
+                monitored_processes[pid] = new_monitor_state()
+                monitored_process_client_ids.pop(pid, None)
+            if process_start:
+                monitored_process_start_times[pid] = process_start
             cpu_usage = proc.cpu_percent(interval=None)
             monitored_processes[pid]['cpu_history'].append((current_time, cpu_usage))
             cpu_history_copy = list(monitored_processes[pid]['cpu_history'])
@@ -598,6 +668,8 @@ def update_process_cpu_usage(clients):
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             if pid in monitored_processes:
                 del monitored_processes[pid]
+            monitored_process_start_times.pop(pid, None)
+            monitored_process_client_ids.pop(pid, None)
 
 def schedule_update():
     """Schedule the periodic update of the process list."""
@@ -614,20 +686,13 @@ def update_process_list():
     """Update the process list in the GUI."""
     global monitored_processes, artifact_row_cache
 
-    clients = get_foldit_clients()
-    update_process_cpu_usage(clients)
+    process_clients = get_foldit_clients()
+    update_process_cpu_usage(process_clients)
+    clients = client_resolver.submit(process_clients)
     
-    # Capture the source folder up front so its visual state survives the refresh.
     existing_items = set(process_tree.get_children())
-    selected_folder_order = []
-    for item in selected_rows:
-        if not process_tree.exists(item):
-            continue
-        folder_tag = get_folder_tag(process_tree.item(item, 'tags'))
-        if folder_tag and folder_tag not in selected_folder_order:
-            selected_folder_order.append(folder_tag)
-    copy_source_folder = selected_folder_order[0] if selected_folder_order else None
-    current_selected_items = {}
+    selected_item_order = [item for item in selected_rows if process_tree.exists(item)]
+    copy_source_item = selected_item_order[0] if selected_item_order else None
     current_items = set()
     current_artifact_rows = {}
     stats_targets_by_puzzle = {}
@@ -640,6 +705,7 @@ def update_process_list():
                 "script_running": False,
             }
             for client in clients
+            if client.pid is not None
         }
         if speed_boost is not None
         else None
@@ -648,20 +714,33 @@ def update_process_list():
     for client in clients:
         try:
             pid = client.pid
-            folder = client.folder
+            folder = client.data_root
             if not folder:
                 continue
-            remember_log_root = globals().get("remember_client_log_root")
-            if remember_log_root is not None:
-                remember_log_root(client.client_name, folder)
-            process_state = monitored_processes[pid]
+            if client.log_path:
+                remember_client_log_path(client.client_name, client.log_path)
+            if pid is not None:
+                previous_client_id = monitored_process_client_ids.get(pid)
+                if previous_client_id is not None and previous_client_id != client.client_id:
+                    previous_state = monitored_processes[pid]
+                    replacement = new_monitor_state()
+                    replacement['cpu_history'] = previous_state['cpu_history']
+                    replacement['high_cpu_state'] = previous_state.get('high_cpu_state', False)
+                    monitored_processes[pid] = replacement
+                monitored_process_client_ids[pid] = client.client_id
+                process_state = monitored_processes[pid]
+            else:
+                process_state = monitored_logical_clients[client.client_id]
             cpu_history = process_state['cpu_history']
             cpu_percent = sum(usage for _, usage in cpu_history) / len(cpu_history) if cpu_history else 0.0
             client_column_value = format_client_column_value(client.client_name)
+            # Keep the tiny client column compact. Binding details belong in the
+            # tooltip/diagnostics; only states requiring attention get an icon.
+            if client.binding_status in ("collision", "ambiguous"):
+                client_column_value = f"⚠ {client_column_value}"
             is_window_visible = client.is_window_visible
 
-            # Get the puzzle number from the window title
-            puzzle_number = get_puzzle_number(client.window_title)
+            puzzle_number = get_puzzle_number(client.window_title) or client.puzzle_id_override or None
             process_state['puzzle_number'] = puzzle_number
 
             score_display = ""
@@ -669,9 +748,8 @@ def update_process_list():
             script_type = ""
             script_change_token = 0
             script_running = False
-            script_path = os.path.join(folder, "scriptlog.default.xml")
-            foldit_log_handler.start_monitoring(script_path)
-            log_data = foldit_log_handler.get_data(script_path)
+            script_path = client.log_path if client.binding_status == "resolved" else ""
+            log_data = foldit_log_handler.get_data(script_path) if script_path else None
             if log_data:
                 script_type = log_data.get('script_type', '')
                 script_running = bool(log_data.get('run_open', False))
@@ -691,12 +769,14 @@ def update_process_list():
                 score_display = f"{str(highest_score).split('.')[0] + '.' + str(highest_score).split('.')[1][:1]}"
 
             # Create a unique identifier for the process
-            item_id = str(pid)
+            item_id = client.row_id
             current_items.add(item_id)
             
             # Update an existing item or create a new one
-            tags = [pid, folder]
-            is_idle = (not is_window_visible) and cpu_percent < settings_manager.LOW_CPU_THRESHOLD
+            tags = [folder]
+            if pid is not None:
+                tags.insert(0, pid)
+            is_idle = pid is not None and (not is_window_visible) and cpu_percent < settings_manager.LOW_CPU_THRESHOLD
             if is_window_visible:
                 tags.append('visible_window')
             if getattr(client, 'is_window_focused', False):
@@ -714,7 +794,7 @@ def update_process_list():
             if is_fin:
                 tags.append('fin_state')
 
-            if speed_boost_states is not None:
+            if speed_boost_states is not None and pid is not None:
                 speed_boost_states[pid] = {
                     "pid": pid,
                     "client_name": client.client_name,
@@ -748,9 +828,7 @@ def update_process_list():
                     play_alert_sound()
                     process_state['alarm_on_change'] = False
 
-            if folder in selected_folder_order:
-                current_selected_items[folder] = item_id
-            is_copy_source = folder == copy_source_folder
+            is_copy_source = item_id == copy_source_item
             if is_copy_source:
                 tags.append('copy_source')
 
@@ -769,19 +847,28 @@ def update_process_list():
             )
             
             # Create values with puzzle number
-            values = [score_display, f"{cpu_percent:.0f}", client_column_value, script_type]
+            cpu_display = f"{cpu_percent:.0f}" if pid is not None else ""
+            values = [score_display, cpu_display, client_column_value, script_type]
             if settings_manager.settings['display']['show_puzzle_column']:
                 values.append(str(puzzle_number) if puzzle_number else "")
 
-            current_artifact_rows[str(pid)] = {
-                "row_id": str(pid),
+            current_artifact_rows[item_id] = {
+                "row_id": item_id,
                 "pid": pid,
                 "folder": folder,
+                "data_root": folder,
                 "client": client_column_value,
                 "client_name": client.client_name,
+                "client_id": client.client_id,
+                "log_path": client.log_path,
+                "track": client.track,
+                "binding_status": client.binding_status,
+                "binding_source": client.binding_source,
+                "binding_detail": client.binding_detail,
                 "script_type": script_type,
                 "score": score_display,
                 "puzzle_id": str(puzzle_number) if puzzle_number else "",
+                "log_lines": list(process_state.get("last_log_lines", ())),
             }
             
             if item_id in existing_items:
@@ -798,6 +885,8 @@ def update_process_list():
         process_tree.delete(item_id)
         try:
             monitored_processes.pop(int(item_id), None)
+            monitored_process_start_times.pop(int(item_id), None)
+            monitored_process_client_ids.pop(int(item_id), None)
         except (TypeError, ValueError):
             pass
 
@@ -808,10 +897,9 @@ def update_process_list():
         speed_boost.on_clients_refreshed(speed_boost_states.values())
     
 
-    # Sort by the original folder path stored in row tags, not by the displayed text.
     items = [
         (
-            os.path.basename(get_folder_tag(process_tree.item(item, 'tags')) or ''),
+            str(current_artifact_rows.get(item, {}).get("client_name", "")),
             item,
         )
         for item in process_tree.get_children()
@@ -830,11 +918,7 @@ def update_process_list():
     adjust_window_size(changeWidth=False)
     check_client_changes(clients)
 
-    selected_rows[:] = [
-        current_selected_items[folder]
-        for folder in selected_folder_order
-        if folder in current_selected_items
-    ]
+    selected_rows[:] = [item for item in selected_item_order if item in current_items]
 
 def natural_sort(value):
     """Function to perform a natural sort."""
@@ -989,6 +1073,8 @@ def on_close():
     """Handle application closing"""
     if speed_boost is not None:
         speed_boost.shutdown()
+    if 'client_resolver' in globals():
+        client_resolver.stop()
     foldit_log_handler.stop_all_monitoring()
     stats_manager.flush_all()
     stats_window = get_open_stats_window()
@@ -1012,11 +1098,11 @@ def setup_tooltip(root):
     
     def get_tooltip_text(item):
         """Get the tooltip text for an item."""
-        tags = process_tree.item(item, 'tags')
-        folder_path = next((tag for tag in tags if '\\' in tag or '/' in tag), None)
-        if folder_path:
-            return get_last_log_lines(folder_path)
-        return None
+        row = get_cached_artifact_row(item) or {}
+        log_path = get_row_log_path(item)
+        if log_path and row.get("binding_status") == "resolved":
+            return get_last_log_lines(log_path, row.get("client_name", ""))
+        return row.get("binding_detail") or None
     
     tooltip.set_update_callback(get_tooltip_text)
     
@@ -1039,14 +1125,15 @@ def setup_tooltip(root):
                         for num, line in log_lines
                     )
                 else:
-                    log_text = "Log data not available"
+                    row = get_cached_artifact_row(item) or {}
+                    log_text = row.get("binding_detail") or "Log data not available"
             else:
-                tags = tree.item(item, 'tags')
-                folder_path = next((tag for tag in tags if '\\' in tag or '/' in tag), None)
-                if folder_path:
-                    log_text = get_last_log_lines(folder_path)
+                log_path = get_row_log_path(item)
+                row = get_cached_artifact_row(item) or {}
+                if log_path and row.get("binding_status") == "resolved":
+                    log_text = get_last_log_lines(log_path, row.get("client_name", ""))
                 else:
-                    log_text = "Log data not available"
+                    log_text = row.get("binding_detail") or "Log data not available"
                 
             x = root.winfo_x()
             y = root.winfo_y()
@@ -1067,9 +1154,13 @@ def setup_tooltip(root):
     
     return tooltip
 
-def get_last_log_lines(folder_path):
+def get_last_log_lines(log_path, client_name=""):
     """Get the last lines of the log from the FolditLogHandler"""
-    script_path = os.path.join(folder_path, "scriptlog.default.xml")
+    script_path = (
+        os.path.join(log_path, "scriptlog.default.xml")
+        if os.path.isdir(log_path)
+        else str(log_path)
+    )
     data = foldit_log_handler.get_data(script_path)  # Get log data using foldit_log_handler
     
     if not data:
@@ -1080,7 +1171,7 @@ def get_last_log_lines(folder_path):
     formatted_lines = []
     
     # Add the first line with the folder name, script, and score
-    folder_name = os.path.basename(folder_path)
+    folder_name = str(client_name).strip() or os.path.basename(os.path.dirname(script_path))
     script_name = data.get('script_type', 'Unknown')
     highest_score = data.get('highest_score', 'N/A')
     header = f"{folder_name} | {script_name} | {highest_score}"
@@ -1182,10 +1273,10 @@ def get_save_manager_clients():
             folders.append(folder)
             known_keys.add(key)
 
-    folders.sort(key=lambda folder: natural_sort(os.path.basename(folder)))
+    folders.sort(key=lambda folder: natural_sort(get_data_root_display_name(folder)))
     return [
         SimpleNamespace(
-            name=os.path.basename(folder),
+            name=get_data_root_display_name(folder),
             path=os.path.abspath(folder),
             running=normalize_save_manager_path(folder) in running_paths,
             active_puzzle_id=running_paths.get(normalize_save_manager_path(folder), ("", ""))[1],
@@ -1267,32 +1358,133 @@ def show_stats_puzzle_menu(event=None):
 
 def check_client_changes(clients=None):
     """Check for changes in client state."""
+    def finalize_interrupted_stats(script_path, client_name, puzzle_id):
+        if not client_name or not puzzle_id:
+            return False
+        get_snapshot = getattr(
+            foldit_log_handler,
+            'get_interrupted_stats_snapshot',
+            None,
+        )
+        finalize_interrupted = getattr(
+            stats_manager,
+            'finalize_interrupted_run',
+            None,
+        )
+        snapshot = get_snapshot(script_path) if get_snapshot is not None else None
+        if not snapshot or finalize_interrupted is None:
+            return False
+        return bool(
+            finalize_interrupted(
+                client_name=client_name,
+                puzzle_id=puzzle_id,
+                script_name=snapshot.get('script'),
+                score=snapshot.get('score'),
+            )
+        )
+
     current_stats_clients = set()
     current_client_runtime = {}
     active_script_paths = set()
     current_clients = clients if clients is not None else get_foldit_clients()
+    known_script_paths = {
+        str(getattr(client, "log_path", "") or os.path.join(getattr(client, "folder", ""), "scriptlog.default.xml"))
+        for client in current_clients
+        if str(getattr(client, "log_path", "") or getattr(client, "folder", "")).strip()
+    }
+    for client in current_clients:
+        known_script_paths.update(
+            str(path)
+            for path in getattr(client, "candidate_log_paths", ())
+            if str(path).strip()
+        )
     
     for client in current_clients:
         try:
-            folder = client.folder
+            folder = str(getattr(client, "data_root", "") or getattr(client, "folder", ""))
             if not folder:
                 continue
-            remember_log_root = globals().get("remember_client_log_root")
-            if remember_log_root is not None:
-                remember_log_root(client.client_name, folder)
             client_name = client.client_name
-            
-            script_path = os.path.join(folder, "scriptlog.default.xml")
+
+            binding_status = str(getattr(client, "binding_status", "resolved") or "resolved")
+            script_path = str(
+                getattr(client, "log_path", "")
+                or os.path.join(folder, "scriptlog.default.xml")
+            )
+            if binding_status != "resolved" or not script_path:
+                continue
+            remember_log_path = globals().get("remember_client_log_path")
+            if remember_log_path is not None:
+                remember_log_path(client_name, script_path)
             active_script_paths.add(script_path)
-            foldit_log_handler.start_monitoring(script_path)
-            handler = foldit_log_handler.current_handlers.get(script_path)
-            puzzle_number = monitored_processes.get(client.pid, {}).get('puzzle_number')
+            state_store = (
+                monitored_processes.get(client.pid, {})
+                if client.pid is not None
+                else monitored_logical_clients.get(getattr(client, "client_id", ""), {})
+            )
+            puzzle_number = state_store.get('puzzle_number') or getattr(client, "puzzle_id_override", "")
             puzzle_id = str(puzzle_number) if puzzle_number else None
+
+            process_create_time = getattr(client, "process_start_time", None)
+            if client.pid is not None and not process_create_time:
+                try:
+                    process_create_time = client.process.create_time()
+                except Exception:
+                    process_create_time = None
+
+            remember_client_context = getattr(foldit_log_handler, 'remember_client_context', None)
+            if remember_client_context is not None:
+                remember_client_context(
+                    script_path,
+                    folder_path=folder,
+                    puzzle_id=puzzle_id,
+                    client_name=client_name,
+                )
+
+            recover_interrupted_file = getattr(foldit_log_handler, 'recover_interrupted_log_file', None)
+            recover_interrupted_legacy = getattr(foldit_log_handler, 'recover_interrupted_log', None)
+            source_predates_process = getattr(
+                foldit_log_handler,
+                'source_predates_process',
+                None,
+            )
+            stale_source = bool(
+                source_predates_process is not None
+                and process_create_time is not None
+                and source_predates_process(script_path, process_create_time)
+            )
+            interrupted_path = None
+            if stale_source and (recover_interrupted_file or recover_interrupted_legacy):
+                if recover_interrupted_file is not None:
+                    interrupted_path = recover_interrupted_file(
+                        script_path,
+                        process_create_time=process_create_time,
+                        puzzle_id=puzzle_id,
+                    )
+                else:
+                    interrupted_path = recover_interrupted_legacy(
+                        folder,
+                        process_create_time=process_create_time,
+                        puzzle_id=puzzle_id,
+                    )
+                if interrupted_path:
+                    finalize_interrupted_stats(script_path, client_name, puzzle_id)
+
+            if interrupted_path:
+                # This open file belongs to the previous Foldit process.  Re-check
+                # its mtime on the next normal poll; attach only after this process
+                # actually changes or replaces it.  A closed stale file is safe to
+                # attach as a baseline because it emits no bootstrap script event.
+                foldit_log_handler.stop_monitoring(script_path)
+                handler = None
+            else:
+                foldit_log_handler.start_monitoring(script_path)
+                handler = foldit_log_handler.current_handlers.get(script_path)
 
             if puzzle_id:
                 current_stats_clients.add(client_name)
                 stats_manager.touch_client(client_name, puzzle_id)
-                item_id = str(client.pid)
+                item_id = str(getattr(client, "row_id", client.pid))
                 cpu_percent = 0.0
                 is_idle = False
                 score_stale_ticks = 0
@@ -1305,7 +1497,7 @@ def check_client_changes(clients=None):
                         except (TypeError, ValueError):
                             cpu_percent = 0.0
                     is_idle = 'idle_window' in tags
-                process_state = monitored_processes.get(client.pid, {})
+                process_state = state_store
                 try:
                     score_stale_ticks = max(0, int(process_state.get('score_stale_ticks', 0) or 0))
                 except (TypeError, ValueError):
@@ -1317,18 +1509,19 @@ def check_client_changes(clients=None):
                     'score_stale_ticks': score_stale_ticks,
                 }
             
-            if handler and puzzle_id:
+            if handler:
                 for event in handler.consume_stats_events():
                     event_kind = str(event.get('kind', '')).strip().lower()
-                    if event_kind == 'script':
+                    if event_kind == 'script' and puzzle_id:
                         stats_manager.handle_monitor_update(
                             client_name=client_name,
                             puzzle_id=puzzle_id,
                             script_name=event.get('script'),
                             score=event.get('score'),
                             continue_tail=bool(event.get('continue_tail', True)),
+                            bootstrap_attach=bool(event.get('bootstrap_attach', False)),
                         )
-                    elif event_kind == 'state':
+                    elif event_kind == 'state' and puzzle_id:
                         stats_manager.handle_script_state_snapshot(
                             client_name=client_name,
                             puzzle_id=puzzle_id,
@@ -1337,19 +1530,42 @@ def check_client_changes(clients=None):
                         )
                     elif event_kind == 'finish':
                         speed_boost_integration = globals().get('speed_boost')
-                        if speed_boost_integration is not None:
+                        if speed_boost_integration is not None and client.pid is not None:
                             speed_boost_integration.on_script_finished(client.pid)
-                        foldit_log_handler.export_log(
-                            folder,
-                            open_file=False,
-                            puzzle_id=puzzle_id,
-                        )
+                        export_log_file = getattr(foldit_log_handler, "export_log_file", None)
+                        if export_log_file is not None:
+                            export_log_file(script_path, open_file=False, puzzle_id=puzzle_id)
+                        else:
+                            foldit_log_handler.export_log(folder, open_file=False, puzzle_id=puzzle_id)
                     
         except Exception as e:
             print(f"Error checking client changes: {e}")
 
     for monitored_path in list(foldit_log_handler.current_handlers.keys()):
         if monitored_path not in active_script_paths:
+            archive_interrupted = getattr(
+                foldit_log_handler,
+                'archive_interrupted_on_disappearance',
+                None,
+            )
+            if archive_interrupted is not None and monitored_path not in known_script_paths:
+                interrupted_path = archive_interrupted(monitored_path)
+                if interrupted_path:
+                    get_client_context = getattr(
+                        foldit_log_handler,
+                        'get_client_context',
+                        None,
+                    )
+                    context = (
+                        get_client_context(monitored_path)
+                        if get_client_context is not None
+                        else {}
+                    )
+                    finalize_interrupted_stats(
+                        monitored_path,
+                        context.get('client_name'),
+                        context.get('puzzle_id'),
+                    )
             foldit_log_handler.stop_monitoring(monitored_path)
 
     stats_manager.sync_active_clients(current_stats_clients)
@@ -1828,8 +2044,14 @@ def handle_middle_click(event):
         target_folder = get_folder_tag(target_tags)
         
         if source_folder and target_folder:
-            # Copy files (only saves, no IR solutions)
-            copy_foldit_saves(source_folder, target_folder, copy_saves=True, copy_ir=True)
+            copy_foldit_saves(
+                source_folder,
+                target_folder,
+                copy_saves=True,
+                copy_ir=True,
+                source_row_id=selected_rows[0],
+                target_row_id=selected_rows[1],
+            )
 
             # Clear selections after 1 second
             root.after(1000, clear_all_selections)
@@ -1839,7 +2061,14 @@ def handle_middle_click(event):
 _copy_in_progress = False  # guard: don't start a second copy over a running one
 
 
-def copy_foldit_saves(source_folder, target_folder, copy_saves=True, copy_ir=False):
+def copy_foldit_saves(
+    source_folder,
+    target_folder,
+    copy_saves=True,
+    copy_ir=False,
+    source_row_id=None,
+    target_row_id=None,
+):
     """Copy Foldit saves between two clients.
 
     The disk work runs in a background thread so a slow or busy disk never freezes
@@ -1848,44 +2077,81 @@ def copy_foldit_saves(source_folder, target_folder, copy_saves=True, copy_ir=Fal
     global _copy_in_progress
     if _copy_in_progress:
         return
-    job = _resolve_copy_job(source_folder, target_folder, copy_saves, copy_ir)
+    job = _resolve_copy_job(
+        source_folder,
+        target_folder,
+        copy_saves,
+        copy_ir,
+        source_row_id=source_row_id,
+        target_row_id=target_row_id,
+    )
     _copy_in_progress = True
     threading.Thread(target=_run_copy_jobs, args=([job],), daemon=True).start()
 
 
-def copy_to_all_clients(source_folder):
+def copy_to_all_clients(source_folder, source_row_id=None):
     """Copy the latest .ir_solution from source folder to all other clients (threaded)."""
     global _copy_in_progress
     if _copy_in_progress:
         return
     jobs = []
+    seen_targets = set()
     for item in process_tree.get_children():
         tags = process_tree.item(item, 'tags')
         target_folder = next((tag for tag in tags if '\\' in tag or '/' in tag), None)
-        if target_folder and target_folder != source_folder:
-            jobs.append(_resolve_copy_job(source_folder, target_folder, copy_saves=False, copy_ir=True))
+        target_key = normalize_path(target_folder) if target_folder else ""
+        if (
+            target_folder
+            and target_key != normalize_path(source_folder)
+            and target_key not in seen_targets
+        ):
+            # Imported/shared .ir_solution files live at data-root level, so one
+            # copy per distinct root is sufficient even when it hosts many Tracks.
+            seen_targets.add(target_key)
+            jobs.append(
+                _resolve_copy_job(
+                    source_folder,
+                    target_folder,
+                    copy_saves=False,
+                    copy_ir=True,
+                    source_row_id=source_row_id,
+                    target_row_id=item,
+                )
+            )
     if not jobs:
         return
     _copy_in_progress = True
     threading.Thread(target=_run_copy_jobs, args=(jobs,), daemon=True).start()
 
 
-def _resolve_copy_job(source_folder, target_folder, copy_saves, copy_ir):
+def _resolve_copy_job(
+    source_folder,
+    target_folder,
+    copy_saves,
+    copy_ir,
+    source_row_id=None,
+    target_row_id=None,
+):
     """Gather everything that needs the Tk tree / process state. Runs on the main
     thread before the worker starts (Tkinter must never be touched off-thread)."""
-    source_pid = get_pid_for_folder(source_folder)
-    target_pid = get_pid_for_folder(target_folder)
+    source_row = get_cached_artifact_row(source_row_id) if source_row_id else None
+    target_row = get_cached_artifact_row(target_row_id) if target_row_id else None
+    source_pid = source_row.get("pid") if source_row else get_pid_for_folder(source_folder)
+    target_pid = target_row.get("pid") if target_row else get_pid_for_folder(target_folder)
     return {
         'source_folder': source_folder,
         'target_folder': target_folder,
         'copy_saves': copy_saves,
         'copy_ir': copy_ir,
-        'source_name': os.path.basename(source_folder),
-        'target_name': os.path.basename(target_folder),
+        'source_name': source_row.get("client_name") if source_row else os.path.basename(source_folder),
+        'target_name': target_row.get("client_name") if target_row else os.path.basename(target_folder),
+        'source_log_path': source_row.get("log_path", "") if source_row else os.path.join(source_folder, "scriptlog.default.xml"),
+        'source_track': source_row.get("track", "default") if source_row else "default",
+        'target_track': target_row.get("track", "default") if target_row else "default",
         'source_pid': source_pid,
         'target_pid': target_pid,
-        'source_puzzle_id': get_puzzle_id(source_pid),
-        'target_puzzle_id': get_puzzle_id(target_pid),
+        'source_puzzle_id': source_row.get("puzzle_id") if source_row else get_puzzle_id(source_pid),
+        'target_puzzle_id': target_row.get("puzzle_id") if target_row else get_puzzle_id(target_pid),
     }
 
 
@@ -1923,7 +2189,7 @@ def _perform_copy_job(job):
     source_log_data = None
     source_snapshot = None
     try:
-        source_script_path = os.path.join(source_folder, "scriptlog.default.xml")
+        source_script_path = job.get('source_log_path') or os.path.join(source_folder, "scriptlog.default.xml")
         foldit_log_handler.start_monitoring(source_script_path)
         source_log_data = foldit_log_handler.get_fresh_data(source_script_path)
         source_snapshot = foldit_log_handler.get_stats_snapshot(source_script_path, fresh=True)
@@ -1934,37 +2200,26 @@ def _perform_copy_job(job):
 
     if job['copy_saves']:
         try:
-            src_puzzles = os.path.join(source_folder, "puzzles")
-            dest_puzzles = os.path.join(target_folder, "puzzles")
-            if not os.path.exists(src_puzzles):
-                return f"Source folder does not exist: {src_puzzles}"
-
-            latest_subdir = get_most_recently_modified_subdir(src_puzzles)
-            if not latest_subdir:
-                return f"No subdirectories found in the folder {src_puzzles}"
-
-            latest_subdir_path = os.path.join(src_puzzles, latest_subdir)
-            dest_path = os.path.join(dest_puzzles, latest_subdir)
-
+            source_location, dest_path = resolve_track_copy_paths(
+                source_folder,
+                job.get('source_track'),
+                target_folder,
+                job.get('target_track'),
+            )
+            source_track_path = source_location.path
+            backup_path = None
             if save2backup:
                 backup_folder = os.path.join(os.path.dirname(source_folder), backup_folder_name)
-                if not os.path.exists(backup_folder):
-                    os.makedirs(backup_folder)
-                # If the destination already exists, move it aside as a backup.
+                os.makedirs(backup_folder, exist_ok=True)
+                # Back up only the destination Track; sibling Tracks in the same
+                # Foldit data root must remain untouched.
                 if os.path.exists(dest_path):
-                    try:
-                        current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                        backup_path = os.path.join(backup_folder,
-                            f"{latest_subdir} {current_time} {os.path.basename(target_folder)}")
-                        shutil.move(dest_path, backup_path)
-                    except Exception as e:
-                        print(f"Error creating backup: {e}")
-                        shutil.rmtree(dest_path, ignore_errors=True)
-            else:
-                if os.path.exists(dest_path):
-                    shutil.rmtree(dest_path, ignore_errors=True)
+                    current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                    backup_path = os.path.join(backup_folder,
+                        f"{source_location.internal_puzzle_id} {current_time} "
+                        f"{os.path.basename(target_folder)} {track_directory_name(job.get('target_track'))}")
 
-            shutil.copytree(latest_subdir_path, dest_path)
+            replace_track_save_tree(source_track_path, dest_path, backup_path)
         except Exception as e:
             return f"Error copying saves: {e}"
 
@@ -1982,13 +2237,15 @@ def _perform_copy_job(job):
 
     if job['copy_ir']:
         try:
-            ir_files = [f for f in os.listdir(source_folder) if f.endswith('.ir_solution')]
-            if ir_files:
-                latest_ir = max(ir_files, key=lambda f: os.path.getmtime(os.path.join(source_folder, f)))
-                ir_path = os.path.join(source_folder, latest_ir)
-                # Only copy a fresh (< 1 day old) solution.
-                if time.time() - os.path.getmtime(ir_path) < 3600 * 24:
-                    shutil.copy2(ir_path, target_folder)
+            # Tracks in one data root already share imported/root-level solutions.
+            if normalize_path(source_folder) != normalize_path(target_folder):
+                ir_files = [f for f in os.listdir(source_folder) if f.endswith('.ir_solution')]
+                if ir_files:
+                    latest_ir = max(ir_files, key=lambda f: os.path.getmtime(os.path.join(source_folder, f)))
+                    ir_path = os.path.join(source_folder, latest_ir)
+                    # Only copy a fresh (< 1 day old) solution.
+                    if time.time() - os.path.getmtime(ir_path) < 3600 * 24:
+                        shutil.copy2(ir_path, target_folder)
         except Exception as e:
             return f"Error copying IR solution: {e}"
 
@@ -2016,24 +2273,6 @@ def export_save_to_pdb(save_path, save_name, puzzle_id=None):
         messagebox.showinfo("Success", f"PDB exported to:\n{pdb_path}")
     except Exception as e:
         messagebox.showerror("Error", f"Error exporting PDB: {e}")
-
-def get_most_recently_modified_subdir(root_dir):
-    """Finds the subdirectory with the most recently modified file"""
-    most_recent_time = 0
-    most_recent_subdir = None
-
-    for subdir in os.listdir(root_dir):
-        subdir_path = os.path.join(root_dir, subdir)
-        if os.path.isdir(subdir_path):
-            for dirpath, dirnames, filenames in os.walk(subdir_path):
-                for filename in filenames:
-                    file_path = os.path.join(dirpath, filename)
-                    modified_time = os.path.getmtime(file_path)
-                    if modified_time > most_recent_time:
-                        most_recent_time = modified_time
-                        most_recent_subdir = subdir
-
-    return most_recent_subdir
 
 #-------------------------------------------------------------------------------------------------CONTEXT MENU AND SERVICE FUNCTIONS
 def show_popup_menu(menu, event):
@@ -2111,15 +2350,13 @@ def dump_all_logs():
     """Saves logs of all active Foldit clients"""
     for item in process_tree.get_children():
         try:
-            # Get all item tags
-            tags = process_tree.item(item, 'tags')
-            # Find the tag containing the folder path (contains \\ or /)
-            folder_path = next((tag for tag in tags if '\\' in tag or '/' in tag), None)
-            if folder_path:
-                foldit_log_handler.export_log(
-                    folder_path,
+            row = get_cached_artifact_row(item) or {}
+            log_path = str(row.get("log_path", "")).strip()
+            if log_path and row.get("binding_status") == "resolved":
+                foldit_log_handler.export_log_file(
+                    log_path,
                     open_file=False,
-                    puzzle_id=get_puzzle_id(get_pid_tag(tags)),
+                    puzzle_id=row.get("puzzle_id"),
                 )
         except Exception as e:
             print(f"Error dumping log for item {item}: {e}")
@@ -2129,15 +2366,13 @@ def open_all_logs():
     """Opens logs of all active Foldit clients"""
     for item in process_tree.get_children():
         try:
-            # Get all item tags
-            tags = process_tree.item(item, 'tags')
-            # Find the tag containing the folder path (contains \\ or /)
-            folder_path = next((tag for tag in tags if '\\' in tag or '/' in tag), None)
-            if folder_path:
-                foldit_log_handler.export_log(
-                    folder_path,
+            row = get_cached_artifact_row(item) or {}
+            log_path = str(row.get("log_path", "")).strip()
+            if log_path and row.get("binding_status") == "resolved":
+                foldit_log_handler.export_log_file(
+                    log_path,
                     open_file=True,
-                    puzzle_id=get_puzzle_id(get_pid_tag(tags)),
+                    puzzle_id=row.get("puzzle_id"),
                 )
                 time.sleep(0.3)
         except Exception as e:
@@ -2255,7 +2490,8 @@ def remove_client_menu_items():
             label.startswith("Share ")
             or label == "Export to PDB"
             or label.endswith("Alarm on change")
-            or label in (STATS_TO_MAIN_LABEL, STATS_TO_FINALIZATION_LABEL, MANAGE_SAVES_LABEL)
+            or label in (STATS_TO_MAIN_LABEL, STATS_TO_FINALIZATION_LABEL)
+            or label.startswith(MANAGE_SAVES_LABEL)
         ):
             context_menu.delete(i)
     remove_leading_context_separator()
@@ -2284,11 +2520,12 @@ def show_tree_context_menu(event):
     insert_index = 0
 
     pid = get_pid_tag(tags)
-    if speed_boost is not None:
+    row = get_cached_artifact_row(item) or {}
+    if speed_boost is not None and pid is not None:
         speed_boost.populate_menu(
             speed_boost_menu,
             pid=pid,
-            client_name=os.path.basename(folder),
+            client_name=row.get("client_name") or os.path.basename(folder),
         )
     if pid is not None:
         alarm_armed = bool(monitored_processes.get(pid, {}).get('alarm_on_change'))
@@ -2314,9 +2551,9 @@ def show_tree_context_menu(event):
         )
         insert_index += 1
 
-    row = get_cached_artifact_row(item) or {}
     row_puzzle_id = str(row.get("puzzle_id", "")).strip()
-    if row_puzzle_id:
+    shared_root = is_shared_data_root(folder)
+    if row_puzzle_id and not shared_root:
         context_menu.insert(
             insert_index,
             "command",
@@ -2324,9 +2561,16 @@ def show_tree_context_menu(event):
             command=lambda p=row_puzzle_id, f=folder: open_save_manager_window(p, f, "client"),
         )
     else:
-        context_menu.insert(insert_index, "command", label=MANAGE_SAVES_LABEL, state="disabled")
+        label = (
+            f"{MANAGE_SAVES_LABEL} (shared Track folder)"
+            if shared_root
+            else MANAGE_SAVES_LABEL
+        )
+        context_menu.insert(insert_index, "command", label=label, state="disabled")
     insert_index += 1
 
+    # Root-level imported solutions are shared naturally by Tracks in one data
+    # root; offering Share is therefore safe even when this row has siblings.
     info = get_share_info(folder)
     save_path = info.get('path')
     if not (info.get('done') and not save_path):  # skip Share/Export only when this client has no saves
@@ -2340,7 +2584,7 @@ def show_tree_context_menu(event):
             share_label = "Share SaveFile"
         context_menu.insert(insert_index, "command",
             label=share_label,
-            command=lambda f=folder: copy_to_all_clients(f)
+            command=lambda f=folder, row_id=item: copy_to_all_clients(f, row_id)
         )
         insert_index += 1
         if save_path and save_name and export_pdb is not None:
@@ -2443,20 +2687,25 @@ def on_treeview_click(event):
     last_double_click_time = time.time()
     column = process_tree.identify_column(event.x)
     item = process_tree.identify('item', event.x, event.y)
+    if not item:
+        return
     
     # Get all tags and extract only pid and folder_path
     tags = process_tree.item(item, 'tags')
-    # Find pid (first tag) and folder_path (second tag)
-    pid = next(tag for tag in tags if tag.isdigit())
-    folder_path = next(tag for tag in tags if '\\' in tag or '/' in tag)
+    pid = get_pid_tag(tags)
+    folder_path = get_folder_tag(tags)
+    row = get_cached_artifact_row(item) or {}
+    log_path = str(row.get("log_path", "")).strip()
     
     if column == "#1" or column == "#4":
-        foldit_log_handler.export_log(
-            folder_path,
+        if not log_path or row.get("binding_status") != "resolved":
+            return
+        foldit_log_handler.export_log_file(
+            log_path,
             open_file=True,
-            puzzle_id=get_puzzle_id(int(pid)),
+            puzzle_id=row.get("puzzle_id"),
         )
-    if column == "#2":
+    if column == "#2" and pid is not None:
         pid_int = int(pid)
         if speed_boost is not None:
             if speed_boost.before_activate(
@@ -2465,7 +2714,7 @@ def on_treeview_click(event):
             ):
                 return
         window_manager.activate_client(pid_int)
-    if column == "#3":
+    if column == "#3" and folder_path:
         open_folder(folder_path)
 
 def find_foldit_installations():
@@ -2485,7 +2734,7 @@ def find_foldit_installations():
     if not foldit_folders:
         messagebox.showerror("Error", "No Foldit installations found")
         return None, None
-    foldit_folders.sort(key=lambda x: natural_sort(os.path.basename(x)))
+    foldit_folders.sort(key=lambda x: natural_sort(get_data_root_display_name(x)))
 
     running_folders = set()
     for item in process_tree.get_children():
@@ -2505,31 +2754,32 @@ def launch_client_folder(folder_path):
 
 
 def launch_next_client():
-    """Launch the first available Foldit client."""
+    """Prefer an unused installation; duplicate one only when all are running."""
     foldit_folders, running_folders = find_foldit_installations()
     if not foldit_folders:
         return
 
-    # Launch the lowest available installation, regardless of which client is running now.
-    for current_folder in foldit_folders:
-        if current_folder not in running_folders:
-            launch_client_folder(current_folder)
-            return
-
-    messagebox.showinfo("Info", "No available Foldit clients found")
+    running_keys = {normalize_path(folder) for folder in running_folders}
+    unused_folders = [folder for folder in foldit_folders if normalize_path(folder) not in running_keys]
+    launch_client_folder((unused_folders or foldit_folders)[0])
 
 
 def show_new_client_menu(event):
-    """RMB on New Client: menu of all known installations; running ones are checked off."""
+    """RMB on New Client, with duplicates offered only when no install is free."""
     foldit_folders, running_folders = find_foldit_installations()
     if not foldit_folders:
         return "break"
 
+    running_keys = {normalize_path(folder) for folder in running_folders}
+    unused_folders = [folder for folder in foldit_folders if normalize_path(folder) not in running_keys]
     menu = tk.Menu(root, tearoff=0)
     for folder in foldit_folders:
-        name = os.path.basename(folder)
-        if folder in running_folders:
+        name = get_data_root_display_name(folder)
+        is_running = normalize_path(folder) in running_keys
+        if unused_folders and is_running:
             menu.add_command(label=f"✓ {name}", state="disabled")
+        elif is_running:
+            menu.add_command(label=f"↻ {name} (another instance)", command=lambda f=folder: launch_client_folder(f))
         else:
             menu.add_command(label=name, command=lambda f=folder: launch_client_folder(f))
     try:
@@ -2544,6 +2794,7 @@ def handle_root_configure(event=None):
 #--------------------------------------------------------------------------------------------MAIN WINDOW GUI
 # Create a global instance of WindowManager
 window_manager = WindowManager()
+client_resolver = ClientResolver(settings_manager.settings)
 
 root = tk.Tk()
 root.title("Foldit Monitor")
@@ -2736,6 +2987,7 @@ network_manager = NetworkManager(
         'build_artifact_query': build_remote_artifact_query,
         'artifact_received': handle_remote_artifact_received,
         'artifact_error': handle_remote_artifact_error,
+        'get_row_payload': get_cached_artifact_row,
     },
     tree=process_tree,  # Pass process_tree
     monitored_processes=monitored_processes,  # Pass monitored_processes

@@ -1,8 +1,10 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import foldit_speed_boost as speed_boost_module
@@ -18,6 +20,7 @@ from foldit_speed_boost import (
     FolditSpeedBoostManager,
     SpeedBoostSession,
     SpeedBoostTiming,
+    SpeedBoostTimeout,
     _script_source,
 )
 
@@ -36,8 +39,8 @@ class _Exports:
     def getstats(self):
         return {
             "enabled": True,
-            "patched": 7,
-            "matchedByOffset": {FIRST_OFFSET_KEY: 7},
+            "hooksActive": True,
+            "hookedApis": [{"api": "KERNELBASE.dll!Sleep"}],
         }
 
 
@@ -310,6 +313,14 @@ class SpeedBoostCases(unittest.TestCase):
         self.assertIn('findExport("winmm.dll", "timeEndPeriod")', source)
         self.assertIn("timeEndPeriod(activeResolutionMs)", source)
         self.assertIn("settiming(replacementSleepMs, requestedTimerResolutionMs)", source)
+        self.assertIn("targetReturnAddresses", source)
+        self.assertIn("listener.detach()", source)
+        self.assertIn("function installHooks()", source)
+        self.assertIn("function removeHooks()", source)
+        self.assertNotIn("Process.findModuleByAddress", source)
+        self.assertNotIn("matchedByOffset", source)
+        self.assertNotIn("patchedByOffset", source)
+        self.assertNotIn("stats.passed", source)
         self.assertNotIn("TIMER_RESOLUTION_MS_PLACEHOLDER", source)
 
     def test_monitor_exposes_one_speed_boost_cascade(self):
@@ -381,7 +392,7 @@ class SpeedBoostCases(unittest.TestCase):
         self.assertEqual(manager.get_timing(), timing)
         self.assertIn("unsupported resolution", managed.last_error)
 
-    def test_get_stats_returns_live_hook_counters(self):
+    def test_get_stats_returns_lightweight_hook_state(self):
         manager = FolditSpeedBoostManager(timing=FAST_TIMING, offsets=DEFAULT_OFFSETS)
         manager.sessions[123] = SpeedBoostSession(
             pid=123,
@@ -394,9 +405,65 @@ class SpeedBoostCases(unittest.TestCase):
 
         stats = manager.get_stats(123)
 
-        self.assertEqual(stats["patched"], 7)
-        self.assertEqual(stats["matchedByOffset"], {FIRST_OFFSET_KEY: 7})
+        self.assertTrue(stats["hooksActive"])
+        self.assertEqual(stats["hookedApis"], [{"api": "KERNELBASE.dll!Sleep"}])
         self.assertIsNone(manager.get_stats(999))
+
+    def test_unresponsive_rpc_is_cancelled_instead_of_waiting_forever(self):
+        manager = FolditSpeedBoostManager(
+            timing=FAST_TIMING,
+            offsets=DEFAULT_OFFSETS,
+            log_callback=lambda _message: None,
+            rpc_timeout_seconds=0.01,
+        )
+
+        class FakeCancellable:
+            latest = None
+
+            def __init__(self):
+                self.cancelled = threading.Event()
+                FakeCancellable.latest = self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return False
+
+            def cancel(self):
+                self.cancelled.set()
+
+        class BlockingExports:
+            def setenabled(self, _enabled):
+                FakeCancellable.latest.cancelled.wait(1)
+                raise RuntimeError("operation cancelled")
+
+        managed = SpeedBoostSession(
+            pid=123,
+            client_name="Foldit9",
+            session=object(),
+            script=SimpleNamespace(exports_sync=BlockingExports()),
+            enabled=False,
+            started_at=0.0,
+        )
+        manager.sessions[123] = managed
+
+        with patch.object(
+            speed_boost_module,
+            "frida",
+            SimpleNamespace(Cancellable=FakeCancellable),
+        ):
+            started = time.monotonic()
+            self.assertFalse(manager.set_enabled(123, True))
+            elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.25)
+        self.assertIn("timed out after 0.01s", managed.last_error)
+        self.assertIsInstance(
+            SpeedBoostTimeout(managed.last_error),
+            SpeedBoostTimeout,
+        )
+        self.assertFalse(managed.enabled)
 
     def test_fast_detach_releases_timer_period_before_detaching(self):
         manager = FolditSpeedBoostManager(timing=FAST_TIMING, offsets=DEFAULT_OFFSETS)
@@ -417,7 +484,7 @@ class SpeedBoostCases(unittest.TestCase):
         self.assertEqual(session.detach_calls, 1)
         self.assertFalse(manager.is_managed(123))
 
-    def test_abandon_all_releases_timer_period_without_slow_detach(self):
+    def test_abandon_all_cleans_up_and_detaches_sessions(self):
         manager = FolditSpeedBoostManager(timing=FAST_TIMING, offsets=DEFAULT_OFFSETS)
         script = _CleanupScript()
         session = _Session()
@@ -433,7 +500,49 @@ class SpeedBoostCases(unittest.TestCase):
         manager.abandon_all()
 
         self.assertEqual(script.exports_sync.cleanup_calls, 1)
-        self.assertEqual(session.detach_calls, 0)
+        self.assertEqual(session.detach_calls, 1)
+        self.assertEqual(manager.snapshot(), {})
+
+    def test_abandon_all_does_not_wait_for_a_busy_session_lock(self):
+        manager = FolditSpeedBoostManager(timing=FAST_TIMING, offsets=DEFAULT_OFFSETS)
+        managed = SpeedBoostSession(
+            pid=123,
+            client_name="Foldit9",
+            session=_Session(),
+            script=_CleanupScript(),
+            enabled=True,
+            started_at=0.0,
+        )
+        manager.sessions[123] = managed
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_rpc_lock():
+            with managed.rpc_lock:
+                lock_held.set()
+                release_lock.wait(1)
+
+        holder = threading.Thread(target=hold_rpc_lock)
+        holder.start()
+        self.assertTrue(lock_held.wait(1))
+        try:
+            with patch.object(
+                speed_boost_module,
+                "SHUTDOWN_RPC_TIMEOUT_SECONDS",
+                0.01,
+            ), patch.object(
+                speed_boost_module,
+                "SHUTDOWN_TOTAL_TIMEOUT_SECONDS",
+                0.03,
+            ):
+                started = time.monotonic()
+                manager.abandon_all()
+                elapsed = time.monotonic() - started
+        finally:
+            release_lock.set()
+            holder.join(1)
+
+        self.assertLess(elapsed, 0.2)
         self.assertEqual(manager.snapshot(), {})
 
 
