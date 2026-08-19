@@ -2553,14 +2553,29 @@ icon_data = create_ribbon_icon()
 icon = tk.PhotoImage(data=icon_data)
 root.iconphoto(True, icon)
 
-# Initialize sound for the alert. Create sound file if it doesn't exist.
-def init_sound():
+# Initialize optional sound support. Monitoring works normally without pygame.
+def _load_optional_pygame():
     try:
         import pygame
+    except Exception as error:
+        print(
+            "Alert sound support is unavailable. Use Python 3.11-3.13 and "
+            f"reinstall requirements.txt to enable it: {error}"
+        )
+        return None
+    return pygame
+
+
+def init_sound():
+    pygame = _load_optional_pygame()
+    if pygame is None:
+        return False
+    try:
         pygame.mixer.init()
     except pygame.error as e:
         print(f"Error initializing sound: {e}")
         return False
+    return True
 # init_sound()
 #if os.path.exists(settings_manager.sound_file):
 #   pygame.mixer.music.load(settings_manager.sound_file)
@@ -2574,8 +2589,10 @@ def init_sound():
 
 def play_alert_sound():
     """(Re)initialize mixer so playback goes to the current default device, then play."""
+    pygame = _load_optional_pygame()
+    if pygame is None:
+        return False
     try:
-        import pygame  # lazy: keep the ~1s pygame/SDL import off the startup path
         pygame.mixer.quit()
         pygame.mixer.init()
         pygame.mixer.music.load(settings_manager.sound_file)
@@ -2583,6 +2600,8 @@ def play_alert_sound():
         pygame.mixer.music.play()
     except pygame.error as e:
         print(f"Error playing sound: {e}")
+        return False
+    return True
 
 
 # Set window position and make draggable
