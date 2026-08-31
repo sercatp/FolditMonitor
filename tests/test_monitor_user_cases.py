@@ -206,9 +206,9 @@ class PollingLogHandler:
         self.export_calls = []
         self.recovery_handler = FolditLogHandler(settings)
 
-    def recover_interrupted_log(self, folder_path: str, process_create_time: float, puzzle_id=None):
-        return self.recovery_handler.recover_interrupted_log(
-            folder_path,
+    def recover_interrupted_log_file(self, script_path: str, process_create_time: float, puzzle_id=None):
+        return self.recovery_handler.recover_interrupted_log_file(
+            script_path,
             process_create_time=process_create_time,
             puzzle_id=puzzle_id,
         )
@@ -259,10 +259,10 @@ class PollingLogHandler:
         if handler is not None:
             handler.stop()
 
-    def export_log(self, folder_path: str, open_file: bool = True, puzzle_id=None):
+    def export_log_file(self, script_path: str, open_file: bool = True, puzzle_id=None):
         self.export_calls.append(
             {
-                "folder_path": folder_path,
+                "script_path": script_path,
                 "open_file": open_file,
                 "puzzle_id": puzzle_id,
             }
@@ -321,6 +321,10 @@ class MonitorIntegrationHarness:
                 SimpleNamespace(
                     pid=process.pid,
                     folder=folder,
+                    data_root=folder,
+                    log_path=os.path.join(folder, "scriptlog.default.xml"),
+                    binding_status="resolved",
+                    candidate_log_paths=(os.path.join(folder, "scriptlog.default.xml"),),
                     client_name=os.path.basename(folder),
                     process=process,
                 )
@@ -756,11 +760,12 @@ class ManagedLogExportCases(unittest.TestCase):
 
     def test_managed_export_reuses_unchanged_partial(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            write_windows_text(os.path.join(temp_dir, "scriptlog.default.xml"), DRW_OPEN)
+            script_path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
             log_handler, _handler, _script_path = self._build_handler(temp_dir)
 
-            first_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
-            second_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            first_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
+            second_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
 
             self.assertEqual(first_path, second_path)
             self.assertTrue(os.path.exists(first_path))
@@ -772,10 +777,10 @@ class ManagedLogExportCases(unittest.TestCase):
             write_windows_text(script_path, DRW_OPEN)
             log_handler, handler, _script_path = self._build_handler(temp_dir)
 
-            first_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            first_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
             append_windows_text(script_path, APPEND_SCORE)
             handler._update_data()
-            second_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            second_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
 
             self.assertNotEqual(first_path, second_path)
             self.assertFalse(os.path.exists(first_path))
@@ -788,10 +793,10 @@ class ManagedLogExportCases(unittest.TestCase):
             write_windows_text(script_path, DRW_OPEN)
             log_handler, handler, _script_path = self._build_handler(temp_dir)
 
-            first_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            first_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
             write_windows_text(script_path, DRW_OPEN.replace("4299.941", "4305.000"))
             handler._update_data()
-            second_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            second_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
 
             self.assertNotEqual(first_path, second_path)
             self.assertTrue(os.path.exists(first_path))
@@ -805,10 +810,10 @@ class ManagedLogExportCases(unittest.TestCase):
             write_windows_text(script_path, DRW_OPEN)
             log_handler, handler, _script_path = self._build_handler(temp_dir)
 
-            partial_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            partial_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
             write_windows_text(script_path, DRW_CLOSED)
             handler._update_data()
-            final_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            final_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
 
             self.assertFalse(os.path.exists(partial_path))
             self.assertTrue(os.path.exists(final_path))
@@ -820,8 +825,8 @@ class ManagedLogExportCases(unittest.TestCase):
             write_windows_text(script_path, DRW_CLOSED)
             log_handler, _handler, _script_path = self._build_handler(temp_dir)
 
-            first_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
-            second_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            first_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
+            second_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
 
             self.assertEqual(first_path, second_path)
             self.assertTrue(first_path.endswith(".fin.txt"))
@@ -834,14 +839,14 @@ class ManagedLogExportCases(unittest.TestCase):
             os.utime(script_path, (old_mtime, old_mtime))
             log_handler = FolditLogHandler(make_logger_settings())
 
-            first_path = log_handler.recover_interrupted_log(
-                temp_dir,
+            first_path = log_handler.recover_interrupted_log_file(
+                script_path,
                 process_create_time=old_mtime + 30,
                 puzzle_id="1234",
             )
             restarted_log_handler = FolditLogHandler(make_logger_settings())
-            second_path = restarted_log_handler.recover_interrupted_log(
-                temp_dir,
+            second_path = restarted_log_handler.recover_interrupted_log_file(
+                script_path,
                 process_create_time=old_mtime + 30,
                 puzzle_id="1234",
             )
@@ -860,16 +865,16 @@ class ManagedLogExportCases(unittest.TestCase):
 
             write_windows_text(script_path, DRW_OPEN)
             os.utime(script_path, (old_mtime, old_mtime))
-            first_path = log_handler.recover_interrupted_log(
-                temp_dir,
+            first_path = log_handler.recover_interrupted_log_file(
+                script_path,
                 process_create_time=old_mtime + 30,
                 puzzle_id="1234",
             )
 
             write_windows_text(script_path, DRW_OPEN + "different output\n")
             os.utime(script_path, (old_mtime, old_mtime))
-            second_path = log_handler.recover_interrupted_log(
-                temp_dir,
+            second_path = log_handler.recover_interrupted_log_file(
+                script_path,
                 process_create_time=old_mtime + 30,
                 puzzle_id="1234",
             )
@@ -885,8 +890,8 @@ class ManagedLogExportCases(unittest.TestCase):
             old_mtime = time.time() - 60
             os.utime(script_path, (old_mtime, old_mtime))
             log_handler = FolditLogHandler(make_logger_settings())
-            interrupted_path = log_handler.recover_interrupted_log(
-                temp_dir,
+            interrupted_path = log_handler.recover_interrupted_log_file(
+                script_path,
                 process_create_time=old_mtime + 30,
                 puzzle_id="1234",
             )
@@ -894,7 +899,7 @@ class ManagedLogExportCases(unittest.TestCase):
             handler._update_data()
             log_handler.current_handlers[script_path] = handler
 
-            opened_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            opened_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
 
             self.assertEqual(opened_path, interrupted_path)
             self.assertEqual(list(Path(temp_dir).glob("*.part.txt")), [])
@@ -906,8 +911,8 @@ class ManagedLogExportCases(unittest.TestCase):
             old_mtime = time.time() - 60
             os.utime(script_path, (old_mtime, old_mtime))
             log_handler = FolditLogHandler(make_logger_settings())
-            log_handler.recover_interrupted_log(
-                temp_dir,
+            log_handler.recover_interrupted_log_file(
+                script_path,
                 process_create_time=old_mtime + 30,
                 puzzle_id="1234",
             )
@@ -934,10 +939,10 @@ class ManagedLogExportCases(unittest.TestCase):
                 puzzle_id="1234",
                 client_name="client1",
             )
-            partial_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            partial_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
 
             interrupted_path = log_handler.archive_interrupted_on_disappearance(script_path)
-            reopened_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            reopened_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
 
             self.assertFalse(os.path.exists(partial_path))
             self.assertTrue(interrupted_path.endswith(".interrupted.txt"))
@@ -968,8 +973,8 @@ class ManagedLogExportCases(unittest.TestCase):
             old_mtime = time.time() - 60
             os.utime(script_path, (old_mtime, old_mtime))
             log_handler = FolditLogHandler(make_logger_settings())
-            interrupted_path = log_handler.recover_interrupted_log(
-                temp_dir,
+            interrupted_path = log_handler.recover_interrupted_log_file(
+                script_path,
                 process_create_time=old_mtime + 30,
                 puzzle_id="1234",
             )
@@ -978,7 +983,7 @@ class ManagedLogExportCases(unittest.TestCase):
             handler = LogFileHandler(make_logger_settings(), script_path)
             handler._update_data()
             log_handler.current_handlers[script_path] = handler
-            final_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            final_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
 
             self.assertTrue(os.path.exists(interrupted_path))
             self.assertTrue(final_path.endswith(".fin.txt"))
@@ -991,8 +996,8 @@ class ManagedLogExportCases(unittest.TestCase):
             current_mtime = os.path.getmtime(script_path)
             log_handler = FolditLogHandler(make_logger_settings())
 
-            export_path = log_handler.recover_interrupted_log(
-                temp_dir,
+            export_path = log_handler.recover_interrupted_log_file(
+                script_path,
                 process_create_time=current_mtime - 30,
                 puzzle_id="1234",
             )
@@ -1004,10 +1009,11 @@ class ManagedLogExportCases(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             settings = make_logger_settings()
             settings["managed_log_exports"] = False
-            write_windows_text(os.path.join(temp_dir, "scriptlog.default.xml"), DRW_OPEN)
+            script_path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
             log_handler, _handler, _script_path = self._build_handler(temp_dir, settings=settings)
 
-            export_path = log_handler.export_log(temp_dir, open_file=False, puzzle_id="1234")
+            export_path = log_handler.export_log_file(script_path, open_file=False, puzzle_id="1234")
 
             self.assertTrue(export_path.endswith(".txt"))
             self.assertFalse(export_path.endswith(".part.txt"))
@@ -1227,7 +1233,7 @@ class MonitorIntegrationCases(unittest.TestCase):
                 harness.foldit_log_handler.export_calls,
                 [
                     {
-                        "folder_path": client_dir,
+                        "script_path": script_path,
                         "open_file": False,
                         "puzzle_id": "1234",
                     }

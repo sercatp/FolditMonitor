@@ -7,15 +7,21 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence
+from functools import lru_cache
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
 
 
 SCRIPT_LOG_RE = re.compile(r"^scriptlog\.(?P<track>.*)\.xml$", re.IGNORECASE)
 
 
+@lru_cache(maxsize=8192)
+def _normalize_path_cached(path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+
 def normalize_path(path: str) -> str:
-    """Return a stable comparison key for an existing or future path."""
-    return os.path.normcase(os.path.realpath(os.path.abspath(str(path))))
+    """Return a cached stable comparison key for an existing or future path."""
+    return _normalize_path_cached(str(path))
 
 
 def track_from_log_path(path: str) -> Optional[str]:
@@ -62,6 +68,7 @@ class MonitoredClient:
     installation_path: str = ""
     window_info: Any = None
     window_title: str = ""
+    window_title_available: bool = False
     is_window_visible: bool = False
     is_window_focused: bool = False
 
@@ -119,12 +126,28 @@ def parse_log_fallbacks(settings: Optional[dict], report: Callable[[str], None] 
     return fallbacks
 
 
-class DirectoryLogCache:
-    """Cache the small set of script logs without rescanning a large directory each tick."""
+@dataclass(frozen=True)
+class DirectoryObservation:
+    candidates: tuple[str, ...]
+    changed_paths: tuple[str, ...]
 
-    def __init__(self, rescan_seconds: float = 60.0):
-        self.rescan_seconds = float(rescan_seconds)
-        self._entries: Dict[str, tuple[int, float, tuple[str, ...]]] = {}
+
+@dataclass(frozen=True)
+class _DirectoryState:
+    directory_mtime_ns: int
+    candidates: tuple[str, ...]
+    stamps: tuple[tuple[str, int, int], ...]
+
+
+class ScriptLogIndex:
+    """Track the few script logs in a root and report file activity cheaply.
+
+    A directory is enumerated only on first use or when its directory mtime
+    changes. Ordinary refreshes stat only the already known script-log files.
+    """
+
+    def __init__(self):
+        self._states: Dict[str, _DirectoryState] = {}
 
     @staticmethod
     def _directory_mtime_ns(path: str) -> int:
@@ -133,54 +156,81 @@ class DirectoryLogCache:
         except OSError:
             return -1
 
-    def candidates(self, data_root: str, now: Optional[float] = None, force: bool = False) -> list[str]:
-        current_time = time.monotonic() if now is None else float(now)
-        root_key = normalize_path(data_root)
-        directory_mtime = self._directory_mtime_ns(root_key)
-        cached = self._entries.get(root_key)
-        if (
-            not force
-            and cached is not None
-            and cached[0] == directory_mtime
-            and current_time - cached[1] < self.rescan_seconds
-        ):
-            return list(cached[2])
-
+    @staticmethod
+    def _scan(data_root: str) -> tuple[str, ...]:
         matches: list[str] = []
         try:
-            with os.scandir(root_key) as entries:
+            with os.scandir(data_root) as entries:
                 for entry in entries:
                     if SCRIPT_LOG_RE.match(entry.name) and entry.is_file(follow_symlinks=False):
                         matches.append(normalize_path(entry.path))
         except OSError:
             pass
-        matches.sort(key=str.casefold)
-        self._entries[root_key] = (directory_mtime, current_time, tuple(matches))
-        return matches
+        return tuple(sorted(set(matches), key=str.casefold))
+
+    @staticmethod
+    def _stamps(paths: Sequence[str]) -> tuple[tuple[str, int, int], ...]:
+        stamps: list[tuple[str, int, int]] = []
+        for path in paths:
+            try:
+                stat = os.stat(path)
+                stamps.append((path, int(stat.st_mtime_ns), int(stat.st_size)))
+            except OSError:
+                stamps.append((path, -1, -1))
+        return tuple(stamps)
+
+    def observe(self, data_roots: Iterable[str], force_rescan: bool = False) -> Dict[str, DirectoryObservation]:
+        roots = {normalize_path(root) for root in data_roots if str(root).strip()}
+        for stale_root in set(self._states) - roots:
+            self._states.pop(stale_root, None)
+
+        observations: Dict[str, DirectoryObservation] = {}
+        for root in roots:
+            previous = self._states.get(root)
+            directory_mtime = self._directory_mtime_ns(root)
+            if force_rescan or previous is None or previous.directory_mtime_ns != directory_mtime:
+                candidates = self._scan(root)
+            else:
+                candidates = previous.candidates
+            stamps = self._stamps(candidates)
+
+            changed_paths: set[str] = set()
+            if previous is not None:
+                old_stamps = {path: (mtime, size) for path, mtime, size in previous.stamps}
+                new_stamps = {path: (mtime, size) for path, mtime, size in stamps}
+                changed_paths.update(set(old_stamps) ^ set(new_stamps))
+                changed_paths.update(
+                    path
+                    for path in set(old_stamps) & set(new_stamps)
+                    if old_stamps[path] != new_stamps[path]
+                )
+
+            self._states[root] = _DirectoryState(directory_mtime, candidates, stamps)
+            observations[root] = DirectoryObservation(
+                candidates=candidates,
+                changed_paths=tuple(sorted(changed_paths, key=str.casefold)),
+            )
+        return observations
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    paths: tuple[str, ...] = ()
+    error: str = ""
 
 
 class OpenLogBackend:
-    def __init__(self, system: Optional[str] = None, directory_cache: Optional[DirectoryLogCache] = None):
+    """Stateless platform-specific inspection of files opened by Foldit."""
+
+    def __init__(self, system: Optional[str] = None):
         self.system = system or platform.system()
-        self.directory_cache = directory_cache or DirectoryLogCache()
-        self.diagnostics: Dict[int, str] = {}
-        self._windows_owner_cache: Dict[
-            str,
-            tuple[tuple[str, ...], float, Dict[int, tuple[str, ...]]],
-        ] = {}
-
-    def diagnostic(self, pid: int) -> str:
-        return str(self.diagnostics.get(int(pid), ""))
-
-    def open_logs(self, process: Any, data_root: str) -> list[str]:
-        if self.system == "Windows":
-            return self._windows_open_logs(int(process.pid), data_root)
-        if self.system == "Darwin":
-            return self._macos_open_logs(int(process.pid), data_root)
-        return self._psutil_open_logs(process, data_root)
 
     @staticmethod
-    def _filter_paths(paths: Iterable[str], data_root: str) -> list[str]:
+    def _process_key(client: Any) -> tuple[int, float]:
+        return int(client.pid), float(getattr(client, "process_start_time", 0.0) or 0.0)
+
+    @staticmethod
+    def _filter_paths(paths: Iterable[str], data_root: str) -> tuple[str, ...]:
         root_key = normalize_path(data_root)
         prefix = root_key + os.sep
         found = {
@@ -189,59 +239,109 @@ class OpenLogBackend:
             if is_script_log_path(path)
             and (normalize_path(path) == root_key or normalize_path(path).startswith(prefix))
         }
-        return sorted(found, key=str.casefold)
+        return tuple(sorted(found, key=str.casefold))
 
-    def _psutil_open_logs(self, process: Any, data_root: str) -> list[str]:
-        try:
-            paths = [opened.path for opened in process.open_files()]
-            self.diagnostics.pop(int(process.pid), None)
-        except Exception as error:
-            self.diagnostics[int(process.pid)] = f"Open-file inspection failed: {error}"
-            return []
-        return self._filter_paths(paths, data_root)
+    def probe(
+        self,
+        clients: Sequence[Any],
+        candidates_by_root: Optional[Mapping[str, Sequence[str]]] = None,
+    ) -> Dict[tuple[int, float], ProbeResult]:
+        process_list = list(clients)
+        if self.system == "Windows":
+            return self._probe_windows(process_list, candidates_by_root or {})
+        if self.system == "Darwin":
+            return self._probe_macos(process_list)
+        return self._probe_psutil(process_list)
 
-    def _macos_open_logs(self, pid: int, data_root: str) -> list[str]:
+    def _probe_psutil(self, clients: Sequence[Any]) -> Dict[tuple[int, float], ProbeResult]:
+        results: Dict[tuple[int, float], ProbeResult] = {}
+        for client in clients:
+            key = self._process_key(client)
+            try:
+                paths = [opened.path for opened in client.process.open_files()]
+                results[key] = ProbeResult(self._filter_paths(paths, client.data_root))
+            except Exception as error:
+                results[key] = ProbeResult(error=f"Open-file inspection failed: {error}")
+        return results
+
+    def _probe_macos(self, clients: Sequence[Any]) -> Dict[tuple[int, float], ProbeResult]:
+        if not clients:
+            return {}
+        clients_by_pid = {int(client.pid): client for client in clients}
+        pid_list = ",".join(str(pid) for pid in sorted(clients_by_pid))
         try:
-            result = subprocess.run(
-                ["/usr/sbin/lsof", "-a", "-p", str(int(pid)), "-Fn"],
+            completed = subprocess.run(
+                ["/usr/sbin/lsof", "-a", "-p", pid_list, "-Fpn"],
                 check=False,
                 capture_output=True,
                 text=True,
                 timeout=2.0,
             )
         except (OSError, subprocess.SubprocessError) as error:
-            self.diagnostics[int(pid)] = f"lsof failed: {error}"
-            return []
-        paths = [line[1:] for line in result.stdout.splitlines() if line.startswith("n")]
-        filtered = self._filter_paths(paths, data_root)
-        returncode = int(getattr(result, "returncode", 0) or 0)
-        stderr = str(getattr(result, "stderr", "") or "").strip()
-        if not filtered and (stderr or returncode not in (0, 1)):
-            detail = stderr or f"exit code {returncode}"
-            self.diagnostics[int(pid)] = f"lsof could not inspect the process: {detail}"
-        else:
-            self.diagnostics.pop(int(pid), None)
-        return filtered
-
-    def _windows_open_logs(self, pid: int, data_root: str) -> list[str]:
-        candidates = self.directory_cache.candidates(data_root)
-        root_key = normalize_path(data_root)
-        candidate_key = tuple(candidates)
-        now = time.monotonic()
-        cached = self._windows_owner_cache.get(root_key)
-        if cached and cached[0] == candidate_key and now - cached[1] < 2.0:
-            return list(cached[2].get(int(pid), ()))
+            return {
+                self._process_key(client): ProbeResult(error=f"lsof failed: {error}")
+                for client in clients
+            }
 
         paths_by_pid: Dict[int, list[str]] = {}
-        for path in candidates:
-            for owner_pid in self._restart_manager_users(path):
-                paths_by_pid.setdefault(int(owner_pid), []).append(path)
-        frozen_map = {
-            owner_pid: tuple(paths)
-            for owner_pid, paths in paths_by_pid.items()
-        }
-        self._windows_owner_cache[root_key] = (candidate_key, now, frozen_map)
-        return list(frozen_map.get(int(pid), ()))
+        current_pid: Optional[int] = None
+        for line in str(getattr(completed, "stdout", "") or "").splitlines():
+            if line.startswith("p"):
+                try:
+                    current_pid = int(line[1:])
+                except ValueError:
+                    current_pid = None
+            elif line.startswith("n") and current_pid in clients_by_pid:
+                paths_by_pid.setdefault(current_pid, []).append(line[1:])
+
+        returncode = int(getattr(completed, "returncode", 0) or 0)
+        stderr = str(getattr(completed, "stderr", "") or "").strip()
+        shared_error = ""
+        if stderr or returncode not in (0, 1):
+            shared_error = f"lsof could not inspect the processes: {stderr or f'exit code {returncode}'}"
+
+        results: Dict[tuple[int, float], ProbeResult] = {}
+        for pid, client in clients_by_pid.items():
+            results[self._process_key(client)] = ProbeResult(
+                self._filter_paths(paths_by_pid.get(pid, ()), client.data_root),
+                shared_error,
+            )
+        return results
+
+    def _probe_windows(
+        self,
+        clients: Sequence[Any],
+        candidates_by_root: Mapping[str, Sequence[str]],
+    ) -> Dict[tuple[int, float], ProbeResult]:
+        clients_by_root: Dict[str, list[Any]] = {}
+        for client in clients:
+            clients_by_root.setdefault(normalize_path(client.data_root), []).append(client)
+
+        results: Dict[tuple[int, float], ProbeResult] = {}
+        for root, root_clients in clients_by_root.items():
+            candidates = (
+                tuple(candidates_by_root[root])
+                if root in candidates_by_root
+                else ScriptLogIndex._scan(root)
+            )
+            paths_by_pid: Dict[int, list[str]] = {}
+            errors: list[str] = []
+            for path in candidates:
+                try:
+                    owners = self._restart_manager_users(path)
+                except OSError as error:
+                    errors.append(f"{os.path.basename(path)}: {error}")
+                    continue
+                for owner_pid in owners:
+                    paths_by_pid.setdefault(int(owner_pid), []).append(path)
+            detail = f"Restart Manager failed: {'; '.join(errors[:3])}" if errors else ""
+            for client in root_clients:
+                key = self._process_key(client)
+                results[key] = ProbeResult(
+                    tuple(sorted(set(paths_by_pid.get(int(client.pid), ())), key=str.casefold)),
+                    detail,
+                )
+        return results
 
     @staticmethod
     def _restart_manager_users(path: str) -> set[int]:
@@ -269,12 +369,14 @@ class OpenLogBackend:
             restart_manager = ctypes.WinDLL("Rstrtmgr")
             session = wintypes.DWORD()
             session_key = ctypes.create_unicode_buffer(33)
-            if restart_manager.RmStartSession(ctypes.byref(session), 0, session_key) != 0:
-                return set()
+            status = restart_manager.RmStartSession(ctypes.byref(session), 0, session_key)
+            if status != 0:
+                raise OSError(status, "RmStartSession")
             try:
                 resources = (wintypes.LPCWSTR * 1)(str(path))
-                if restart_manager.RmRegisterResources(session, 1, resources, 0, None, 0, None) != 0:
-                    return set()
+                status = restart_manager.RmRegisterResources(session, 1, resources, 0, None, 0, None)
+                if status != 0:
+                    raise OSError(status, "RmRegisterResources")
                 needed = wintypes.UINT(0)
                 count = wintypes.UINT(0)
                 reasons = wintypes.DWORD(0)
@@ -288,7 +390,7 @@ class OpenLogBackend:
                 if status == 0 and needed.value == 0:
                     return set()
                 if status not in (0, 234):
-                    return set()
+                    raise OSError(status, "RmGetList(size)")
                 count = wintypes.UINT(max(1, needed.value))
                 records = (RM_PROCESS_INFO * count.value)()
                 status = restart_manager.RmGetList(
@@ -299,12 +401,14 @@ class OpenLogBackend:
                     ctypes.byref(reasons),
                 )
                 if status != 0:
-                    return set()
+                    raise OSError(status, "RmGetList(data)")
                 return {int(records[index].Process.dwProcessId) for index in range(count.value)}
             finally:
                 restart_manager.RmEndSession(session)
-        except (AttributeError, OSError, ValueError):
-            return set()
+        except OSError:
+            raise
+        except (AttributeError, ValueError) as error:
+            raise OSError(str(error)) from error
 
 
 @dataclass
@@ -312,143 +416,190 @@ class _OwnershipState:
     paths: tuple[str, ...] = ()
     checked_at: float = 0.0
     window_title: str = ""
+    has_verified_title: bool = False
+    error: str = ""
 
 
 class ClientResolver:
-    """Resolve Foldit processes into independently monitored log sources."""
+    """Main-loop-owned PID-to-log binding controller.
+
+    The class has no polling loop. ``submit`` observes cheap state and starts a
+    short-lived background probe only after a meaningful event. On macOS and
+    Linux, where a window title cannot be trusted as a complete signal, submit
+    schedules a single batched probe at ``portable_probe_interval``.
+    """
 
     def __init__(
         self,
         settings: Optional[dict] = None,
         backend: Optional[OpenLogBackend] = None,
-        waiting_interval: float = 5.0,
-        resolved_interval: float = 30.0,
-        start_worker: bool = True,
+        portable_probe_interval: float = 5.0,
         report: Callable[[str], None] = print,
     ):
         self.backend = backend or OpenLogBackend()
-        self.waiting_interval = float(waiting_interval)
-        self.resolved_interval = float(resolved_interval)
+        self.portable_probe_interval = float(portable_probe_interval)
         self.report = report
         self.fallbacks = parse_log_fallbacks(settings, report=report)
-        self._lock = threading.RLock()
         self._states: Dict[tuple[int, float], _OwnershipState] = {}
-        self._latest_processes: list[Any] = []
-        self._snapshot: list[MonitoredClient] = []
-        self._wake = threading.Event()
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
+        self._log_index = ScriptLogIndex()
+        self._result_lock = threading.Lock()
+        self._completed_result: Optional[Dict[tuple[int, float], ProbeResult]] = None
+        self._probe_thread: Optional[threading.Thread] = None
+        self._pending_keys: set[tuple[int, float]] = set()
+        self._stopped = False
         self._reported_conflicts: set[tuple[int, str, str]] = set()
-        self._root_mtimes: Dict[str, int] = {}
-        if start_worker:
-            self._thread = threading.Thread(target=self._worker, name="FolditLogResolver", daemon=True)
-            self._thread.start()
 
     @staticmethod
     def _process_key(client: Any) -> tuple[int, float]:
         return int(client.pid), float(getattr(client, "process_start_time", 0.0) or 0.0)
 
+    @staticmethod
+    def _title_available(client: Any) -> bool:
+        explicit = getattr(client, "window_title_available", None)
+        if explicit is not None:
+            return bool(explicit)
+        return bool(str(getattr(client, "window_title", "") or ""))
+
     def submit(self, processes: Sequence[Any]) -> list[MonitoredClient]:
-        with self._lock:
-            self._latest_processes = list(processes)
-            snapshot = self._build_snapshot(self._latest_processes)
-            self._snapshot = snapshot
-        self._wake.set()
-        return list(snapshot)
-
-    def get_snapshot(self) -> list[MonitoredClient]:
-        with self._lock:
-            return list(self._snapshot)
-
-    def resolve_now(self, processes: Sequence[Any], force: bool = True) -> list[MonitoredClient]:
         process_list = list(processes)
         now = time.monotonic()
-        self._refresh_states(process_list, now, force=force)
-        with self._lock:
-            self._latest_processes = process_list
-            self._snapshot = self._build_snapshot(process_list)
-            return list(self._snapshot)
+        self._consume_completed_result(now)
+        live_by_key = {self._process_key(client): client for client in process_list}
+        self._remove_stale_states(set(live_by_key))
+
+        roots = {normalize_path(client.data_root) for client in process_list}
+        observations = self._log_index.observe(roots) if self.backend.system == "Windows" else {}
+
+        due_keys: set[tuple[int, float]] = set()
+        event_keys: set[tuple[int, float]] = set()
+        clients_by_root: Dict[str, list[Any]] = {}
+        for client in process_list:
+            key = self._process_key(client)
+            root = normalize_path(client.data_root)
+            clients_by_root.setdefault(root, []).append(client)
+            state = self._states.get(key)
+            if state is None:
+                state = _OwnershipState()
+                self._states[key] = state
+                due_keys.add(key)
+                event_keys.add(key)
+
+            title = str(getattr(client, "window_title", "") or "")
+            if self._title_available(client):
+                if state.has_verified_title and state.window_title != title:
+                    due_keys.add(key)
+                    event_keys.add(key)
+                state.window_title = title
+                state.has_verified_title = True
+
+            if state.paths and not all(os.path.exists(path) for path in state.paths):
+                due_keys.add(key)
+                event_keys.add(key)
+
+            if self.backend.system != "Windows":
+                if state.checked_at <= 0 or now - state.checked_at >= self.portable_probe_interval:
+                    due_keys.add(key)
+
+        snapshot = self._build_snapshot(process_list)
+
+        if self.backend.system == "Windows":
+            bound_by_root: Dict[str, set[str]] = {}
+            for monitored in snapshot:
+                if monitored.pid is not None and monitored.binding_status == "resolved" and monitored.log_path:
+                    bound_by_root.setdefault(normalize_path(monitored.data_root), set()).add(
+                        normalize_path(monitored.log_path)
+                    )
+            for root, observation in observations.items():
+                bound_paths = bound_by_root.get(root, set())
+                if any(path not in bound_paths for path in observation.changed_paths):
+                    for client in clients_by_root.get(root, ()):
+                        key = self._process_key(client)
+                        due_keys.add(key)
+                        event_keys.add(key)
+
+        pending_live = self._pending_keys & set(live_by_key)
+        due_keys.update(pending_live)
+        event_keys.update(pending_live)
+        self._pending_keys.clear()
+        candidates_by_root = {root: observation.candidates for root, observation in observations.items()}
+        self._request_probe(due_keys, event_keys, live_by_key, candidates_by_root)
+        return snapshot
 
     def stop(self, timeout: float = 1.0):
-        self._stop.set()
-        self._wake.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=max(0.0, float(timeout)))
+        self._stopped = True
+        thread = self._probe_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=max(0.0, float(timeout)))
 
-    def _worker(self):
-        while not self._stop.is_set():
-            self._wake.wait(1.0)
-            self._wake.clear()
-            with self._lock:
-                processes = list(self._latest_processes)
-            if not processes and not self.fallbacks:
-                continue
-            self._refresh_states(processes, time.monotonic(), force=False)
-            with self._lock:
-                self._snapshot = self._build_snapshot(processes)
+    def _remove_stale_states(self, live_keys: set[tuple[int, float]]):
+        for key in set(self._states) - live_keys:
+            self._states.pop(key, None)
+        self._pending_keys.intersection_update(live_keys)
 
-    def _refresh_states(self, processes: Sequence[Any], now: float, force: bool):
-        live_keys = {self._process_key(client) for client in processes}
-        with self._lock:
-            stale_keys = set(self._states) - live_keys
-            for key in stale_keys:
-                self._states.pop(key, None)
+    def _request_probe(
+        self,
+        due_keys: set[tuple[int, float]],
+        event_keys: set[tuple[int, float]],
+        live_by_key: Mapping[tuple[int, float], Any],
+        candidates_by_root: Mapping[str, Sequence[str]],
+    ):
+        if self._stopped or not due_keys:
+            return
+        if self._probe_thread is not None and self._probe_thread.is_alive():
+            self._pending_keys.update(event_keys)
+            return
 
-        changed_roots: set[str] = set()
-        current_root_mtimes: Dict[str, int] = {}
-        for client in processes:
-            root_key = normalize_path(client.data_root)
-            if root_key in current_root_mtimes:
-                continue
+        request_clients = [live_by_key[key] for key in due_keys if key in live_by_key]
+        if not request_clients:
+            return
+        request_candidates = {
+            root: tuple(paths)
+            for root, paths in candidates_by_root.items()
+            if any(normalize_path(client.data_root) == root for client in request_clients)
+        }
+        def run_probe():
             try:
-                current_mtime = int(os.stat(root_key).st_mtime_ns)
-            except OSError:
-                current_mtime = -1
-            previous_mtime = self._root_mtimes.get(root_key)
-            if previous_mtime is not None and previous_mtime != current_mtime:
-                changed_roots.add(root_key)
-            current_root_mtimes[root_key] = current_mtime
-        self._root_mtimes = current_root_mtimes
-
-        for client in processes:
-            key = self._process_key(client)
-            title = str(getattr(client, "window_title", "") or "")
-            with self._lock:
-                state = self._states.get(key, _OwnershipState())
-            interval = self.resolved_interval if len(state.paths) == 1 else self.waiting_interval
-            path_missing = bool(state.paths and not all(os.path.exists(path) for path in state.paths))
-            due = (
-                force
-                or state.checked_at <= 0
-                or now - state.checked_at >= interval
-                or state.window_title != title
-                or path_missing
-                or normalize_path(client.data_root) in changed_roots
-            )
-            if not due:
-                continue
-            try:
-                discovered_paths = tuple(
-                    normalize_path(path)
-                    for path in self.backend.open_logs(client.process, client.data_root)
-                    if is_script_log_path(path)
-                )
-                discovered_paths = tuple(dict.fromkeys(discovered_paths))
-                if (
-                    not discovered_paths
-                    and state.paths
-                    and all(os.path.exists(path) for path in state.paths)
-                ):
-                    # Foldit may close its log between scripts. Keep the last
-                    # proven binding until a new open log supersedes it.
-                    paths = state.paths
-                else:
-                    paths = discovered_paths
+                results = self.backend.probe(request_clients, request_candidates)
             except Exception as error:
-                self.report(f"Could not resolve Foldit log for PID {client.pid}: {error}")
-                paths = state.paths
-            with self._lock:
-                self._states[key] = _OwnershipState(paths=paths, checked_at=now, window_title=title)
+                results = {
+                    self._process_key(client): ProbeResult(error=f"Open-log probe failed: {error}")
+                    for client in request_clients
+                }
+            with self._result_lock:
+                self._completed_result = results
+
+        self._probe_thread = threading.Thread(
+            target=run_probe,
+            name="FolditLogProbe",
+            daemon=True,
+        )
+        self._probe_thread.start()
+
+    def _consume_completed_result(self, now: float):
+        with self._result_lock:
+            results = self._completed_result
+            self._completed_result = None
+        if results is None:
+            return
+        self._probe_thread = None
+        self._apply_results(results, now)
+
+    def _apply_results(self, results: Mapping[tuple[int, float], ProbeResult], now: float):
+        for key, result in results.items():
+            state = self._states.get(key)
+            if state is None:
+                continue
+            state.checked_at = now
+            if result.error:
+                state.error = result.error
+                if not result.paths:
+                    continue
+            else:
+                state.error = ""
+            discovered = tuple(dict.fromkeys(normalize_path(path) for path in result.paths))
+            if not discovered and state.paths and all(os.path.exists(path) for path in state.paths):
+                continue
+            state.paths = discovered
 
     @staticmethod
     def _fallback_title_matches(fallback: LogFallback, client: Any) -> bool:
@@ -490,15 +641,14 @@ class ClientResolver:
 
         for client in processes:
             key = self._process_key(client)
-            with self._lock:
-                state = self._states.get(key, _OwnershipState())
+            state = self._states.get(key, _OwnershipState())
             data_root = normalize_path(client.data_root)
             paths = list(state.paths)
             log_path = ""
             track = ""
             status = "waiting"
             source = ""
-            detail = "Waiting for Foldit to open a script log"
+            detail = state.error or "Waiting for Foldit to open a script log"
             matched_fallback: Optional[LogFallback] = None
 
             if len(paths) == 1:
@@ -506,7 +656,7 @@ class ClientResolver:
                 track = track_from_log_path(log_path) or ""
                 status = "resolved"
                 source = "os"
-                detail = ""
+                detail = state.error
                 matched_fallback = fallback_by_path.get(log_path)
                 if matched_fallback:
                     used_fallback_paths.add(log_path)
@@ -561,22 +711,14 @@ class ClientResolver:
                         track = track_from_log_path(log_path) or ""
                         status = "resolved"
                         source = "single_default"
-                        detail = ""
+                        detail = state.error
                     elif len(existing_defaults) > 1:
                         status = "ambiguous"
                         detail = "Both default script-log naming variants exist and ownership is unknown"
 
-                if status == "waiting" and not source:
-                    diagnostic = getattr(self.backend, "diagnostic", lambda _pid: "")(client.pid)
-                    if diagnostic:
-                        detail = diagnostic
-
             base_name = self._installation_name(client, data_root)
             client_name = self._display_name(base_name, track, matched_fallback)
-            if log_path:
-                client_id = f"log:{normalize_path(log_path)}"
-            else:
-                client_id = f"process:{client.pid}:{key[1]:.6f}"
+            client_id = f"log:{normalize_path(log_path)}" if log_path else f"process:{client.pid}:{key[1]:.6f}"
             resolved.append(
                 MonitoredClient(
                     client_id=client_id,
@@ -596,6 +738,7 @@ class ClientResolver:
                     installation_path=str(getattr(client, "installation_path", "") or ""),
                     window_info=getattr(client, "window_info", None),
                     window_title=str(getattr(client, "window_title", "") or ""),
+                    window_title_available=self._title_available(client),
                     is_window_visible=bool(getattr(client, "is_window_visible", False)),
                     is_window_focused=bool(getattr(client, "is_window_focused", False)),
                 )
@@ -669,12 +812,5 @@ class ClientResolver:
 
 __all__ = [
     "ClientResolver",
-    "DirectoryLogCache",
-    "LogFallback",
-    "MonitoredClient",
-    "OpenLogBackend",
-    "is_script_log_path",
     "normalize_path",
-    "parse_log_fallbacks",
-    "track_from_log_path",
 ]

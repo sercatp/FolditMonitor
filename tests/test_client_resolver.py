@@ -3,6 +3,7 @@ import json
 import re
 import time
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,8 +11,9 @@ from unittest.mock import patch
 
 from client_resolver import (
     ClientResolver,
-    DirectoryLogCache,
     OpenLogBackend,
+    ProbeResult,
+    ScriptLogIndex,
     normalize_path,
     parse_log_fallbacks,
     track_from_log_path,
@@ -25,9 +27,29 @@ class FakeBackend:
     def __init__(self, mapping=None, system="Windows"):
         self.mapping = mapping or {}
         self.system = system
+        self.calls = []
 
-    def open_logs(self, process, _data_root):
-        return list(self.mapping.get(int(process.pid), ()))
+    def probe(self, clients, _candidates_by_root=None):
+        self.calls.append(tuple(int(client.pid) for client in clients))
+        return {
+            (int(client.pid), float(client.process_start_time)): ProbeResult(
+                tuple(self.mapping.get(int(client.pid), ()))
+            )
+            for client in clients
+        }
+
+
+class BlockingBackend(FakeBackend):
+    def __init__(self, mapping=None, system="Windows"):
+        super().__init__(mapping=mapping, system=system)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def probe(self, clients, candidates_by_root=None):
+        if not self.calls:
+            self.started.set()
+            self.release.wait(timeout=2)
+        return super().probe(clients, candidates_by_root)
 
 
 def fake_client(pid, data_root, title="", name="Foldit", start=None):
@@ -43,9 +65,18 @@ def fake_client(pid, data_root, title="", name="Foldit", start=None):
         installation_path=str(data_root),
         window_info=None,
         window_title=title,
+        window_title_available=bool(title),
         is_window_visible=False,
         is_window_focused=False,
     )
+
+
+def settle_resolver(resolver, clients):
+    resolver.submit(clients)
+    worker = resolver._probe_thread
+    if worker is not None:
+        worker.join(timeout=2)
+    return resolver.submit(clients)
 
 
 class ClientResolverCases(unittest.TestCase):
@@ -62,9 +93,9 @@ class ClientResolverCases(unittest.TestCase):
             first.write_text("", encoding="utf-8")
             second.write_text("", encoding="utf-8")
             backend = FakeBackend({1: [str(first)], 2: [str(second)]})
-            resolver = ClientResolver(backend=backend, start_worker=False)
+            resolver = ClientResolver(backend=backend)
 
-            result = resolver.resolve_now([
+            result = settle_resolver(resolver, [
                 fake_client(1, root),
                 fake_client(2, root),
             ])
@@ -80,10 +111,9 @@ class ClientResolverCases(unittest.TestCase):
             shared.write_text("", encoding="utf-8")
             resolver = ClientResolver(
                 backend=FakeBackend({1: [str(shared)], 2: [str(shared)]}),
-                start_worker=False,
             )
 
-            result = resolver.resolve_now([fake_client(1, root), fake_client(2, root)])
+            result = settle_resolver(resolver, [fake_client(1, root), fake_client(2, root)])
 
             self.assertEqual({item.binding_status for item in result}, {"collision"})
             self.assertEqual(len({item.client_id for item in result}), 2)
@@ -96,10 +126,9 @@ class ClientResolverCases(unittest.TestCase):
             empty_default.write_text("", encoding="utf-8")
             resolver = ClientResolver(
                 backend=FakeBackend({1: [str(named_default)], 2: [str(empty_default)]}),
-                start_worker=False,
             )
 
-            result = resolver.resolve_now([fake_client(1, root), fake_client(2, root)])
+            result = settle_resolver(resolver, [fake_client(1, root), fake_client(2, root)])
 
             self.assertEqual(len({item.client_name for item in result}), 2)
 
@@ -108,12 +137,13 @@ class ClientResolverCases(unittest.TestCase):
             log_path = Path(root) / "scriptlog.track.xml"
             log_path.write_text("", encoding="utf-8")
             backend = FakeBackend({1: []})
-            resolver = ClientResolver(backend=backend, start_worker=False)
+            resolver = ClientResolver(backend=backend)
             clients = [fake_client(1, root), fake_client(2, root)]
 
-            waiting = resolver.resolve_now(clients)
+            waiting = settle_resolver(resolver, clients)
             backend.mapping[1] = [str(log_path)]
-            resolved = resolver.resolve_now(clients)
+            log_path.write_text("opened", encoding="utf-8")
+            resolved = settle_resolver(resolver, clients)
 
             self.assertEqual(next(item for item in waiting if item.pid == 1).binding_status, "waiting")
             bound = next(item for item in resolved if item.pid == 1)
@@ -127,14 +157,25 @@ class ClientResolverCases(unittest.TestCase):
             first.write_text("", encoding="utf-8")
             second.write_text("", encoding="utf-8")
             backend = FakeBackend({1: [str(first)]})
-            resolver = ClientResolver(backend=backend, start_worker=False)
-            clients = [fake_client(1, root), fake_client(2, root)]
+            resolver = ClientResolver(backend=backend)
+            initial_clients = [
+                fake_client(1, root, title="Foldit - first"),
+                fake_client(2, root, title="Foldit - other"),
+            ]
 
-            initial = resolver.resolve_now(clients)
+            initial = settle_resolver(resolver, initial_clients)
             backend.mapping[1] = []
-            closed = resolver.resolve_now(clients)
+            closed_clients = [
+                fake_client(1, root, title="Foldit - loading"),
+                fake_client(2, root, title="Foldit - other"),
+            ]
+            closed = settle_resolver(resolver, closed_clients)
             backend.mapping[1] = [str(second)]
-            switched = resolver.resolve_now(clients)
+            switched_clients = [
+                fake_client(1, root, title="Foldit - second"),
+                fake_client(2, root, title="Foldit - other"),
+            ]
+            switched = settle_resolver(resolver, switched_clients)
 
             self.assertEqual(next(item for item in initial if item.pid == 1).track, "first")
             self.assertEqual(next(item for item in closed if item.pid == 1).track, "first")
@@ -147,10 +188,9 @@ class ClientResolverCases(unittest.TestCase):
                 path.write_text("", encoding="utf-8")
             resolver = ClientResolver(
                 backend=FakeBackend({1: [str(path) for path in paths]}),
-                start_worker=False,
             )
 
-            result = resolver.resolve_now([fake_client(1, root)])
+            result = settle_resolver(resolver, [fake_client(1, root)])
 
             self.assertEqual(result[0].binding_status, "ambiguous")
             self.assertEqual(result[0].log_path, "")
@@ -166,9 +206,9 @@ class ClientResolverCases(unittest.TestCase):
                     ]
                 }
             }
-            resolver = ClientResolver(settings, backend=FakeBackend(), start_worker=False)
+            resolver = ClientResolver(settings, backend=FakeBackend())
 
-            result = resolver.resolve_now([])
+            result = resolver.submit([])
 
             self.assertEqual(len(result), 1)
             self.assertIsNone(result[0].pid)
@@ -184,24 +224,53 @@ class ClientResolverCases(unittest.TestCase):
             resolver = ClientResolver(
                 settings,
                 backend=FakeBackend({1: [str(log_path)]}),
-                start_worker=False,
             )
 
-            result = resolver.resolve_now([fake_client(1, root)])
+            result = settle_resolver(resolver, [fake_client(1, root)])
 
             self.assertEqual(len(result), 1)
             self.assertEqual(result[0].pid, 1)
             self.assertEqual(result[0].client_name, "Greg")
             self.assertEqual(result[0].binding_source, "os")
 
+    def test_automatic_owner_keeps_priority_over_conflicting_json_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            configured = Path(root) / "scriptlog.configured.xml"
+            actual = Path(root) / "scriptlog.actual.xml"
+            configured.write_text("", encoding="utf-8")
+            actual.write_text("", encoding="utf-8")
+            messages = []
+            settings = {
+                "monitoring": {
+                    "log_fallbacks": [
+                        {
+                            "log_path": str(configured),
+                            "title_suffix": " - matching",
+                        }
+                    ]
+                }
+            }
+            resolver = ClientResolver(
+                settings,
+                backend=FakeBackend({1: [str(actual)]}),
+                report=messages.append,
+            )
+
+            result = settle_resolver(resolver, [fake_client(1, root, title="Foldit - matching")])
+
+            process_client = next(item for item in result if item.pid == 1)
+            self.assertEqual(process_client.log_path, normalize_path(str(actual)))
+            self.assertEqual(process_client.binding_source, "os")
+            self.assertTrue(any("Ignoring conflicting JSON" in message for message in messages))
+
     def test_exact_track_suffix_can_bind_json_fallback(self):
         with tempfile.TemporaryDirectory() as root:
             log_path = Path(root) / "scriptlog.branch.xml"
             log_path.write_text("", encoding="utf-8")
             settings = {"monitoring": {"log_fallbacks": [{"log_path": str(log_path)}]}}
-            resolver = ClientResolver(settings, backend=FakeBackend(), start_worker=False)
+            resolver = ClientResolver(settings, backend=FakeBackend())
 
-            result = resolver.resolve_now([
+            result = settle_resolver(resolver, [
                 fake_client(1, root, title="Foldit - 2802: Puzzle - branch"),
                 fake_client(2, root, title="Foldit - 2802: Puzzle - other"),
             ])
@@ -229,10 +298,11 @@ class ClientResolverCases(unittest.TestCase):
 
 
 class ResolverBackendCases(unittest.TestCase):
-    def test_directory_cache_does_not_rescan_unchanged_root(self):
+    def test_script_log_index_does_not_rescan_unchanged_root(self):
         with tempfile.TemporaryDirectory() as root:
-            (Path(root) / "scriptlog.default.xml").write_text("", encoding="utf-8")
-            cache = DirectoryLogCache(rescan_seconds=60)
+            log_path = Path(root) / "scriptlog.default.xml"
+            log_path.write_text("", encoding="utf-8")
+            index = ScriptLogIndex()
             real_scandir = os.scandir
             calls = []
 
@@ -241,23 +311,170 @@ class ResolverBackendCases(unittest.TestCase):
                 return real_scandir(path)
 
             with patch("client_resolver.os.scandir", side_effect=counting_scandir):
-                first = cache.candidates(root, now=1)
-                second = cache.candidates(root, now=2)
+                first = index.observe([root])
+                second = index.observe([root])
 
-            self.assertEqual(first, second)
+            self.assertEqual(first[normalize_path(root)].candidates, second[normalize_path(root)].candidates)
             self.assertEqual(len(calls), 1)
 
-    def test_lsof_machine_output_is_filtered_to_the_data_root(self):
+    def test_script_log_index_detects_writes_without_rescanning_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            log_path = Path(root) / "scriptlog.default.xml"
+            log_path.write_text("a", encoding="utf-8")
+            index = ScriptLogIndex()
+            index.observe([root])
+            log_path.write_text("changed", encoding="utf-8")
+
+            with patch("client_resolver.os.scandir") as scandir:
+                observation = index.observe([root])[normalize_path(root)]
+
+            scandir.assert_not_called()
+            self.assertEqual(observation.changed_paths, (normalize_path(str(log_path)),))
+
+    def test_batched_lsof_maps_each_path_to_its_pid(self):
         with tempfile.TemporaryDirectory() as root:
             inside = str(Path(root) / "scriptlog.track with space.xml")
+            second = str(Path(root) / "scriptlog.second.xml")
             outside = str(Path(root).parent / "scriptlog.other.xml")
-            completed = SimpleNamespace(stdout=f"p123\nfcwd\nn{root}\nftxt\nn{inside}\nftxt\nn{outside}\n")
+            completed = SimpleNamespace(
+                stdout=f"p123\nfcwd\nn{root}\nftxt\nn{inside}\nn{outside}\np456\nftxt\nn{second}\n",
+                returncode=0,
+                stderr="",
+            )
             backend = OpenLogBackend(system="Darwin")
             with patch("client_resolver.subprocess.run", return_value=completed) as run:
-                result = backend._macos_open_logs(123, root)
+                clients = [fake_client(123, root), fake_client(456, root)]
+                result = backend.probe(clients)
 
-            self.assertEqual(result, [normalize_path(inside)])
-            self.assertEqual(run.call_args.args[0][:5], ["/usr/sbin/lsof", "-a", "-p", "123", "-Fn"])
+            self.assertEqual(result[(123, 1123.0)].paths, (normalize_path(inside),))
+            self.assertEqual(result[(456, 1456.0)].paths, (normalize_path(second),))
+            self.assertEqual(run.call_args.args[0], ["/usr/sbin/lsof", "-a", "-p", "123,456", "-Fpn"])
+
+
+class EventDrivenResolverCases(unittest.TestCase):
+    @staticmethod
+    def settle(resolver, clients):
+        return settle_resolver(resolver, clients)
+
+    def test_stable_windows_binding_does_not_probe_again(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "scriptlog.track.xml"
+            path.write_text("initial", encoding="utf-8")
+            backend = FakeBackend({1: [str(path)]})
+            resolver = ClientResolver(backend=backend)
+            clients = [fake_client(1, root, title="Foldit - track")]
+
+            result = self.settle(resolver, clients)
+            resolver.submit(clients)
+            resolver.submit(clients)
+
+            self.assertEqual(result[0].binding_source, "os")
+            self.assertEqual(backend.calls, [(1,)])
+
+    def test_waiting_windows_client_does_not_poll_without_activity(self):
+        with tempfile.TemporaryDirectory() as root:
+            backend = FakeBackend({1: []})
+            resolver = ClientResolver(backend=backend)
+            clients = [fake_client(1, root, title="Foldit - track")]
+
+            result = self.settle(resolver, clients)
+            for _ in range(5):
+                resolver.submit(clients)
+
+            self.assertEqual(result[0].binding_status, "waiting")
+            self.assertEqual(backend.calls, [(1,)])
+
+    def test_json_fallback_activity_does_not_retry_failed_ownership_probe(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "scriptlog.manual.xml"
+            path.write_text("initial", encoding="utf-8")
+            settings = {
+                "monitoring": {
+                    "log_fallbacks": [
+                        {
+                            "log_path": str(path),
+                            "title_suffix": " - manual",
+                        }
+                    ]
+                }
+            }
+            backend = FakeBackend({1: []})
+            resolver = ClientResolver(settings, backend=backend)
+            clients = [fake_client(1, root, title="Foldit - manual")]
+            result = self.settle(resolver, clients)
+
+            path.write_text("still running", encoding="utf-8")
+            resolver.submit(clients)
+
+            self.assertEqual(result[0].binding_source, "json")
+            self.assertEqual(backend.calls, [(1,)])
+
+    def test_unknown_log_activity_wakes_waiting_windows_client_once(self):
+        with tempfile.TemporaryDirectory() as root:
+            backend = FakeBackend({1: []})
+            resolver = ClientResolver(backend=backend)
+            clients = [fake_client(1, root, title="Foldit - track")]
+            self.settle(resolver, clients)
+
+            path = Path(root) / "scriptlog.track.xml"
+            path.write_text("started", encoding="utf-8")
+            backend.mapping[1] = [str(path)]
+            result = self.settle(resolver, clients)
+
+            self.assertEqual(result[0].track, "track")
+            self.assertEqual(backend.calls, [(1,), (1,)])
+
+    def test_windows_title_change_wakes_exactly_one_probe(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = Path(root) / "scriptlog.first.xml"
+            second = Path(root) / "scriptlog.second.xml"
+            first.write_text("first", encoding="utf-8")
+            second.write_text("second", encoding="utf-8")
+            backend = FakeBackend({1: [str(first)]})
+            resolver = ClientResolver(backend=backend)
+            initial = [fake_client(1, root, title="Foldit - first")]
+            self.settle(resolver, initial)
+
+            backend.mapping[1] = [str(second)]
+            switched = [fake_client(1, root, title="Foldit - second")]
+            result = self.settle(resolver, switched)
+            resolver.submit(switched)
+
+            self.assertEqual(result[0].track, "second")
+            self.assertEqual(backend.calls, [(1,), (1,)])
+
+    def test_temporary_unavailable_title_is_not_a_change_event(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "scriptlog.track.xml"
+            path.write_text("initial", encoding="utf-8")
+            backend = FakeBackend({1: [str(path)]})
+            resolver = ClientResolver(backend=backend)
+            self.settle(resolver, [fake_client(1, root, title="Foldit - track")])
+
+            unavailable = fake_client(1, root, title="")
+            resolver.submit([unavailable])
+
+            self.assertEqual(backend.calls, [(1,)])
+
+    def test_title_event_during_probe_is_not_lost(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "scriptlog.track.xml"
+            path.write_text("initial", encoding="utf-8")
+            backend = BlockingBackend({1: [str(path)]})
+            resolver = ClientResolver(backend=backend)
+            initial = [fake_client(1, root, title="Foldit - first")]
+            changed = [fake_client(1, root, title="Foldit - second")]
+
+            resolver.submit(initial)
+            self.assertTrue(backend.started.wait(timeout=1))
+            resolver.submit(changed)
+            backend.release.set()
+            resolver._probe_thread.join(timeout=2)
+            resolver.submit(changed)
+            resolver._probe_thread.join(timeout=2)
+            resolver.submit(changed)
+
+            self.assertEqual(backend.calls, [(1,), (1,)])
 
 
 class MacWindowBackendCases(unittest.TestCase):
@@ -352,6 +569,47 @@ class MacWindowBackendCases(unittest.TestCase):
             self.assertEqual(found, [os.path.realpath(str(resources))])
             self.assertEqual(launched, os.path.realpath(str(app)))
             popen.assert_called_once_with(["/usr/bin/open", "-n", os.path.realpath(str(app))])
+
+
+class WindowsWindowBackendCases(unittest.TestCase):
+    def test_windows_are_enumerated_once_and_grouped_by_pid(self):
+        class Win32Gui:
+            def __init__(self):
+                self.enum_calls = 0
+
+            def EnumWindows(self, callback, extra):
+                self.enum_calls += 1
+                callback(101, extra)
+                callback(202, extra)
+
+            @staticmethod
+            def IsWindowVisible(_hwnd):
+                return True
+
+            @staticmethod
+            def GetWindowText(hwnd):
+                return "" if hwnd == 101 else "Foldit - track"
+
+            @staticmethod
+            def GetClassName(_hwnd):
+                return "foldit"
+
+        class Win32Process:
+            @staticmethod
+            def GetWindowThreadProcessId(hwnd):
+                return 1, 11 if hwnd == 101 else 22
+
+        manager = WindowManager()
+        manager.system = "Windows"
+        manager.win32gui = Win32Gui()
+        manager.win32process = Win32Process()
+
+        manager._refresh_windows_window_cache()
+
+        self.assertEqual(manager.win32gui.enum_calls, 1)
+        self.assertEqual(manager._get_windows_process_windows(11)[0][0], 101)
+        self.assertEqual(manager._get_windows_process_windows(22)[0][0], 202)
+        self.assertTrue(manager._is_foldit_window(manager._get_windows_process_windows(11)[0]))
 
 
 class PathFirstLoggerCases(unittest.TestCase):

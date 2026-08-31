@@ -177,6 +177,7 @@ monitored_process_client_ids = {}
 selected_rows = []  # Array for storing selected rows
 artifact_row_cache = {}
 artifact_row_cache_lock = threading.Lock()
+rendered_process_rows = {}
 client_log_paths_by_client = defaultdict(set)
 last_double_click_time = 0
 stats_button = None
@@ -456,13 +457,6 @@ def remember_client_log_path(client_name, log_path):
         client_log_paths_by_client[key].add(normalize_path(clean_path))
 
 
-def remember_client_log_root(client_name, folder):
-    """Legacy helper retained for callers that only know a default-log folder."""
-    clean_folder = str(folder or "").strip()
-    if clean_folder:
-        remember_client_log_path(client_name, os.path.join(clean_folder, "scriptlog.default.xml"))
-
-
 def get_known_client_log_roots(client_name):
     roots = set()
     for key in client_lookup_keys(client_name):
@@ -684,7 +678,7 @@ def schedule_update():
     
 def update_process_list():
     """Update the process list in the GUI."""
-    global monitored_processes, artifact_row_cache
+    global monitored_processes, artifact_row_cache, rendered_process_rows
 
     process_clients = get_foldit_clients()
     update_process_cpu_usage(process_clients)
@@ -696,6 +690,8 @@ def update_process_list():
     current_items = set()
     current_artifact_rows = {}
     stats_targets_by_puzzle = {}
+    order_dirty = False
+    layout_dirty = False
     speed_boost_states = (
         {
             int(client.pid): {
@@ -871,10 +867,21 @@ def update_process_list():
                 "log_lines": list(process_state.get("last_log_lines", ())),
             }
             
-            if item_id in existing_items:
-                process_tree.item(item_id, values=values, tags=tags)
-            else:
+            render_state = (tuple(values), tuple(tags), str(client.client_name))
+            previous_render = rendered_process_rows.get(item_id)
+            if item_id not in existing_items:
                 process_tree.insert('', 'end', iid=item_id, values=values, tags=tags)
+                order_dirty = True
+                layout_dirty = True
+            elif previous_render != render_state:
+                process_tree.item(item_id, values=values, tags=tags)
+                if previous_render is None or previous_render[2] != render_state[2]:
+                    order_dirty = True
+                previous_lengths = tuple(len(str(value)) for value in previous_render[0]) if previous_render else ()
+                current_lengths = tuple(len(str(value)) for value in render_state[0])
+                if previous_lengths != current_lengths:
+                    layout_dirty = True
+            rendered_process_rows[item_id] = render_state
             
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
@@ -883,6 +890,9 @@ def update_process_list():
     items_to_remove = existing_items - current_items
     for item_id in items_to_remove:
         process_tree.delete(item_id)
+        rendered_process_rows.pop(item_id, None)
+        order_dirty = True
+        layout_dirty = True
         try:
             monitored_processes.pop(int(item_id), None)
             monitored_process_start_times.pop(int(item_id), None)
@@ -897,25 +907,26 @@ def update_process_list():
         speed_boost.on_clients_refreshed(speed_boost_states.values())
     
 
-    items = [
-        (
-            str(current_artifact_rows.get(item, {}).get("client_name", "")),
-            item,
-        )
-        for item in process_tree.get_children()
-    ]
-    items.sort(key=lambda x: natural_sort(x[0]))
-    
-    # Reorder items
-    for idx, (_, item) in enumerate(items):
-        process_tree.move(item, '', idx)
+    if order_dirty:
+        items = [
+            (
+                str(current_artifact_rows.get(item, {}).get("client_name", "")),
+                item,
+            )
+            for item in process_tree.get_children()
+        ]
+        items.sort(key=lambda x: natural_sort(x[0]))
+
+        for idx, (_, item) in enumerate(items):
+            process_tree.move(item, '', idx)
 
     current_parent_dirs = get_running_foldit_parent_dirs()
     if current_parent_dirs:
         settings_manager.save_last_seen_foldit_parent(current_parent_dirs[0])
     
-    adjust_column_widths(process_tree)
-    adjust_window_size(changeWidth=False)
+    if layout_dirty:
+        adjust_column_widths(process_tree)
+        adjust_window_size(changeWidth=False)
     check_client_changes(clients)
 
     selected_rows[:] = [item for item in selected_item_order if item in current_items]
@@ -1156,11 +1167,7 @@ def setup_tooltip(root):
 
 def get_last_log_lines(log_path, client_name=""):
     """Get the last lines of the log from the FolditLogHandler"""
-    script_path = (
-        os.path.join(log_path, "scriptlog.default.xml")
-        if os.path.isdir(log_path)
-        else str(log_path)
-    )
+    script_path = str(log_path)
     data = foldit_log_handler.get_data(script_path)  # Get log data using foldit_log_handler
     
     if not data:
@@ -1356,7 +1363,7 @@ def show_stats_puzzle_menu(event=None):
         stats_puzzle_menu.grab_release()
     return "break"
 
-def check_client_changes(clients=None):
+def check_client_changes(clients):
     """Check for changes in client state."""
     def finalize_interrupted_stats(script_path, client_name, puzzle_id):
         if not client_name or not puzzle_id:
@@ -1386,11 +1393,11 @@ def check_client_changes(clients=None):
     current_stats_clients = set()
     current_client_runtime = {}
     active_script_paths = set()
-    current_clients = clients if clients is not None else get_foldit_clients()
+    current_clients = clients
     known_script_paths = {
-        str(getattr(client, "log_path", "") or os.path.join(getattr(client, "folder", ""), "scriptlog.default.xml"))
+        str(getattr(client, "log_path", "") or "")
         for client in current_clients
-        if str(getattr(client, "log_path", "") or getattr(client, "folder", "")).strip()
+        if str(getattr(client, "log_path", "") or "")
     }
     for client in current_clients:
         known_script_paths.update(
@@ -1407,10 +1414,7 @@ def check_client_changes(clients=None):
             client_name = client.client_name
 
             binding_status = str(getattr(client, "binding_status", "resolved") or "resolved")
-            script_path = str(
-                getattr(client, "log_path", "")
-                or os.path.join(folder, "scriptlog.default.xml")
-            )
+            script_path = str(getattr(client, "log_path", "") or "")
             if binding_status != "resolved" or not script_path:
                 continue
             remember_log_path = globals().get("remember_client_log_path")
@@ -1441,8 +1445,6 @@ def check_client_changes(clients=None):
                     client_name=client_name,
                 )
 
-            recover_interrupted_file = getattr(foldit_log_handler, 'recover_interrupted_log_file', None)
-            recover_interrupted_legacy = getattr(foldit_log_handler, 'recover_interrupted_log', None)
             source_predates_process = getattr(
                 foldit_log_handler,
                 'source_predates_process',
@@ -1454,19 +1456,12 @@ def check_client_changes(clients=None):
                 and source_predates_process(script_path, process_create_time)
             )
             interrupted_path = None
-            if stale_source and (recover_interrupted_file or recover_interrupted_legacy):
-                if recover_interrupted_file is not None:
-                    interrupted_path = recover_interrupted_file(
-                        script_path,
-                        process_create_time=process_create_time,
-                        puzzle_id=puzzle_id,
-                    )
-                else:
-                    interrupted_path = recover_interrupted_legacy(
-                        folder,
-                        process_create_time=process_create_time,
-                        puzzle_id=puzzle_id,
-                    )
+            if stale_source:
+                interrupted_path = foldit_log_handler.recover_interrupted_log_file(
+                    script_path,
+                    process_create_time=process_create_time,
+                    puzzle_id=puzzle_id,
+                )
                 if interrupted_path:
                     finalize_interrupted_stats(script_path, client_name, puzzle_id)
 
@@ -1531,11 +1526,11 @@ def check_client_changes(clients=None):
                         speed_boost_integration = globals().get('speed_boost')
                         if speed_boost_integration is not None and client.pid is not None:
                             speed_boost_integration.on_script_finished(client.pid)
-                        export_log_file = getattr(foldit_log_handler, "export_log_file", None)
-                        if export_log_file is not None:
-                            export_log_file(script_path, open_file=False, puzzle_id=puzzle_id)
-                        else:
-                            foldit_log_handler.export_log(folder, open_file=False, puzzle_id=puzzle_id)
+                        foldit_log_handler.export_log_file(
+                            script_path,
+                            open_file=False,
+                            puzzle_id=puzzle_id,
+                        )
                     
         except Exception as e:
             print(f"Error checking client changes: {e}")

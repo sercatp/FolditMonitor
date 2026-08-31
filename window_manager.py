@@ -59,12 +59,16 @@ class ClientInfo:
     process: psutil.Process
     window_info: Any = None
     window_title: str = ""
+    window_title_available: bool = False
     is_window_visible: bool = False
     is_window_focused: bool = False
 
 class WindowManager:
     def __init__(self):
         self.system = platform.system()
+        self._windows_by_pid = {}
+        self._linux_by_pid = {}
+        self._mac_windows_by_pid = {}
         # Import all required modules at class initialization
         if self.system == 'Linux':
             try:
@@ -72,10 +76,12 @@ class WindowManager:
                 import Xlib.X
                 self.Xlib = Xlib
                 self.display = Xlib.display.Display()
+                self._linux_by_pid = {}
             except ImportError:
                 print("For Linux, python-xlib is required. Install: pip install python-xlib")
                 self.Xlib = None
                 self.display = None
+                self._linux_by_pid = {}
         elif self.system == 'Darwin':  # MacOS
             try:
                 import AppKit
@@ -101,11 +107,13 @@ class WindowManager:
                 self.win32gui = win32gui
                 self.win32process = win32process
                 self.win32con = win32con
+                self._windows_by_pid = {}
             except ImportError:
                 print("For Windows, pywin32 is required. Install: pip install pywin32")
                 self.win32gui = None
                 self.win32process = None
                 self.win32con = None
+                self._windows_by_pid = {}
 
     def get_process_windows(self, pid):
         if self.system == 'Windows':
@@ -119,39 +127,65 @@ class WindowManager:
     def _get_windows_process_windows(self, pid):
         if not all([self.win32gui, self.win32process]):
             return []
-        windows = []
+        return list(self._windows_by_pid.get(int(pid), ()))
+
+    def _refresh_windows_window_cache(self):
+        if not all([self.win32gui, self.win32process]):
+            self._windows_by_pid = {}
+            return
+        grouped = {}
+
         def enum_callback(hwnd, results):
-            if self.win32gui.IsWindowVisible(hwnd):
+            try:
+                if not self.win32gui.IsWindowVisible(hwnd):
+                    return
                 _, found_pid = self.win32process.GetWindowThreadProcessId(hwnd)
-                if found_pid == pid:
-                    title = self.win32gui.GetWindowText(hwnd)
-                    class_name = self.win32gui.GetClassName(hwnd)
-                    windows.append((hwnd, title, class_name))
+                title = self.win32gui.GetWindowText(hwnd)
+                class_name = self.win32gui.GetClassName(hwnd)
+                grouped.setdefault(int(found_pid), []).append((hwnd, title, class_name))
+            except Exception:
+                return
+
         self.win32gui.EnumWindows(enum_callback, None)
-        return windows
+        self._windows_by_pid = grouped
 
     def _get_linux_process_windows(self, pid):
         if not self.Xlib or not self.display:
             return []
-        windows = []
+        return list(getattr(self, "_linux_by_pid", {}).get(int(pid), ()))
+
+    def _refresh_linux_window_cache(self):
+        if not self.Xlib or not self.display:
+            self._linux_by_pid = {}
+            return
+        grouped = {}
         root = self.display.screen().root
-        window_ids = root.get_full_property(
-            self.display.intern_atom('_NET_CLIENT_LIST'), 
-            self.Xlib.X.AnyPropertyType
-        ).value
-        
-        for window_id in window_ids:
-            window = self.display.create_resource_object('window', window_id)
-            window_pid = window.get_full_property(
-                self.display.intern_atom('_NET_WM_PID'), 
-                self.Xlib.X.AnyPropertyType
+        try:
+            client_list = root.get_full_property(
+                self.display.intern_atom('_NET_CLIENT_LIST'),
+                self.Xlib.X.AnyPropertyType,
             )
-            
-            if window_pid and window_pid.value[0] == pid:
+            window_ids = client_list.value if client_list is not None else ()
+        except Exception:
+            self._linux_by_pid = {}
+            return
+
+        for window_id in window_ids:
+            try:
+                window = self.display.create_resource_object('window', window_id)
+                window_pid = window.get_full_property(
+                    self.display.intern_atom('_NET_WM_PID'),
+                    self.Xlib.X.AnyPropertyType,
+                )
+                if not window_pid:
+                    continue
+                pid = int(window_pid.value[0])
                 title = window.get_wm_name()
                 class_name = window.get_wm_class()
-                windows.append((window_id, title, class_name))
-        return windows
+                grouped.setdefault(pid, []).append((window_id, title, class_name))
+            except Exception:
+                continue
+        self._linux_by_pid = grouped
 
     def _get_macos_process_windows(self, pid):
         if not self.AppKit or not self.Quartz:
@@ -359,12 +393,29 @@ class WindowManager:
         installation_path = data_root
         return installation_path, data_root, os.path.basename(data_root) if data_root else ""
 
+    def _is_foldit_window(self, window: Any) -> bool:
+        title = str(window[1] or "") if len(window) > 1 else ""
+        class_name = window[2] if len(window) > 2 else ""
+        if isinstance(class_name, (tuple, list)):
+            class_text = " ".join(str(part or "") for part in class_name)
+        else:
+            class_text = str(class_name or "")
+        if self.system == "Darwin":
+            return True
+        if self.system == "Windows" and class_text.casefold() == "foldit":
+            return True
+        return "foldit" in f"{title} {class_text}".casefold()
+
     def list_foldit_clients(self, executable_name: Optional[str] = None) -> list[ClientInfo]:
         expected_name = executable_name or self.get_executable_name()
         if not expected_name:
             return []
 
-        if self.system == "Darwin":
+        if self.system == "Windows":
+            self._refresh_windows_window_cache()
+        elif self.system == "Linux":
+            self._refresh_linux_window_cache()
+        elif self.system == "Darwin":
             self._refresh_macos_window_cache()
 
         clients = []
@@ -383,17 +434,15 @@ class WindowManager:
 
                 selected_window = None
                 selected_title = ""
+                title_available = False
                 is_visible = False
                 is_focused = False
                 windows = self.get_process_windows(proc.pid)
-                foldit_windows = [window for window in windows if "Foldit" in str(window[1] or "")]
-                if self.system == "Darwin" and not foldit_windows:
-                    # Window names are commonly unavailable without Screen Recording.
-                    # Quartz owner PID is sufficient to choose the process' main layer-0 window.
-                    foldit_windows = list(windows)
+                foldit_windows = [window for window in windows if self._is_foldit_window(window)]
                 if foldit_windows:
                     selected_window = foldit_windows[0]
                     selected_title = str(selected_window[1] or "")
+                    title_available = bool(selected_title.strip())
                     is_visible = self.is_window_visible(selected_window)
                     is_focused = self.is_window_focused(selected_window)
 
@@ -409,6 +458,7 @@ class WindowManager:
                         process=proc,
                         window_info=selected_window,
                         window_title=selected_title,
+                        window_title_available=title_available,
                         is_window_visible=is_visible,
                         is_window_focused=is_focused,
                     )
@@ -426,12 +476,12 @@ class WindowManager:
                 return False
             return bool(application.activateWithOptions_(self.AppKit.NSApplicationActivateAllWindows))
 
+        if self.system == "Windows":
+            self._refresh_windows_window_cache()
+        elif self.system == "Linux":
+            self._refresh_linux_window_cache()
         windows = self.get_process_windows(int(pid))
-        foldit_windows = [
-            window
-            for window in windows
-            if "Foldit" in str(window[1] or "")
-        ]
+        foldit_windows = [window for window in windows if self._is_foldit_window(window)]
         if not foldit_windows:
             return False
         self.activate_window(foldit_windows[0])
@@ -509,9 +559,6 @@ class WindowManager:
             print(f"Error pressing {clean_shortcut}: {exc}")
         return True
 
-    def open_client_load_dialog(self, pid: int) -> bool:
-        return self.send_client_shortcut(pid, "ctrl+o")
-
 def open_path(path):
     """Open a file or folder with the system default application."""
     system = platform.system()
@@ -535,11 +582,6 @@ def open_containing_folder(path):
     absolute_path = os.path.abspath(path)
     folder_path = absolute_path if os.path.isdir(absolute_path) else os.path.dirname(absolute_path)
     open_folder(folder_path)
-
-
-def reveal_file(path):
-    """Compatibility alias: open the file's directory in the default file manager."""
-    open_containing_folder(path)
 
 
 def open_file(path, reveal_end=False):

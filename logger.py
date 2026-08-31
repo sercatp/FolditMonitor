@@ -378,31 +378,6 @@ class FolditLogHandler:
         )
         return export_path
 
-    def recover_interrupted_log(
-        self,
-        folder_path: str,
-        *,
-        process_create_time: float,
-        puzzle_id: Optional[str] = None,
-    ) -> Optional[str]:
-        """Archive an open script log that predates the current Foldit process."""
-        if not self._managed_exports_enabled():
-            return None
-
-        try:
-            process_started = float(process_create_time)
-        except (TypeError, ValueError):
-            return None
-        if process_started <= 0:
-            return None
-
-        script_path = os.path.join(folder_path, "scriptlog.default.xml")
-        return self.recover_interrupted_log_file(
-            script_path,
-            process_create_time=process_started,
-            puzzle_id=puzzle_id,
-        )
-
     def recover_interrupted_log_file(
         self,
         script_path: str,
@@ -614,11 +589,6 @@ class FolditLogHandler:
         if open_file:
             open_exported_file(export_path, reveal_end=True)
         return export_path
-
-    def export_log(self, folder_path: str, open_file: bool = True, puzzle_id: Optional[str] = None):
-        """Export log file with formatted name."""
-        script_path = os.path.join(folder_path, "scriptlog.default.xml")
-        return self.export_log_file(script_path, open_file=open_file, puzzle_id=puzzle_id)
 
     def export_log_file(self, script_path: str, open_file: bool = True, puzzle_id: Optional[str] = None):
         """Export an exact script log path, including a named Track log."""

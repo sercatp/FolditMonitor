@@ -11,17 +11,9 @@ python3.13 "Foldit Monitor.pyw"
 Homebrew Python may require the matching Tk formula, for example
 `brew install python-tk@3.13`.
 
-Foldit Monitor discovers the executable inside `Foldit.app`, but reads script
-logs and puzzle data from `Foldit.app/Contents/Resources`. **New Client** first
-launches an installation that is not already running. Only when every
-discovered installation is in use does it start another instance of a running
-bundle with `open -n`.
+Foldit Monitor discovers the executable inside `Foldit.app`, but reads script logs and puzzle data from `Foldit.app/Contents/Resources`. **New Client** first launches an installation that is not already running. Only when every discovered installation is in use does it start another instance of a running bundle with `open -n`.
 
-Window titles can be unavailable until Screen Recording access is granted to
-the terminal or Python host that runs the monitor. This permission is optional:
-process discovery, log ownership detection, score/script monitoring, and
-application activation continue to work without a title. Puzzle statistics
-require a puzzle id from either the window title or the optional JSON fallback.
+Window titles can be unavailable until Screen Recording access is granted to the terminal or Python host that runs the monitor. This permission is optional: process discovery, log ownership detection, score/script monitoring, and application activation continue to work without a title. Puzzle statistics require a puzzle id from either the window title or the optional JSON fallback.
 
 Accessibility permission is not used by this version.
 
@@ -39,8 +31,9 @@ version. `requirements.txt` therefore skips pygame automatically on Python
 
 Several Foldit processes can run from the same `Foldit.app` while using
 different Tracks. Foldit Monitor normally detects this automatically: it
-inspects the script-log files opened by each process and associates every PID
-with its exact `scriptlog.<track>.xml` file.
+periodically runs one batched `lsof` query for all Foldit PIDs, then associates
+every PID with its exact open `scriptlog.<track>.xml` file. It does not scan the
+Resources directory for this mapping and does not start one resolver per PID.
 
 When several processes use different Tracks in one bundle, save copying
 addresses the exact `puzzles/<puzzle>/<user>/<track>` directory. Copying between
