@@ -16,7 +16,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Un
 from savefile_api import FolditSaveSummary, get_save_summary
 
 
-INDEX_SCHEMA_VERSION = 3
+INDEX_SCHEMA_VERSION = 4
 ACTIVE_PUZZLE_RE = re.compile(rb"Loading puzzle\s+(\d+)", re.IGNORECASE)
 PUZZLE_MAP_FIELDS = ("public_id", "internal_id", "source", "first_seen", "last_verified")
 

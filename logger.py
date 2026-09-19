@@ -71,6 +71,41 @@ class FolditLogHandler:
             handler = self.current_handlers.get(file_path)
         return handler.get_data() if handler else None
 
+    def get_display_data(self, file_path: str) -> Optional[dict]:
+        """Return live data, or a read-only snapshot of an interrupted source."""
+        data = self.get_data(file_path)
+        if data is not None:
+            return data
+
+        marker_path = os.path.abspath(str(file_path))
+        with self.lock:
+            interrupted = dict(self.interrupted_exports.get(marker_path, {}))
+
+        if not interrupted or not str(interrupted.get("script", "")).strip():
+            return None
+
+        # Stop showing the archived snapshot as soon as Foldit replaces or changes
+        # the raw log. The next monitor pass will attach a live handler to it.
+        try:
+            source_key = self._source_stat_key(os.stat(marker_path))
+        except OSError:
+            return None
+        if interrupted.get("source_key") != source_key:
+            return None
+
+        return {
+            "script_name": "",
+            "script_type": str(interrupted.get("script", "")).strip(),
+            "highest_score": interrupted.get("score"),
+            "script_column_number": 0,
+            "script_change_token": interrupted.get("run_token", 0),
+            "run_open": False,
+            "last_log_lines": list(interrupted.get("last_log_lines", ())),
+            "script_state_snapshot": None,
+            "stats_snapshot": None,
+            "interrupted": True,
+        }
+
     def consume_stats_events(self, file_path: str) -> List[dict]:
         with self.lock:
             handler = self.current_handlers.get(file_path)
@@ -245,6 +280,7 @@ class FolditLogHandler:
             "export_path": export_path,
             "script": str(data.get("script_type", "")).strip(),
             "score": data.get("highest_score"),
+            "last_log_lines": list(data.get("last_log_lines", ())),
         }
         old_partial_path = None
         with self.lock:

@@ -167,11 +167,12 @@ class FolditSpeedBoostIntegration:
         self._closed = True
         self.manager.abandon_all()
 
-    def select_profile(self, profile_name: str) -> None:
+    def select_profile(self, profile_name: str, *, persist: bool = True) -> None:
         if profile_name not in self.settings_manager.SPEED_BOOST_PROFILES:
             return
         timing = self._timing_for_profile(profile_name)
-        self.settings_manager.save_speed_boost_profile(profile_name)
+        if persist:
+            self.settings_manager.save_speed_boost_profile(profile_name)
         self.profile_var.set(profile_name)
         with self._lock:
             self._pending_profile = (profile_name, timing)

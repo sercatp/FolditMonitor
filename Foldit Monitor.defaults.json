@@ -1,4 +1,8 @@
 {
+  "check_interval": 2,
+  "monitor_duration": 60,
+  "high_cpu_threshold": 60,
+  "low_cpu_threshold": 7,
   "launch": {
     "last_seen_foldit_parent": ""
   },
@@ -53,6 +57,10 @@
       "Remaining time:",
       "ignore other score string"
     ],
+    "score_patterns": [
+      "\\b\\d{4,6}\\.\\d+\\b",
+      "\\b\\d{4,6}\\b"
+    ],
     "logs_folder": "puzzle_logs",
     "stats_save_interval_minutes": 30,
     "stats_score_decimals": 0,
@@ -71,6 +79,12 @@
   "speed_boost": {
     "enabled": false,
     "profile": "fast",
+    "profiles": {
+      "fastest": {"label": "Fastest", "replacement_sleep_ms": 1, "timer_resolution_ms": 1},
+      "fast": {"label": "Fast", "replacement_sleep_ms": 2, "timer_resolution_ms": 2},
+      "medium": {"label": "Medium", "replacement_sleep_ms": 5, "timer_resolution_ms": 3},
+      "slower": {"label": "Slower", "replacement_sleep_ms": 15, "timer_resolution_ms": 5}
+    },
     "offsets": [
       "0xDB729B",
       "0xE729B9"

@@ -10,7 +10,7 @@ numpy>=1.26
 # The speed boost targets Windows' game_library.dll and is optional.
 frida==17.15.4; sys_platform == "win32"
 
-# Native window integration; pip installs only the entry for the current OS.
+# Native process/window integration for the current platform.
 pywin32>=306; sys_platform == "win32"
 keyboard>=0.13.5; sys_platform == "win32"
 python-xlib>=0.33; sys_platform == "linux"

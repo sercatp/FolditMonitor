@@ -174,6 +174,18 @@ class SaveManagerWindowQt(QMainWindow):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
 
+        puzzle_row = QHBoxLayout()
+        puzzle_row.setSpacing(4)
+        puzzle_row.addWidget(QLabel("Puzzle:", central))
+        self.puzzle_selector = QComboBox(central)
+        self.puzzle_selector.setMinimumWidth(90)
+        self.puzzle_selector.setToolTip("Choose a puzzle active in a running client")
+        self.puzzle_selector.activated.connect(self._on_puzzle_selected)
+        puzzle_row.addWidget(self.puzzle_selector)
+        puzzle_row.addWidget(QLabel("Clients below show saves for the selected puzzle.", central))
+        puzzle_row.addStretch(1)
+        layout.addLayout(puzzle_row)
+
         toolbar = QHBoxLayout()
         toolbar.setSpacing(4)
         toolbar.addWidget(QLabel("Name:", central))
@@ -197,7 +209,7 @@ class SaveManagerWindowQt(QMainWindow):
         self.clear_button.clicked.connect(self._clear_filters)
         toolbar.addWidget(self.clear_button)
         self.include_quick_auto = QCheckBox("Include quick/auto saves", central)
-        self.include_quick_auto.setChecked(False)
+        self.include_quick_auto.setChecked(True)
         self.include_quick_auto.toggled.connect(lambda _checked: self.refresh(False))
         toolbar.addWidget(self.include_quick_auto)
         toolbar.addStretch(1)
@@ -297,6 +309,26 @@ class SaveManagerWindowQt(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def _on_puzzle_selected(self, index: int):
+        puzzle_id = self.puzzle_selector.itemText(index).strip()
+        if puzzle_id and puzzle_id != self.puzzle_id:
+            self.open_context(puzzle_id, None, "all")
+
+    def _refresh_puzzle_selector(self):
+        puzzle_ids = {self.puzzle_id}
+        puzzle_ids.update(
+            client.active_puzzle_id
+            for client in self.clients
+            if client.running and client.active_puzzle_id
+        )
+        ordered = sorted((puzzle_id for puzzle_id in puzzle_ids if puzzle_id), key=_natural_key)
+        self.puzzle_selector.blockSignals(True)
+        if [self.puzzle_selector.itemText(index) for index in range(self.puzzle_selector.count())] != ordered:
+            self.puzzle_selector.clear()
+            self.puzzle_selector.addItems(ordered)
+        self.puzzle_selector.setCurrentIndex(self.puzzle_selector.findText(self.puzzle_id))
+        self.puzzle_selector.blockSignals(False)
+
     def refresh(self, force_error_retry: bool = False):
         if self._closed:
             return
@@ -321,6 +353,7 @@ class SaveManagerWindowQt(QMainWindow):
         self.clients = sorted(unique.values(), key=lambda client: _natural_key(client.name))
         self.clients_by_path = {normalize_path(client.path): client for client in self.clients}
         self.records_by_client = {normalize_path(client.path): [] for client in self.clients}
+        self._refresh_puzzle_selector()
         self.generation += 1
         generation = self.generation
         self.pending_metadata.clear()

@@ -103,6 +103,107 @@ def make_stats_manager(temp_dir: str, script_type_mapping=None, score_decimals: 
 MONITOR_SOURCE_PATH = Path(__file__).resolve().parents[1] / "Foldit Monitor.pyw"
 
 
+class MonitorStartupLayoutCases(unittest.TestCase):
+    def test_empty_monitor_initializes_layout_before_first_refresh(self):
+        source = MONITOR_SOURCE_PATH.read_text(encoding="utf-8-sig")
+        module = ast.parse(source, filename=str(MONITOR_SOURCE_PATH))
+        top_level_calls = {
+            node.value.func.id: node.lineno
+            for node in module.body
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id in {
+                "adjust_column_widths",
+                "adjust_window_size",
+                "schedule_update",
+            }
+        }
+
+        self.assertLess(top_level_calls["adjust_column_widths"], top_level_calls["schedule_update"])
+        self.assertLess(top_level_calls["adjust_window_size"], top_level_calls["schedule_update"])
+
+    def test_empty_monitor_size_includes_button_bar(self):
+        source = MONITOR_SOURCE_PATH.read_text(encoding="utf-8-sig")
+        module = ast.parse(source, filename=str(MONITOR_SOURCE_PATH))
+        function_node = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef) and node.name == "adjust_window_size"
+        )
+
+        class FakeFont:
+            @staticmethod
+            def metrics():
+                return {"linespace": 20}
+
+        class FakeRoot:
+            def __init__(self):
+                self.geometry_value = None
+
+            @staticmethod
+            def winfo_screenheight():
+                return 2160
+
+            def geometry(self, value):
+                self.geometry_value = value
+
+            @staticmethod
+            def after(_delay, _callback):
+                return None
+
+        class FakeTree:
+            height = None
+
+            @staticmethod
+            def get_children():
+                return ()
+
+            def configure(self, **kwargs):
+                self.height = kwargs.get("height")
+
+            @staticmethod
+            def winfo_reqwidth():
+                return 180
+
+        class FakeButtonFrame:
+            @staticmethod
+            def winfo_reqheight():
+                return 32
+
+            @staticmethod
+            def winfo_reqwidth():
+                return 330
+
+        class FakeStyle:
+            @staticmethod
+            def configure(*_args, **_kwargs):
+                return None
+
+        root = FakeRoot()
+        process_tree = FakeTree()
+        namespace = {
+            "__builtins__": __builtins__,
+            "root": root,
+            "process_tree": process_tree,
+            "button_frame": FakeButtonFrame(),
+            "normal_font": FakeFont(),
+            "bold_font": FakeFont(),
+            "italic_font": FakeFont(),
+            "bold_italic_font": FakeFont(),
+            "ttk": SimpleNamespace(Style=FakeStyle),
+        }
+        exec(
+            compile(ast.Module(body=[function_node], type_ignores=[]), str(MONITOR_SOURCE_PATH), "exec"),
+            namespace,
+        )
+
+        namespace["adjust_window_size"]()
+
+        self.assertEqual(process_tree.height, 1)
+        self.assertEqual(root.geometry_value, "334x83")
+
+
 def build_check_client_changes_function():
     source = MONITOR_SOURCE_PATH.read_text(encoding="utf-8-sig")
     module = ast.parse(source, filename=str(MONITOR_SOURCE_PATH))
@@ -857,6 +958,35 @@ class ManagedLogExportCases(unittest.TestCase):
             self.assertEqual(Path(first_path).read_text(encoding="utf-8"), DRW_OPEN)
             self.assertEqual(len(list(Path(temp_dir).glob("*.interrupted.txt"))), 1)
 
+    def test_interrupted_log_remains_available_as_read_only_display_data(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = os.path.join(temp_dir, "scriptlog.default.xml")
+            write_windows_text(script_path, DRW_OPEN)
+            old_mtime = time.time() - 60
+            os.utime(script_path, (old_mtime, old_mtime))
+            log_handler = FolditLogHandler(make_logger_settings())
+
+            interrupted_path = log_handler.recover_interrupted_log_file(
+                script_path,
+                process_create_time=old_mtime + 30,
+                puzzle_id="1234",
+            )
+            display_data = log_handler.get_display_data(script_path)
+
+            self.assertIsNotNone(interrupted_path)
+            self.assertIsNone(log_handler.get_data(script_path))
+            self.assertEqual(log_handler.current_handlers, {})
+            self.assertEqual(display_data["script_type"], "DRW")
+            self.assertEqual(display_data["highest_score"], 4299.941)
+            self.assertFalse(display_data["run_open"])
+            self.assertTrue(display_data["interrupted"])
+            self.assertTrue(display_data["last_log_lines"])
+            self.assertIn(
+                "Starting score 4299.941",
+                display_data["last_log_lines"][-1][1],
+            )
+            self.assertEqual(log_handler.consume_stats_events(script_path), [])
+
     def test_interrupted_name_puts_collision_number_after_status(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             script_path = os.path.join(temp_dir, "scriptlog.default.xml")
@@ -916,10 +1046,19 @@ class ManagedLogExportCases(unittest.TestCase):
                 process_create_time=old_mtime + 30,
                 puzzle_id="1234",
             )
+            self.assertEqual(
+                log_handler.get_display_data(script_path)["highest_score"],
+                4299.941,
+            )
 
             write_windows_text(script_path, DRW_OPEN.replace("4299.941", "4305.000"))
+            self.assertIsNone(log_handler.get_display_data(script_path))
             handler = log_handler.start_monitoring(script_path)
             try:
+                self.assertEqual(
+                    log_handler.get_display_data(script_path)["highest_score"],
+                    4305.0,
+                )
                 self.assertEqual(
                     handler.consume_stats_events(),
                     [{"kind": "start", "script": "DRW", "score": 4305.0}],

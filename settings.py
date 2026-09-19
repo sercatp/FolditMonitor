@@ -4,8 +4,15 @@ import re
 import sys
 import tempfile
 import threading
+import shutil
 from copy import deepcopy
 from typing import Dict, Any, Optional
+
+from settings_validation import SettingsValidationError, validate_settings
+
+
+RESET_TO_DEFAULT = object()
+_MISSING = object()
 
 
 # User-selectable Foldit Speed Boost profiles and the public fallback offsets.
@@ -66,6 +73,9 @@ class Settings:
             "Foldit Monitor.defaults.json",
         )
         self.user_settings: Dict[str, Any] = {}
+        self.load_error = ""
+        self._editor_main_position_override = False
+        self._editor_stats_position_override = False
         self.non_merged_paths = {('script_type_mapping',)}
         
         # Default constants
@@ -360,6 +370,7 @@ class Settings:
                 "max_lines": self.MAX_LINES,
                 "script_exclusions": self.SCRIPT_EXCLUSIONS,
                 "exclude_score_strings": self.EXCLUSION_CRITERIA,
+                "score_patterns": [pattern.pattern for pattern in self.SCORE_PATTERNS],
                 "logs_folder": "puzzle_logs",
                 "stats_save_interval_minutes": 30,
                 "stats_score_decimals": 0,
@@ -378,9 +389,14 @@ class Settings:
             "speed_boost": {
                 "enabled": False,
                 "profile": self.DEFAULT_SPEED_BOOST_PROFILE,
+                "profiles": deepcopy(self.SPEED_BOOST_PROFILES),
                 "offsets": list(self.DEFAULT_SPEED_BOOST_OFFSETS),
             },
-            "script_type_mapping": self.SCRIPT_TYPE_MAPPING
+            "script_type_mapping": self.SCRIPT_TYPE_MAPPING,
+            "check_interval": self.CHECK_INTERVAL,
+            "monitor_duration": self.MONITOR_DURATION,
+            "high_cpu_threshold": self.HIGH_CPU_THRESHOLD,
+            "low_cpu_threshold": self.LOW_CPU_THRESHOLD,
         }
 
     def load_settings(self) -> Dict[str, Any]:
@@ -401,10 +417,16 @@ class Settings:
                 self.user_settings = deepcopy(default_settings)
                 should_initialize_file = True
 
-        except Exception as e:
-            print(f"Error handling settings file: {e}")
+        except (OSError, ValueError, TypeError) as e:
+            self.load_error = f"Could not load settings file: {e}"
+            print(self.load_error)
             self.user_settings = deepcopy(default_settings)
-            should_initialize_file = True
+            should_initialize_file = False
+
+        if self.load_error:
+            effective_settings = deepcopy(self.user_settings)
+            self._apply_display_palette(effective_settings)
+            return effective_settings
 
         should_initialize_file = self._migrate_stats_ui_backend_setting() or should_initialize_file
         should_initialize_file = (
@@ -520,7 +542,10 @@ class Settings:
 
         current = self.user_settings.get("speed_boost")
         if current is None:
-            self.user_settings["speed_boost"] = deepcopy(default_speed_boost)
+            self.user_settings["speed_boost"] = {
+                key: deepcopy(default_speed_boost[key])
+                for key in ("enabled", "profile", "offsets")
+            }
             return True
         if not isinstance(current, dict):
             return False
@@ -567,8 +592,132 @@ class Settings:
             current = current[key]
         return current
 
+    @staticmethod
+    def _value_or_missing(settings_dict: Dict[str, Any], path: tuple[str, ...]):
+        current = settings_dict
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                return _MISSING
+            current = current[key]
+        return current
+
+    @staticmethod
+    def _delete_nested_value(settings_dict: Dict[str, Any], path: tuple[str, ...]) -> None:
+        current = settings_dict
+        for key in path[:-1]:
+            current = current.get(key)
+            if not isinstance(current, dict):
+                return
+        current.pop(path[-1], None)
+
+    def get_editor_snapshot(self):
+        """Return separate default, user, and effective settings for the GUI."""
+        if self.load_error:
+            raise SettingsValidationError(self.load_error)
+        with self._settings_lock:
+            defaults = self.get_default_settings()
+            if os.path.exists(self.settings_file):
+                try:
+                    with open(self.settings_file, "r", encoding="utf-8") as handle:
+                        user = json.load(handle)
+                except (OSError, ValueError) as error:
+                    raise SettingsValidationError(f"Cannot read settings file: {error}") from error
+                if not isinstance(user, dict):
+                    raise SettingsValidationError("Settings file root must be an object")
+            else:
+                user = {}
+            effective = deepcopy(user)
+            self._apply_defaults(effective, defaults)
+            self._apply_display_palette(effective)
+            return deepcopy(defaults), deepcopy(user), effective
+
+    def save_editor_changes(self, changes, baseline_user):
+        """Validate and commit only edited paths, refusing overlapping disk edits.
+
+        A value of RESET_TO_DEFAULT removes the local override. Other disk keys,
+        including unknown keys and automatic window-state writes, survive.
+        """
+        if not isinstance(baseline_user, dict):
+            raise SettingsValidationError("Invalid editor baseline")
+        normalized = {tuple(path): value for path, value in changes.items()}
+        if not normalized:
+            return self.get_editor_snapshot()[2]
+        if any(not path or any(not isinstance(key, str) for key in path) for path in normalized):
+            raise SettingsValidationError("Invalid setting path")
+        with self._settings_lock:
+            defaults, current_user, _ = self.get_editor_snapshot()
+            for path in normalized:
+                before = self._value_or_missing(baseline_user, path)
+                now = self._value_or_missing(current_user, path)
+                if (before is _MISSING) != (now is _MISSING) or (
+                    before is not _MISSING and before != now
+                ):
+                    raise SettingsValidationError(
+                        "This setting changed on disk while the window was open: "
+                        + ".".join(path)
+                        + ". Reopen settings and try again."
+                    )
+            updated_user = deepcopy(current_user)
+            for path, value in normalized.items():
+                if value is RESET_TO_DEFAULT:
+                    self._delete_nested_value(updated_user, path)
+                else:
+                    self._set_nested_value(updated_user, path, deepcopy(value))
+            effective = deepcopy(updated_user)
+            self._apply_defaults(effective, defaults)
+            self._apply_display_palette(effective)
+            validate_settings(effective)
+
+            backup_path = self.settings_file + ".pre-settings-gui.bak"
+            if os.path.exists(self.settings_file) and not os.path.exists(backup_path):
+                shutil.copy2(self.settings_file, backup_path)
+            previous_user = self.user_settings
+            try:
+                self.user_settings = updated_user
+                self._save_user_settings()
+            except Exception:
+                self.user_settings = previous_user
+                raise
+            if any(path[:2] == ('display', 'window_position') for path in normalized):
+                self._editor_main_position_override = True
+            if any(path[:2] == ('display', 'stats_window_position') for path in normalized):
+                self._editor_stats_position_override = True
+            return effective
+
+    def apply_live_editor_settings(self, effective, changed_paths):
+        """Refresh only settings whose consumers can safely update in place."""
+        live = {
+            ('display', 'active_palette'),
+            ('display', 'row_appearance'),
+            ('display', 'always_on_top'),
+            ('sound', 'volume'),
+            ('speed_boost', 'profile'),
+        }
+        with self._settings_lock:
+            changed = set(changed_paths) & live
+            for path in changed:
+                self._set_nested_value(self.settings, path, deepcopy(self._get_nested_value(effective, path)))
+            if changed & {('display', 'active_palette'), ('display', 'row_appearance')}:
+                self._apply_display_palette(self.settings)
+                self.ACTIVE_DISPLAY_PALETTE = self.settings['display']['active_palette']
+                self.ROW_APPEARANCE = deepcopy(self.settings['display']['row_appearance'])
+                self.active_display_palette = self.ACTIVE_DISPLAY_PALETTE
+                self.row_appearance = self.ROW_APPEARANCE
+            if ('display', 'always_on_top') in changed:
+                self.ALWAYS_ON_TOP = self.settings['display']['always_on_top']
+                self.always_on_top = self.ALWAYS_ON_TOP
+            if ('sound', 'volume') in changed:
+                self.VOLUME = self.settings['sound']['volume']
+                self.volume = self.VOLUME
+            if ('speed_boost', 'profile') in changed:
+                self.SPEED_BOOST_PROFILE = self.settings['speed_boost']['profile']
+            return changed
+
     def _save_user_settings(self, changed_paths=()):
         """Atomically persist settings while preserving unrelated disk edits."""
+        if self.load_error:
+            print(f"Settings not saved: {self.load_error}")
+            return
         normalized_paths = tuple(tuple(path) for path in changed_paths)
         with self._settings_lock:
             settings_to_write = deepcopy(self.user_settings)
@@ -579,7 +728,8 @@ class Settings:
                     if not isinstance(latest_settings, dict):
                         raise ValueError("Settings file root must be a JSON object.")
                 except (OSError, ValueError, json.JSONDecodeError) as error:
-                    print(f"Could not merge current settings file: {error}")
+                    print(f"Current settings file cannot be read; it was not overwritten: {error}")
+                    return
                 else:
                     for path in normalized_paths:
                         value = deepcopy(self._get_nested_value(settings_to_write, path))
@@ -642,6 +792,21 @@ class Settings:
         self.BACKUP_FOLDER_NAME = self.settings['backup']['folder_name']
         self.SAVE_TO_BACKUP = self.settings['backup']['save_to_backup']
         self.SCRIPT_TYPE_MAPPING = self.settings['script_type_mapping']
+        try:
+            self.SCORE_PATTERNS = [
+                re.compile(pattern)
+                for pattern in self.settings['logging'].get(
+                    'score_patterns', [item.pattern for item in self.SCORE_PATTERNS]
+                )
+            ]
+            if not self.SCORE_PATTERNS:
+                raise ValueError("score_patterns must not be empty")
+        except (TypeError, ValueError, re.error) as error:
+            print(f"Invalid score_patterns; using built-in patterns: {error}")
+            self.SCORE_PATTERNS = [
+                re.compile(r'\b\d{4,6}\.\d+\b'),
+                re.compile(r'\b\d{4,6}\b'),
+            ]
         self.sound_file = self._resolve_runtime_or_bundled_file(
             self.settings['sound']['alert_file']
         )
@@ -650,6 +815,17 @@ class Settings:
         self.STATS_UI_BACKEND = self.settings['display'].get('stats_ui_backend', self.STATS_UI_BACKEND)
         self.STATS_LAST_PUZZLE = str(self.settings['display'].get('stats_last_puzzle', self.STATS_LAST_PUZZLE)).strip()
         speed_boost_settings = self.settings.get('speed_boost', {})
+        configured_profiles = speed_boost_settings.get('profiles', {}) if isinstance(speed_boost_settings, dict) else {}
+        if isinstance(configured_profiles, dict) and all(
+            isinstance(profile, dict)
+            and isinstance(profile.get('replacement_sleep_ms'), int)
+            and profile['replacement_sleep_ms'] > 0
+            and isinstance(profile.get('timer_resolution_ms'), int)
+            and profile['timer_resolution_ms'] > 0
+            and isinstance(profile.get('label'), str)
+            for profile in configured_profiles.values()
+        ) and configured_profiles:
+            self.SPEED_BOOST_PROFILES = deepcopy(configured_profiles)
         self.SPEED_BOOST_CONFIG_ERROR = ""
         if not isinstance(speed_boost_settings, dict):
             self.SPEED_BOOST_ENABLED = False
@@ -714,6 +890,8 @@ class Settings:
 
     def save_window_position(self, x: int, y: int):
         """Save the window position in the settings."""
+        if self._editor_main_position_override:
+            return
         self._set_nested_value(self.settings, ('display', 'window_position', 'x'), x)
         self._set_nested_value(self.settings, ('display', 'window_position', 'y'), y)
         self._set_nested_value(self.user_settings, ('display', 'window_position', 'x'), x)
@@ -725,6 +903,8 @@ class Settings:
 
     def save_stats_window_position(self, x: int, y: int):
         """Saves stats window position in settings."""
+        if self._editor_stats_position_override:
+            return
         self._set_nested_value(self.settings, ('display', 'stats_window_position', 'x'), x)
         self._set_nested_value(self.settings, ('display', 'stats_window_position', 'y'), y)
         self._set_nested_value(self.user_settings, ('display', 'stats_window_position', 'x'), x)
@@ -738,11 +918,12 @@ class Settings:
         """Persist the selected display palette and refresh effective settings."""
         normalized_name = self._normalize_display_palette(palette_name)
         self._set_nested_value(self.user_settings, ('display', 'active_palette'), normalized_name)
-
-        self.settings = deepcopy(self.user_settings)
-        self._apply_defaults(self.settings, self.get_default_settings())
+        self._set_nested_value(self.settings, ('display', 'active_palette'), normalized_name)
         self._apply_display_palette(self.settings)
-        self.update_globals()
+        self.ACTIVE_DISPLAY_PALETTE = self.settings['display']['active_palette']
+        self.ROW_APPEARANCE = deepcopy(self.settings['display']['row_appearance'])
+        self.active_display_palette = self.ACTIVE_DISPLAY_PALETTE
+        self.row_appearance = self.ROW_APPEARANCE
         self._save_user_settings((('display', 'active_palette'),))
 
     def save_last_seen_foldit_parent(self, folder_path: str):
@@ -792,3 +973,12 @@ class Settings:
         self._set_nested_value(self.settings, ('network', 'auto_reconnect'), clean_value)
         self._set_nested_value(self.user_settings, ('network', 'auto_reconnect'), clean_value)
         self._save_user_settings((('network', 'auto_reconnect'),))
+
+    def save_always_on_top(self, value: bool):
+        """Persist the existing context-menu preference."""
+        clean_value = bool(value)
+        self._set_nested_value(self.settings, ('display', 'always_on_top'), clean_value)
+        self._set_nested_value(self.user_settings, ('display', 'always_on_top'), clean_value)
+        self.ALWAYS_ON_TOP = clean_value
+        self.always_on_top = clean_value
+        self._save_user_settings((('display', 'always_on_top'),))

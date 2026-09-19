@@ -46,12 +46,14 @@ If you do not want to install Python, open [the latest release](https://github.c
 
 Foldit Monitor starts with the bundled [default profile](Foldit%20Monitor.defaults.json), then creates a separate local `Foldit Monitor.json`. That local file keeps window positions, paths, last-used puzzle data, and connections; it is intentionally not part of the repository.
 
+Right-click the main window and choose **Settings…** to edit the local settings. The dialog validates changes before saving them; some settings take effect after a restart.
+
 The app also creates `logs/`, `puzzle_logs/`, and `foldit_backup/` when needed. These are local working folders and can be kept or removed without changing the source code.
 
 ## Main files
 
 - `Foldit Monitor.pyw` — main application.
-- `settings.py` — default and local settings.
+- `settings.py`, `settings_ui.py`, `settings_validation.py` — default and local settings, the editor, and validation.
 - `network.py` — local-network synchronisation and artifact transfer.
 - `stats_*.py`, `logger.py`, `log_lookup.py` — score/log parsing and the statistics UI.
 - `save_catalog.py`, `save_manager_qt.py`, `savefile_api.py` — indexed save-file browsing and export.

@@ -11,6 +11,7 @@ env/
 # Local runtime settings and generated data.
 # Foldit Monitor.defaults.json is the tracked first-run profile.
 Foldit Monitor.json
+Foldit Monitor.json.*
 logs/
 puzzle_logs/
 foldit_backup/

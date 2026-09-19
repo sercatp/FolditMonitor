@@ -665,21 +665,7 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
         self.save_manager_handler = save_manager_handler
 
         display_settings = self.settings.get("display", {})
-        row_appearance = display_settings.get("row_appearance", {})
-        if not isinstance(row_appearance, dict):
-            row_appearance = {}
-        copy_source_appearance = row_appearance.get("copy_source", {})
-        idle_appearance = row_appearance.get("idle", {})
-        if not isinstance(copy_source_appearance, dict):
-            copy_source_appearance = {}
-        if not isinstance(idle_appearance, dict):
-            idle_appearance = {}
-        self.selected_main_background_color = str(
-            copy_source_appearance.get("background", "#dbeafe")
-        )
-        self.idle_main_background_color = str(idle_appearance.get("background", "#f3f4f6"))
-        self.idle_header_background_color = str(idle_appearance.get("background", "#f3f4f6"))
-        self.idle_main_foreground_color = str(idle_appearance.get("foreground", "#6b7280"))
+        self._load_palette_colors(display_settings)
 
         self.clients: List[str] = []
         self.selected_client: Optional[str] = None
@@ -748,6 +734,29 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
 
         self.show()
         self.focus_window()
+
+    def _load_palette_colors(self, display_settings):
+        row_appearance = display_settings.get("row_appearance", {})
+        if not isinstance(row_appearance, dict):
+            row_appearance = {}
+        copy_source_appearance = row_appearance.get("copy_source", {})
+        idle_appearance = row_appearance.get("idle", {})
+        if not isinstance(copy_source_appearance, dict):
+            copy_source_appearance = {}
+        if not isinstance(idle_appearance, dict):
+            idle_appearance = {}
+        self.selected_main_background_color = str(
+            copy_source_appearance.get("background", "#dbeafe")
+        )
+        self.idle_main_background_color = str(idle_appearance.get("background", "#f3f4f6"))
+        self.idle_header_background_color = str(idle_appearance.get("background", "#f3f4f6"))
+        self.idle_main_foreground_color = str(idle_appearance.get("foreground", "#6b7280"))
+
+    def apply_display_palette_from_settings(self):
+        """Repaint an open stats window without discarding unsaved edits."""
+        self._load_palette_colors(self.settings.get("display", {}))
+        self.main_table.model().refresh()
+        self.fin_table.model().refresh()
 
     def _build_ui(self):
         central = QWidget(self)

@@ -69,6 +69,17 @@ from typing import Dict, List, Optional, Tuple, Union
 PathLike = Union[str, Path]
 MAX_RESIDUES = 10000
 COORD_ABS_MAX = 500.0
+ENERGY_SUM_REL_TOLERANCE = 1e-12
+ENERGY_SUM_ULP_MULTIPLIER = 8
+
+# Variant D has no stored total with which to validate its array.  Keep its
+# accepted numeric range deliberately broad, but finite enough that arbitrary
+# coordinate/string bytes cannot turn into a gigantic yet technically finite
+# Foldit score.
+WEAK_ENERGY_COMPONENT_ABS_MAX = 1e12
+WEAK_ENERGY_TOTAL_ABS_MAX = MAX_RESIDUES * WEAK_ENERGY_COMPONENT_ABS_MAX
+MAX_ENERGY_SEARCH_BYTES = 64 * 1024
+ADAPTIVE_ENERGY_SEARCH_BYTES = 512
 
 
 ATOM_MAP = {
@@ -226,7 +237,60 @@ def clamp(n: int, lo: int, hi: int) -> int:
 
 
 def is_plausible_residue_count(n: int) -> bool:
-    return 2 <= n <= MAX_RESIDUES
+    return 1 <= n <= MAX_RESIDUES
+
+
+def _sum_energy_values(values: List[float]) -> Optional[float]:
+    """Return a stable finite sum, or None for unusable numeric data."""
+    try:
+        total = math.fsum(values)
+    except (OverflowError, ValueError):
+        return None
+    return total if math.isfinite(total) else None
+
+
+def _stored_energy_matches(values: List[float], energy: float) -> bool:
+    """Validate a structured energy array against its independently stored total."""
+    if not math.isfinite(energy) or not values:
+        return False
+    if any(not math.isfinite(value) for value in values):
+        return False
+
+    calculated = _sum_energy_values(values)
+    if calculated is None:
+        return False
+
+    # An all-zero region is a common false positive in binary formats.  A
+    # non-zero array whose terms genuinely cancel to zero remains valid.
+    if energy == 0.0 and not any(value != 0.0 for value in values):
+        return False
+
+    try:
+        absolute_sum = math.fsum(abs(value) for value in values)
+    except (OverflowError, ValueError):
+        return False
+    if not math.isfinite(absolute_sum):
+        return False
+
+    magnitude = max(abs(calculated), abs(energy), absolute_sum)
+    relative_tolerance = ENERGY_SUM_REL_TOLERANCE * magnitude
+    rounding_tolerance = (
+        math.ulp(magnitude) * max(ENERGY_SUM_ULP_MULTIPLIER, len(values))
+    )
+    tolerance = max(relative_tolerance, rounding_tolerance)
+    return abs(calculated - energy) <= tolerance
+
+
+def _ordered_tag_positions(
+    positions: List[int],
+    prefer_after: Optional[int],
+) -> List[int]:
+    if prefer_after is None:
+        return positions
+    return (
+        [position for position in positions if position >= prefer_after]
+        + [position for position in positions if position < prefer_after]
+    )
 
 
 def find_tagged_string(
@@ -245,34 +309,27 @@ def find_tagged_string(
     if not positions:
         return None
 
-    chosen = None
-    if prefer_after is not None:
-        for pos in positions:
-            if pos >= prefer_after:
-                chosen = pos
-                break
-    if chosen is None:
-        chosen = positions[0]
+    for chosen in _ordered_tag_positions(positions, prefer_after):
+        length = u32(data, chosen + 4)
+        if length is None:
+            continue
+        if length > 2_000_000 or chosen + 8 + length > len(data):
+            continue
 
-    length = u32(data, chosen + 4)
-    if length is None:
-        return None
-    if length > 2_000_000 or chosen + 8 + length > len(data):
-        return None
+        payload_bytes = data[chosen + 8 : chosen + 8 + length]
+        try:
+            payload = payload_bytes.decode("ascii")
+        except UnicodeDecodeError:
+            payload = payload_bytes.decode("utf-8", errors="replace")
 
-    payload_bytes = data[chosen + 8 : chosen + 8 + length]
-    try:
-        payload = payload_bytes.decode("ascii")
-    except UnicodeDecodeError:
-        payload = payload_bytes.decode("utf-8", errors="replace")
-
-    return TaggedString(
-        tag=tag.decode("ascii", errors="replace"),
-        tag_off=chosen,
-        strlen=length,
-        payload_off=chosen + 8,
-        payload=payload,
-    )
+        return TaggedString(
+            tag=tag.decode("ascii", errors="replace"),
+            tag_off=chosen,
+            strlen=length,
+            payload_off=chosen + 8,
+            payload=payload,
+        )
+    return None
 
 
 def find_resi_tag(data: bytes, prefer_after: Optional[int] = None) -> Optional[ResiTag]:
@@ -287,20 +344,12 @@ def find_resi_tag(data: bytes, prefer_after: Optional[int] = None) -> Optional[R
     if not positions:
         return None
 
-    chosen = None
-    if prefer_after is not None:
-        for pos in positions:
-            if pos >= prefer_after:
-                chosen = pos
-                break
-    if chosen is None:
-        chosen = positions[0]
-
-    count = u32(data, chosen + 4)
-    if count is None or not is_plausible_residue_count(count):
-        return None
-
-    return ResiTag(tag_off=chosen, count=count)
+    for chosen in _ordered_tag_positions(positions, prefer_after):
+        count = u32(data, chosen + 4)
+        if count is None or not is_plausible_residue_count(count):
+            continue
+        return ResiTag(tag_off=chosen, count=count)
+    return None
 
 
 def try_energy_variant_a(
@@ -328,7 +377,7 @@ def try_energy_variant_a(
     if any(v is None or not math.isfinite(v) for v in values):
         return None
     per_residue = [float(v) for v in values if v is not None]
-    if abs(sum(per_residue) - energy) > 1e-6 or abs(energy) < 1.0:
+    if not _stored_energy_matches(per_residue, energy):
         return None
 
     return EnergyBlock(
@@ -374,7 +423,7 @@ def try_energy_variant_b(
     if any(v is None or not math.isfinite(v) for v in values):
         return None
     per_residue = [float(v) for v in values if v is not None]
-    if abs(sum(per_residue) - energy) > 1e-6 or abs(energy) < 1.0:
+    if not _stored_energy_matches(per_residue, energy):
         return None
 
     return EnergyBlock(
@@ -415,7 +464,7 @@ def try_energy_variant_c(
     if any(v is None or not math.isfinite(v) for v in values):
         return None
     per_residue = [float(v) for v in values if v is not None]
-    if abs(sum(per_residue) - energy) > 1e-6 or abs(energy) < 1.0:
+    if not _stored_energy_matches(per_residue, energy):
         return None
 
     return EnergyBlock(
@@ -454,8 +503,13 @@ def try_energy_variant_d(
         return None
 
     per_residue = [float(v) for v in values if v is not None]
-    energy = sum(per_residue)
-    if not math.isfinite(energy) or abs(energy) < 1.0:
+    if not per_residue or not any(value != 0.0 for value in per_residue):
+        return None
+    if any(abs(value) > WEAK_ENERGY_COMPONENT_ABS_MAX for value in per_residue):
+        return None
+
+    energy = _sum_energy_values(per_residue)
+    if energy is None or abs(energy) > WEAK_ENERGY_TOTAL_ABS_MAX:
         return None
 
     return EnergyBlock(
@@ -486,32 +540,91 @@ def find_energy_block(
         if not targets:
             targets = None
 
-    for off in range(begin, end):
-        block = try_energy_variant_b(data, off, targets)
-        if block:
-            return block
-    for off in range(begin, end):
-        block = try_energy_variant_a(data, off, targets)
-        if block:
-            return block
-    for off in range(begin, end):
-        block = try_energy_variant_c(data, off, targets)
-        if block:
-            return block
-    for off in range(begin, end):
-        block = try_energy_variant_d(data, off, targets)
+    # Structured variants carry both an energy total and a per-entry array.
+    # Their agreement is a much stronger identity check than matching RESI:
+    # Trim can legitimately make the energy array much shorter than the pose.
+    strong_variants = (try_energy_variant_b, try_energy_variant_a, try_energy_variant_c)
+
+    # The energy block normally starts exactly where META ends.  Check that
+    # position first so a later coincidental binary pattern cannot outrank it.
+    for parser in strong_variants:
+        block = parser(data, begin, None)
         if block:
             return block
 
-    for off in range(0, len(data) - 16):
-        block = (
-            try_energy_variant_b(data, off, targets)
-            or try_energy_variant_a(data, off, targets)
-            or try_energy_variant_c(data, off, targets)
-            or try_energy_variant_d(data, off, targets)
-        )
+    adaptive_end = min(end, begin + ADAPTIVE_ENERGY_SEARCH_BYTES)
+    for parser in strong_variants:
+        for off in range(begin + 1, adaptive_end):
+            block = parser(data, off, None)
+            if block:
+                return block
+
+    # Existing non-self-describing saves benefit from the RESI/SSTR count as a
+    # fast corroborating hint.  This does not constrain the exact/near-META
+    # adaptive checks above, where trimmed structured arrays are expected.
+    if targets is not None:
+        for parser in strong_variants:
+            for off in range(begin + 1, end):
+                block = parser(data, off, targets)
+                if block:
+                    return block
+
+    # Variant D stores only an array, so it cannot validate itself against a
+    # recorded total.  Trust it at the exact expected location, or elsewhere
+    # only when its count is corroborated by a structural tag.  Never scan D
+    # inside RESI: the RESI count itself previously caused false score blocks.
+    first_resi = data.find(b"RESI", begin)
+    weak_end = min(end, first_resi) if first_resi != -1 else end
+
+    if begin < weak_end:
+        block = try_energy_variant_d(data, begin, targets)
         if block:
             return block
+
+    if targets is not None:
+        for off in range(begin + 1, weak_end):
+            block = try_energy_variant_d(data, off, targets)
+            if block:
+                return block
+
+    # If the structural count was unavailable or deliberately differs and the
+    # block was not near META, make one bounded checksum-validated pass before
+    # giving up.  This is slower, so legacy D blocks above are resolved first.
+    for parser in strong_variants:
+        for off in range(adaptive_end, end):
+            block = parser(data, off, None)
+            if block:
+                return block
+
+    # Retain a bounded fallback for structured formats.  This is safe from
+    # variable residue/Trim counts because the stored total must still match
+    # the independently decoded array.
+    global_end = max(
+        0,
+        min(
+            len(data) - 16,
+            first_resi if first_resi != -1 else len(data) - 16,
+            begin + MAX_ENERGY_SEARCH_BYTES,
+        ),
+    )
+    for parser in strong_variants:
+        for off in range(0, global_end):
+            if begin <= off < end:
+                continue
+            block = parser(data, off, None)
+            if block:
+                return block
+
+    # A weak global fallback remains available only before RESI and only with
+    # a corroborated count.
+    if targets is not None:
+        weak_global_end = first_resi if first_resi != -1 else global_end
+        for off in range(0, weak_global_end):
+            if begin <= off < weak_end:
+                continue
+            block = try_energy_variant_d(data, off, targets)
+            if block:
+                return block
     return None
 
 
@@ -971,7 +1084,14 @@ def _extract_disulfide_info(data: bytes) -> FolditDisulfideInfo:
 
 
 def _calculate_base_score(energy_block: EnergyBlock) -> float:
-    return 8000.0 - 10.0 * energy_block.total_energy
+    energy = float(energy_block.total_energy)
+    if not math.isfinite(energy):
+        raise FolditApiError("Energy block contains a non-finite total.")
+
+    score = 8000.0 - 10.0 * energy
+    if not math.isfinite(score):
+        raise FolditApiError("Energy block produces a non-finite Foldit score.")
+    return score
 
 
 def _calculate_bonus_score(data: bytes) -> float:

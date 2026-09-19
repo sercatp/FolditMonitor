@@ -47,6 +47,7 @@ from network import (
 )
 from log_lookup import find_matching_log_file, values_match_log_query
 from settings import Settings
+from settings_ui import SettingsDialog
 from tooltip import TooltipWindow
 from logger import FolditLogHandler
 from stats_module import StatsManager, parse_numeric_score
@@ -745,7 +746,7 @@ def update_process_list():
             script_change_token = 0
             script_running = False
             script_path = client.log_path if client.binding_status == "resolved" else ""
-            log_data = foldit_log_handler.get_data(script_path) if script_path else None
+            log_data = foldit_log_handler.get_display_data(script_path) if script_path else None
             if log_data:
                 script_type = log_data.get('script_type', '')
                 script_running = bool(log_data.get('run_open', False))
@@ -1012,6 +1013,8 @@ def adjust_window_size(changeWidth=True, force=False):
 
     border_padding = 4
     button_height = 25
+    if 'button_frame' in globals():
+        button_height = max(button_height, button_frame.winfo_reqheight())
     total_height += border_padding + button_height + 2 
 
     # Force table height to prevent GUI problems #Treeview #remotetreeview bug
@@ -1040,6 +1043,8 @@ def adjust_window_size(changeWidth=True, force=False):
     max_height = int(root.winfo_screenheight() * 0.8)
     window_height = min(max(min_height, total_height), max_height)
     window_width = max(240, process_tree.winfo_reqwidth() + 1)
+    if 'button_frame' in globals():
+        window_width = max(window_width, button_frame.winfo_reqwidth() + border_padding)
     root.geometry(f"{window_width}x{window_height}")
     # Save the last automatic size
     if not force:
@@ -1057,19 +1062,20 @@ def make_window_draggable(window):
     def start_move(event):
         if time.time() - last_double_click_time > 1.5:
             window.is_dragging = True
-            window.x = event.x
-            window.y = event.y
+            window.drag_start_pointer = window.winfo_pointerxy()
+            window.drag_start_window = (window.winfo_x(), window.winfo_y())
             
-    def stop_move(event):
+    def stop_move(_event):
         window.is_dragging = False
         
-    def do_move(event):
+    def do_move(_event):
         if time.time() - last_double_click_time > 1.5 and window.is_dragging:
-            deltax = event.x - window.x
-            deltay = event.y - window.y
-            x = window.winfo_x() + deltax
-            y = window.winfo_y() + deltay
-            window.geometry(f"+{x}+{y}")
+            pointer_x, pointer_y = window.winfo_pointerxy()
+            start_pointer_x, start_pointer_y = window.drag_start_pointer
+            start_window_x, start_window_y = window.drag_start_window
+            x = start_window_x + pointer_x - start_pointer_x
+            y = start_window_y + pointer_y - start_pointer_y
+            window.geometry(f"{x:+d}{y:+d}")
             
     window.bind("<Button-1>", start_move)
     window.bind("<ButtonRelease-1>", stop_move)
@@ -1168,7 +1174,7 @@ def setup_tooltip(root):
 def get_last_log_lines(log_path, client_name=""):
     """Get the last lines of the log from the FolditLogHandler"""
     script_path = str(log_path)
-    data = foldit_log_handler.get_data(script_path)  # Get log data using foldit_log_handler
+    data = foldit_log_handler.get_display_data(script_path)
     
     if not data:
         return "Log data not available"
@@ -2372,8 +2378,9 @@ def open_all_logs():
         except Exception as e:
             print(f"Error opening log for item {item}: {e}")
 
-def apply_display_palette(palette_name):
-    settings_manager.save_active_display_palette(palette_name)
+def apply_display_palette(palette_name, *, persist=True):
+    if persist:
+        settings_manager.save_active_display_palette(palette_name)
     if palette_var is not None:
         palette_var.set(settings_manager.ACTIVE_DISPLAY_PALETTE)
 
@@ -2382,12 +2389,18 @@ def apply_display_palette(palette_name):
         apply_row_appearance(item_id)
     adjust_column_widths(process_tree)
 
+    stats_window = get_open_stats_window()
+    if stats_window is not None and hasattr(stats_window, "apply_display_palette_from_settings"):
+        try:
+            stats_window.apply_display_palette_from_settings()
+        except Exception as error:
+            print(f"Could not refresh stats palette: {error}")
+
     if 'network_manager' in globals() and network_manager.has_clients():
         network_manager.send_tree_data()
 
 def toggle_always_on_top():
-    #global settings_manager.ALWAYS_ON_TOP
-    settings_manager.ALWAYS_ON_TOP = not settings_manager.ALWAYS_ON_TOP
+    settings_manager.save_always_on_top(not settings_manager.ALWAYS_ON_TOP)
     root.attributes("-topmost", settings_manager.ALWAYS_ON_TOP)
     
     # Find the index of the "Always on Top" item dynamically
@@ -2402,6 +2415,38 @@ def toggle_always_on_top():
         except tk.TclError:
             # Ignore the error if the item does not exist
             continue
+
+
+settings_dialog = None
+
+
+def apply_live_settings_from_dialog(changed_paths, _effective):
+    if changed_paths & {('display', 'active_palette'), ('display', 'row_appearance')}:
+        apply_display_palette(settings_manager.ACTIVE_DISPLAY_PALETTE, persist=False)
+    if ('display', 'always_on_top') in changed_paths:
+        root.attributes("-topmost", settings_manager.ALWAYS_ON_TOP)
+        label = "✓ Always on Top" if settings_manager.ALWAYS_ON_TOP else "Always on Top"
+        for index in range(context_menu.index("end") + 1):
+            try:
+                if "Always on Top" in context_menu.entrycget(index, "label"):
+                    context_menu.entryconfig(index, label=label)
+                    break
+            except tk.TclError:
+                continue
+    if ('speed_boost', 'profile') in changed_paths and speed_boost is not None:
+        speed_boost.select_profile(settings_manager.SPEED_BOOST_PROFILE, persist=False)
+
+
+def open_settings_dialog():
+    global settings_dialog
+    if settings_dialog is not None and settings_dialog.window.winfo_exists():
+        settings_dialog.window.lift()
+        settings_dialog.window.focus_set()
+        return
+    try:
+        settings_dialog = SettingsDialog(root, settings_manager, apply_live_settings_from_dialog)
+    except Exception as error:
+        messagebox.showerror("Settings", str(error), parent=root)
 
 share_info_cache = {}  # folder -> info dict filled in by _read_share_info worker
 
@@ -2710,6 +2755,10 @@ def on_treeview_click(event):
         window_manager.activate_client(pid_int)
     if column == "#3" and folder_path:
         open_folder(folder_path)
+    if column == "#5":
+        puzzle_id = str(row.get("puzzle_id", "")).strip()
+        if puzzle_id:
+            open_stats_for_puzzle(puzzle_id)
 
 def find_foldit_installations():
     """Return (installation folders, running folders); (None, None) if none can be found."""
@@ -2792,6 +2841,7 @@ client_resolver = ClientResolver(settings_manager.settings)
 
 root = tk.Tk()
 root.title("Foldit Monitor")
+root.attributes("-topmost", settings_manager.ALWAYS_ON_TOP)
 #root.overrideredirect(True)  # Remove window title and control buttons
 
 icon_data = create_ribbon_icon()
@@ -2950,7 +3000,11 @@ if speed_boost is not None:
     context_menu.add_cascade(label="Speed boost", menu=speed_boost_menu)
     context_menu.add_separator()
 context_menu.add_cascade(label="Palette", menu=palette_menu)
-context_menu.add_command(label="Always on Top", command=toggle_always_on_top)
+context_menu.add_command(
+    label="✓ Always on Top" if settings_manager.ALWAYS_ON_TOP else "Always on Top",
+    command=toggle_always_on_top,
+)
+context_menu.add_command(label="Settings…", command=open_settings_dialog)
 context_menu.add_command(label="Close", command=on_close)
 
 
@@ -2996,6 +3050,13 @@ connect_button = ttk.Button(button_frame, text="Connect", command=show_connect_d
 connect_button.pack(side="left", padx=0)
 connect_button.bind("<Button-3>", show_connect_menu)
 refresh_stats_puzzle_menu()
+
+# Establish the empty-state layout before the first process refresh.  A refresh
+# with no clients has no dirty rows, so it intentionally skips the later
+# incremental layout pass.
+adjust_column_widths(process_tree)
+adjust_window_size()
+
 #--------------------------Main loop
 
 # Start the periodic update scheduling

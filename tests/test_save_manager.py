@@ -1,5 +1,7 @@
+import math
 import os
 import sqlite3
+import struct
 import tempfile
 import unittest
 from contextlib import closing
@@ -51,6 +53,113 @@ class SaveSummaryApiCases(unittest.TestCase):
         self.assertEqual(info.player_name, "Player")
         self.assertEqual(info.save_name, "Compatible")
         self.assertAlmostEqual(info.foldit_score, 7250.0)
+
+
+class EnergyBlockDetectionCases(unittest.TestCase):
+    @staticmethod
+    def _variant_b(values, blob=b""):
+        values = [float(value) for value in values]
+        energy = math.fsum(values)
+        return (
+            struct.pack("<I", len(blob))
+            + blob
+            + struct.pack("<dI", energy, len(values))
+            + struct.pack(f"<{len(values)}d", *values)
+        )
+
+    def test_trimmed_energy_count_does_not_have_to_match_resi_count(self):
+        # 131 active amino acids plus one VRT energy entry, while RESI still
+        # describes the complete 569-amino-acid pose plus VRT.
+        values = [-4.5] * 131 + [-475.0]
+        encoded = self._variant_b(values)
+        data = encoded + b"RESI" + struct.pack("<I", 570) + b"payload"
+
+        block = savefile_api.find_energy_block(
+            data,
+            start=0,
+            window=len(data),
+            n_targets=(570,),
+        )
+
+        self.assertIsNotNone(block)
+        self.assertEqual(block.variant, "B")
+        self.assertEqual(block.n, 132)
+        self.assertAlmostEqual(block.total_energy, math.fsum(values))
+
+    def test_structured_energy_can_be_small_when_its_sum_is_valid(self):
+        encoded = self._variant_b([0.25, -0.125])
+        block = savefile_api.find_energy_block(encoded, start=0, window=len(encoded))
+        self.assertIsNotNone(block)
+        self.assertEqual(block.n, 2)
+        self.assertAlmostEqual(block.total_energy, 0.125)
+
+    def test_tiny_mismatched_binary_values_do_not_pass_absolute_tolerance(self):
+        encoded = (
+            struct.pack("<I", 0)
+            + struct.pack("<dI", 0.0, 1)
+            + struct.pack("<d", 5e-312)
+        )
+        self.assertIsNone(savefile_api.try_energy_variant_b(encoded, 0))
+
+    def test_single_entry_structured_energy_is_supported(self):
+        encoded = self._variant_b([-2.5])
+        block = savefile_api.find_energy_block(encoded, start=0, window=len(encoded))
+        self.assertIsNotNone(block)
+        self.assertEqual(block.n, 1)
+        self.assertAlmostEqual(block.total_energy, -2.5)
+
+    def test_resi_count_is_not_accepted_as_a_variant_d_energy_block(self):
+        data = (
+            b"unrelated-prefix-data"
+            + b"RESI"
+            + struct.pack("<I", 570)
+            + (b"\xff" * (570 * 8))
+        )
+        block = savefile_api.find_energy_block(
+            data,
+            start=0,
+            window=len(data),
+            n_targets=(570,),
+        )
+        self.assertIsNone(block)
+
+    def test_plausible_variant_d_remains_available_before_resi(self):
+        values = [-1.25, 2.5, -3.0]
+        data = b"prefix!" + struct.pack("<I3d", len(values), *values) + b"tail"
+        block = savefile_api.find_energy_block(
+            data,
+            start=0,
+            window=len(data),
+            n_targets=(len(values),),
+        )
+        self.assertIsNotNone(block)
+        self.assertEqual(block.variant, "D")
+        self.assertEqual(block.n, len(values))
+        self.assertAlmostEqual(block.total_energy, math.fsum(values))
+
+    def test_malformed_data_returns_no_candidate_instead_of_leaking_nan(self):
+        self.assertIsNone(
+            savefile_api.find_energy_block(
+                b"\x00" * 128,
+                start=0,
+                window=128,
+                n_targets=(2,),
+            )
+        )
+        with self.assertRaises(savefile_api.FolditApiError):
+            savefile_api._calculate_base_score(SimpleNamespace(total_energy=math.inf))
+
+    def test_invalid_early_tags_do_not_hide_later_valid_sections(self):
+        bad_length = struct.pack("<I", 0xFFFFFFFF)
+        tagged_data = b"META" + bad_length + b"junk" + b"META" + struct.pack("<I", 2) + b"ok"
+        tagged = savefile_api.find_tagged_string(tagged_data, b"META")
+        self.assertIsNotNone(tagged)
+        self.assertEqual(tagged.payload, "ok")
+
+        resi_data = b"RESI" + struct.pack("<I", 0) + b"junk" + b"RESI" + struct.pack("<I", 7)
+        resi = savefile_api.find_resi_tag(resi_data)
+        self.assertIsNotNone(resi)
+        self.assertEqual(resi.count, 7)
 
 
 class SaveCatalogCases(unittest.TestCase):
@@ -120,6 +229,24 @@ class SaveCatalogCases(unittest.TestCase):
         with closing(sqlite3.connect(self.index_path)) as connection:
             count = connection.execute("SELECT COUNT(*) FROM save_index").fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_older_parser_cache_schema_is_rebuilt(self):
+        save_path = self.client / "puzzle_2014362_time_100.ir_solution"
+        save_path.write_bytes(b"one")
+
+        first_catalog = self._catalog()
+        first_record = first_catalog.scan_client("2014362", self.location)[0]
+        first_catalog.load_metadata(first_record)
+        self.assertEqual(self.reader_calls, [save_path.name])
+
+        with closing(sqlite3.connect(self.index_path)) as connection, connection:
+            connection.execute("PRAGMA user_version = 3")
+
+        second_catalog = self._catalog()
+        second_record = second_catalog.scan_client("2014362", self.location)[0]
+        self.assertFalse(second_record.metadata_loaded)
+        second_catalog.load_metadata(second_record)
+        self.assertEqual(self.reader_calls, [save_path.name, save_path.name])
 
     def test_parse_error_is_cached_and_retried_explicitly(self):
         save_path = self.client / "puzzle_2014362_time_100.ir_solution"
@@ -322,6 +449,48 @@ class SaveManagerIntegrationSourceCases(unittest.TestCase):
         self.assertIn("QPlainTextEdit(dialog)", save_manager_source)
         self.assertIn("details.setReadOnly(True)", save_manager_source)
         self.assertIn('getattr(client, "active_puzzle_id"', save_manager_source)
+
+
+class SaveManagerPuzzleSelectorCases(unittest.TestCase):
+    def test_switches_between_running_puzzles_and_scans_all_clients(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from save_manager_qt import QtEventPump, SaveManagerWindowQt
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder:
+            clients = [
+                ClientLocation("Foldit1", str(Path(folder) / "Foldit1"), True, "2817"),
+                ClientLocation("Foldit10", str(Path(folder) / "Foldit10"), True, "2818b"),
+                ClientLocation("Foldit14", str(Path(folder) / "Foldit14"), False, "old"),
+            ]
+            with (
+                patch.object(QtEventPump, "ensure_started"),
+                patch.object(QtEventPump, "register_window"),
+                patch.object(QtEventPump, "unregister_window"),
+                patch.object(SaveManagerWindowQt, "focus_window"),
+                patch.object(SaveManagerWindowQt, "_scan_worker"),
+            ):
+                window = SaveManagerWindowQt(
+                    None, "2817", lambda: clients, str(Path(folder) / "index.sqlite3"), folder,
+                    initial_client_path=clients[0].path,
+                )
+                try:
+                    choices = [window.puzzle_selector.itemText(i) for i in range(window.puzzle_selector.count())]
+                    self.assertEqual(choices, ["2817", "2818b"])
+                    previous_generation = window.generation
+                    window.puzzle_selector.activated.emit(window.puzzle_selector.findText("2818b"))
+                    self.assertEqual(window.puzzle_id, "2818b")
+                    self.assertEqual(window.selected_scope, "all")
+                    self.assertEqual(window.generation, previous_generation + 1)
+                    self.assertEqual(window.puzzle_selector.currentText(), "2818b")
+                    clients[1] = ClientLocation("Foldit10", clients[1].path, True, "2819")
+                    window.refresh()
+                    refreshed = [window.puzzle_selector.itemText(i) for i in range(window.puzzle_selector.count())]
+                    self.assertEqual(refreshed, ["2817", "2818b", "2819"])
+                finally:
+                    window.close()
+        self.assertIsNotNone(app)
 
 
 if __name__ == "__main__":
