@@ -4,20 +4,25 @@ import os
 import re
 import shutil
 import sqlite3
+import stat as stat_module
 import tempfile
 import threading
 import time
 from contextlib import closing
 from dataclasses import dataclass, field
+from itertools import chain
 from pathlib import Path
 from collections import Counter, defaultdict
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from savefile_api import FolditSaveSummary, get_save_summary
+from window_manager import delete_file
 
 
-INDEX_SCHEMA_VERSION = 4
+INDEX_SCHEMA_VERSION = 5
 ACTIVE_PUZZLE_RE = re.compile(rb"Loading puzzle\s+(\d+)", re.IGNORECASE)
+PUZZLE_TITLE_RE = re.compile(rb'(?m)^\s*"title"\s*:\s*"\s*(\d+[A-Za-z]?)\s*:')
+PUZZLE_FILE_ID_RE = re.compile(rb'(?m)^\s*"id"\s*:\s*"(\d+)"')
 PUZZLE_MAP_FIELDS = ("public_id", "internal_id", "source", "first_seen", "last_verified")
 
 
@@ -49,6 +54,9 @@ class SaveRecord:
     base_score: Optional[float] = None
     bonus_score: Optional[float] = None
     total_score: Optional[float] = None
+    solution_mode: Optional[str] = None
+    mode_player_id: Optional[int] = None
+    mode_reference_base_score: Optional[float] = None
     metadata_loaded: bool = False
     error: str = ""
 
@@ -59,6 +67,7 @@ class CopyItemResult:
     target_path: str
     status: str
     error: str = ""
+    source_path: str = ""
 
 
 @dataclass
@@ -68,6 +77,30 @@ class CopyReport:
     @property
     def copied(self) -> int:
         return sum(item.status == "copied" for item in self.items)
+
+    @property
+    def skipped(self) -> int:
+        return sum(item.status == "skipped" for item in self.items)
+
+    @property
+    def failed(self) -> int:
+        return sum(item.status == "failed" for item in self.items)
+
+
+@dataclass(frozen=True)
+class DeleteItemResult:
+    path: str
+    status: str
+    error: str = ""
+
+
+@dataclass
+class DeleteReport:
+    items: List[DeleteItemResult] = field(default_factory=list)
+
+    @property
+    def deleted(self) -> int:
+        return sum(item.status == "deleted" for item in self.items)
 
     @property
     def skipped(self) -> int:
@@ -114,6 +147,7 @@ class PuzzleMappingStore:
     @staticmethod
     def _source_rank(source: str) -> int:
         return {
+            "puzzle-file": 5,
             "manual": 4,
             "active-log": 3,
             "legacy-sqlite": 2,
@@ -280,6 +314,25 @@ class PuzzleMappingStore:
                 self.last_error = f"Puzzle map could not be written: {exc}"
                 return False
 
+    def remove(self, public_puzzle_id: str, internal_puzzle_ids: Iterable[str]) -> bool:
+        rejected = {str(value).strip() for value in internal_puzzle_ids}
+        if not rejected:
+            return True
+        with self._lock:
+            rows = self._read_unlocked()
+            remaining = [
+                row for row in rows
+                if row.public_id != str(public_puzzle_id).strip() or row.internal_id not in rejected
+            ]
+            if len(remaining) == len(rows):
+                return True
+            try:
+                self._write_unlocked(remaining)
+                return True
+            except Exception as exc:
+                self.last_error = f"Puzzle map could not be written: {exc}"
+                return False
+
 
 class SaveIndex:
     """Disposable, size-limited SQLite cache which always fails open."""
@@ -318,7 +371,7 @@ class SaveIndex:
                     os.makedirs(db_folder, exist_ok=True)
                 with closing(self._connect()) as connection, connection:
                     version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-                    if version not in (0, INDEX_SCHEMA_VERSION):
+                    if version != INDEX_SCHEMA_VERSION:
                         connection.execute("DROP TABLE IF EXISTS save_index")
                     connection.execute(
                         """
@@ -338,6 +391,9 @@ class SaveIndex:
                             base_score REAL,
                             bonus_score REAL,
                             total_score REAL,
+                            solution_mode TEXT,
+                            mode_player_id INTEGER,
+                            mode_reference_base_score REAL,
                             error TEXT NOT NULL DEFAULT '',
                             last_seen_at REAL NOT NULL
                         )
@@ -398,6 +454,9 @@ class SaveIndex:
         record.base_score = row["base_score"]
         record.bonus_score = row["bonus_score"]
         record.total_score = row["total_score"]
+        record.solution_mode = row["solution_mode"]
+        record.mode_player_id = row["mode_player_id"]
+        record.mode_reference_base_score = row["mode_reference_base_score"]
         record.error = str(row["error"] or "")
         record.metadata_loaded = True
         return record
@@ -412,8 +471,9 @@ class SaveIndex:
                     INSERT INTO save_index (
                         path_key, path, client_name, client_path_key, puzzle_id, internal_puzzle_id,
                         file_name, size, mtime_ns, modified, save_name, player_name,
-                        base_score, bonus_score, total_score, error, last_seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        base_score, bonus_score, total_score, solution_mode,
+                        mode_player_id, mode_reference_base_score, error, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(path_key) DO UPDATE SET
                         path=excluded.path,
                         client_name=excluded.client_name,
@@ -429,6 +489,9 @@ class SaveIndex:
                         base_score=excluded.base_score,
                         bonus_score=excluded.bonus_score,
                         total_score=excluded.total_score,
+                        solution_mode=excluded.solution_mode,
+                        mode_player_id=excluded.mode_player_id,
+                        mode_reference_base_score=excluded.mode_reference_base_score,
                         error=excluded.error,
                         last_seen_at=excluded.last_seen_at
                     """,
@@ -448,6 +511,9 @@ class SaveIndex:
                         record.base_score,
                         record.bonus_score,
                         record.total_score,
+                        record.solution_mode,
+                        record.mode_player_id,
+                        record.mode_reference_base_score,
                         record.error,
                         time.time(),
                     ),
@@ -513,6 +579,66 @@ class SaveCatalog:
         except OSError:
             return None
         return None
+
+    @staticmethod
+    def _public_id_from_puzzle_file(path: str, internal_id: str) -> Optional[str]:
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read(64 * 1024)
+        except OSError:
+            return None
+        file_id = PUZZLE_FILE_ID_RE.search(data)
+        title = PUZZLE_TITLE_RE.search(data)
+        if not file_id or not title or int(file_id.group(1)) != int(internal_id):
+            return None
+        return title.group(1).decode("ascii")
+
+    @classmethod
+    def _known_public_ids(cls, internal_id: str, clients: Sequence[ClientLocation]) -> set[str]:
+        try:
+            file_names = (f"{int(internal_id):010d}.ir_puzzle", f"{int(internal_id)}.ir_puzzle")
+        except ValueError:
+            return set()
+        found = set()
+        for client in clients:
+            for file_name in file_names:
+                public_id = cls._public_id_from_puzzle_file(
+                    os.path.join(client.path, file_name), internal_id
+                )
+                if public_id:
+                    found.add(public_id)
+                    break
+        return found
+
+    @classmethod
+    def _ids_from_puzzle_files(cls, public_id: str, clients: Sequence[ClientLocation]) -> Tuple[str, ...]:
+        found = set()
+        checked = set()
+        for client in sorted(clients, key=lambda item: (not item.running, item.name.casefold())):
+            try:
+                entries = os.scandir(client.path)
+            except OSError:
+                continue
+            with entries:
+                for entry in entries:
+                    name = entry.name
+                    if not name.casefold().endswith(".ir_puzzle") or not name[:-10].isdigit():
+                        continue
+                    internal_id = str(int(name[:-10]))
+                    if internal_id in checked:
+                        continue
+                    try:
+                        if not entry.is_file():
+                            continue
+                    except OSError:
+                        continue
+                    title_id = cls._public_id_from_puzzle_file(entry.path, internal_id)
+                    if title_id is None:
+                        continue
+                    checked.add(internal_id)
+                    if title_id == public_id:
+                        found.add(internal_id)
+        return tuple(sorted(found, key=int))
 
     @staticmethod
     def _managed_log_times(client_path: str, public_puzzle_id: str) -> List[float]:
@@ -585,21 +711,47 @@ class SaveCatalog:
     ) -> PuzzleResolution:
         clean_public_id = str(public_puzzle_id).strip()
 
-        # CSV is the primary source. log.txt is touched only for an unknown pair.
+        # A cached mapping can be stale when the active-client row changes before
+        # Foldit writes its next "Loading puzzle" line. Verify it against the
+        # local puzzle definition before using it to select save directories.
         mapped = self.mapping_store.get(clean_public_id)
         if mapped:
-            internal_ids = tuple(dict.fromkeys(row.internal_id for row in mapped))
+            valid = []
+            rejected = []
+            for row in mapped:
+                known_ids = self._known_public_ids(row.internal_id, clients)
+                if known_ids and clean_public_id not in known_ids:
+                    rejected.append(row.internal_id)
+                else:
+                    valid.append(row.internal_id)
+            if rejected:
+                self.mapping_store.remove(clean_public_id, rejected)
+                for internal_id in self._ids_from_puzzle_files(clean_public_id, clients):
+                    if internal_id not in valid:
+                        valid.append(internal_id)
+                    self.mapping_store.add(clean_public_id, internal_id, "puzzle-file")
+            internal_ids = tuple(dict.fromkeys(valid))
+            if not internal_ids:
+                mapped = []
+        if mapped:
             warning = ""
             if len(internal_ids) > 1:
                 warning = f"Multiple mappings in puzzle_map.csv: {', '.join(internal_ids)}"
-            return PuzzleResolution(internal_ids, "csv", warning)
+            return PuzzleResolution(internal_ids, "puzzle-file" if rejected else "csv", warning)
+
+        file_ids = self._ids_from_puzzle_files(clean_public_id, clients)
+        if file_ids:
+            for internal_id in file_ids:
+                self.mapping_store.add(clean_public_id, internal_id, "puzzle-file")
+            return PuzzleResolution(file_ids, "puzzle-file")
 
         active_candidates: List[str] = []
         for client in clients:
             if not client.running or str(client.active_puzzle_id).strip() != clean_public_id:
                 continue
             internal_id = self.read_active_internal_puzzle_id(client.path)
-            if internal_id:
+            known_ids = self._known_public_ids(internal_id, (client,)) if internal_id else set()
+            if internal_id and (not known_ids or clean_public_id in known_ids):
                 active_candidates.append(internal_id)
         if active_candidates:
             counts = Counter(active_candidates)
@@ -623,6 +775,9 @@ class SaveCatalog:
         for client in ordered_clients:
             evidence = self._infer_client_mapping(client, clean_public_id)
             if evidence is None:
+                continue
+            known_ids = self._known_public_ids(evidence[0], (client,))
+            if known_ids and clean_public_id not in known_ids:
                 continue
             votes.append(evidence)
             if len(votes) >= 5:
@@ -776,6 +931,9 @@ class SaveCatalog:
             record.base_score = float(summary.base_score)
             record.bonus_score = float(summary.bonus_score)
             record.total_score = float(summary.total_score)
+            record.solution_mode = getattr(summary, "solution_mode", None)
+            record.mode_player_id = getattr(summary, "mode_player_id", None)
+            record.mode_reference_base_score = getattr(summary, "mode_reference_base_score", None)
             record.error = ""
         except Exception as exc:
             record.save_name = ""
@@ -783,6 +941,9 @@ class SaveCatalog:
             record.base_score = None
             record.bonus_score = None
             record.total_score = None
+            record.solution_mode = None
+            record.mode_player_id = None
+            record.mode_reference_base_score = None
             record.error = str(exc)
         record.metadata_loaded = True
         self.index.upsert(record)
@@ -816,16 +977,132 @@ class SaveCatalog:
         source_key = normalize_path(record.client_path)
         for target in targets:
             target_path = os.path.join(target.path, record.file_name)
-            if normalize_path(target.path) == source_key or os.path.exists(target_path):
-                report.items.append(CopyItemResult(target.name, target_path, "skipped"))
+            if normalize_path(target.path) == source_key:
+                report.items.append(CopyItemResult(
+                    target.name, target_path, "skipped", "Source and destination are the same client", record.path
+                ))
+                continue
+            if os.path.exists(target_path):
+                report.items.append(CopyItemResult(
+                    target.name, target_path, "skipped", "Destination file already exists", record.path
+                ))
                 continue
             try:
                 if not os.path.isdir(target.path):
                     raise OSError(f"Target folder not found: {target.path}")
                 shutil.copy2(record.path, target_path)
-                report.items.append(CopyItemResult(target.name, target_path, "copied"))
+                report.items.append(CopyItemResult(target.name, target_path, "copied", source_path=record.path))
             except Exception as exc:
-                report.items.append(CopyItemResult(target.name, target_path, "failed", str(exc)))
+                report.items.append(CopyItemResult(target.name, target_path, "failed", str(exc), record.path))
+        return report
+
+    @staticmethod
+    def copy_records(
+        records: Sequence[SaveRecord],
+        targets: Sequence[ClientLocation],
+        external_folder: Optional[str] = None,
+        skip_own_client: bool = False,
+    ) -> CopyReport:
+        report = CopyReport()
+        seen_sources: set[str] = set()
+        external_path = os.path.abspath(os.path.expanduser(external_folder)) if external_folder else None
+        if external_path and any(normalize_path(target.path) == normalize_path(external_path) for target in targets):
+            external_path = None
+        for record in records:
+            source_key = normalize_path(record.path)
+            if source_key in seen_sources:
+                continue
+            seen_sources.add(source_key)
+            record_targets = (
+                [target for target in targets if normalize_path(target.path) != normalize_path(record.client_path)]
+                if skip_own_client else targets
+            )
+            report.items.extend(SaveCatalog.copy_record(record, record_targets).items)
+            if external_path is None:
+                continue
+            if not os.path.isdir(external_path):
+                report.items.append(CopyItemResult(
+                    "External folder", external_path, "failed", "Destination folder does not exist", record.path
+                ))
+                continue
+            if normalize_path(os.path.dirname(record.path)) == normalize_path(external_path):
+                report.items.append(CopyItemResult(
+                    "External folder", external_path, "skipped", "Source is already in destination folder", record.path
+                ))
+                continue
+            stem, suffix = os.path.splitext(record.file_name)
+            client_label = re.sub(r'[<>:"/\\|?*]+', "_", record.client_name).strip(". ") or "client"
+            candidates = chain(
+                (record.file_name, f"{client_label} {record.file_name}"),
+                (f"{client_label} {stem} ({number}){suffix}" for number in range(2, 10001)),
+            )
+            for file_name in candidates:
+                target_path = os.path.join(external_path, file_name)
+                created = False
+                try:
+                    with open(record.path, "rb") as source:
+                        with open(target_path, "xb") as destination:
+                            created = True
+                            shutil.copyfileobj(source, destination)
+                    shutil.copystat(record.path, target_path)
+                    report.items.append(CopyItemResult(
+                        "External folder", target_path, "copied", source_path=record.path
+                    ))
+                    break
+                except FileExistsError:
+                    continue
+                except Exception as exc:
+                    if created:
+                        try:
+                            os.unlink(target_path)
+                        except OSError:
+                            pass
+                    report.items.append(CopyItemResult(
+                        "External folder", target_path, "failed", str(exc), record.path
+                    ))
+                    break
+            else:
+                report.items.append(CopyItemResult(
+                    "External folder", external_path, "failed", "No available filename", record.path
+                ))
+        return report
+
+    @staticmethod
+    def delete_records(records: Sequence[SaveRecord]) -> DeleteReport:
+        report = DeleteReport()
+        seen: set[str] = set()
+        for record in records:
+            path_key = normalize_path(record.path)
+            if path_key in seen:
+                continue
+            seen.add(path_key)
+            client_root = normalize_path(os.path.realpath(record.client_path))
+            real_path = normalize_path(os.path.realpath(record.path))
+            try:
+                inside_client = os.path.commonpath((client_root, real_path)) == client_root
+            except ValueError:
+                inside_client = False
+            if (
+                not inside_client
+                or not record.path.casefold().endswith(".ir_solution")
+                or os.path.islink(record.path)
+            ):
+                report.items.append(DeleteItemResult(record.path, "skipped", "Not a regular Foldit save inside the client folder"))
+                continue
+            try:
+                file_stat = os.stat(record.path)
+                if not stat_module.S_ISREG(file_stat.st_mode):
+                    report.items.append(DeleteItemResult(record.path, "skipped", "Not a regular file"))
+                    continue
+                if file_stat.st_size != record.size or file_stat.st_mtime_ns != record.mtime_ns:
+                    report.items.append(DeleteItemResult(record.path, "skipped", "File changed since the list was refreshed"))
+                    continue
+                delete_file(record.path)
+                report.items.append(DeleteItemResult(record.path, "deleted"))
+            except FileNotFoundError:
+                report.items.append(DeleteItemResult(record.path, "skipped", "File no longer exists"))
+            except Exception as exc:
+                report.items.append(DeleteItemResult(record.path, "failed", str(exc)))
         return report
 
 
@@ -833,6 +1110,8 @@ __all__ = [
     "ClientLocation",
     "CopyItemResult",
     "CopyReport",
+    "DeleteItemResult",
+    "DeleteReport",
     "PuzzleMapping",
     "PuzzleMappingStore",
     "PuzzleResolution",

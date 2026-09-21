@@ -16,6 +16,7 @@ Import examples:
         get_bonus_score,
         get_disulfide_info,
         get_save_summary,
+        get_solution_mode_info,
         get_player_name,
         get_save_name,
         get_foldit_score,
@@ -29,6 +30,8 @@ Import examples:
     print(info.save_name)
     summary = get_save_summary(save_path)
     print(summary.base_score, summary.bonus_score, summary.total_score)
+    print(summary.solution_mode, summary.mode_player_id, summary.mode_reference_base_score)
+    print(get_solution_mode_info(save_path))
     print(info.foldit_score)
 
     player_name = get_player_name(save_path)
@@ -43,6 +46,7 @@ Import examples:
 Available functions:
     get_basic_info(save_path) -> FolditBasicInfo
     get_save_summary(save_path) -> FolditSaveSummary
+    get_solution_mode_info(save_path) -> FolditSolutionModeInfo
     get_bonus_score(save_path) -> float
     get_disulfide_info(save_path) -> FolditDisulfideInfo
     get_player_name(save_path) -> str
@@ -52,7 +56,9 @@ Available functions:
 
 Behavior:
     - `get_basic_info()` reads the save once and returns all 3 metadata fields.
-    - `get_save_summary()` also returns puzzle id and base/bonus/total scores.
+    - `get_save_summary()` also returns puzzle id, scores, and detected mode.
+    - Mode values 1 and 2 in the PDLT block are identified as solo and evolver.
+      Other values are returned without a guessed mode.
     - The metadata functions do not export a PDB.
     - `export_pdb()` only exports the PDB and returns the written file path.
     - On parse problems, the module raises `FolditApiError`.
@@ -149,6 +155,18 @@ class FolditSaveSummary:
     base_score: float
     bonus_score: float
     total_score: float
+    solution_mode: Optional[str] = None
+    mode_player_id: Optional[int] = None
+    mode_reference_base_score: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class FolditSolutionModeInfo:
+    mode: Optional[str]
+    raw_mode: int
+    player_id: int
+    aux_id: int
+    reference_base_score: Optional[float]
 
 
 @dataclass(frozen=True)
@@ -1144,12 +1162,50 @@ def _find_player(data: bytes, energy_block: Optional[EnergyBlock] = None) -> Puz
     raise FolditApiError("Player block not found; cannot read player_name.")
 
 
+def _find_solution_mode_info(data: bytes) -> Optional[FolditSolutionModeInfo]:
+    # Observed PDLT v3 tail: tag, version, mode, player ID, auxiliary ID,
+    # length-prefixed client build. The role of the auxiliary ID is unknown.
+    start = max(0, len(data) - 8192)
+    off = data.rfind(b"PDLT", start)
+    if off < 0 or off + 24 > len(data):
+        return None
+    version, raw_mode, player_id, aux_id, build_len = struct.unpack_from(
+        "<5I", data, off + 4
+    )
+    build_start = off + 24
+    build_end = build_start + build_len
+    if (
+        version != 3
+        or not 1 <= raw_mode <= 16
+        or player_id == 0
+        or not 1 <= build_len <= 128
+        or build_end > len(data)
+        or not all(32 <= byte < 127 for byte in data[build_start:build_end])
+    ):
+        return None
+    reference_base_score = None
+    if build_end + 9 <= len(data) and data[build_end + 8] == 0xFF:
+        reference_energy = struct.unpack_from("<d", data, build_end)[0]
+        if math.isfinite(reference_energy):
+            calculated = 8000.0 - 10.0 * reference_energy
+            if math.isfinite(calculated):
+                reference_base_score = calculated
+    return FolditSolutionModeInfo(
+        mode={1: "solo", 2: "evolver"}.get(raw_mode),
+        raw_mode=raw_mode,
+        player_id=player_id,
+        aux_id=aux_id,
+        reference_base_score=reference_base_score,
+    )
+
+
 def _extract_save_summary(data: bytes) -> FolditSaveSummary:
     meta = _find_meta(data)
     energy_block = _find_energy(data, meta)
     player_block = _find_player(data, energy_block)
     base_score = _calculate_base_score(energy_block)
     bonus_score = _calculate_bonus_score(data)
+    mode_info = _find_solution_mode_info(data)
     return FolditSaveSummary(
         puzzle_id=player_block.puzzle_id,
         player_name=player_block.player_name,
@@ -1157,6 +1213,9 @@ def _extract_save_summary(data: bytes) -> FolditSaveSummary:
         base_score=base_score,
         bonus_score=bonus_score,
         total_score=base_score + bonus_score,
+        solution_mode=mode_info.mode if mode_info else None,
+        mode_player_id=mode_info.player_id if mode_info else None,
+        mode_reference_base_score=mode_info.reference_base_score if mode_info else None,
     )
 
 
@@ -1179,6 +1238,20 @@ def get_save_summary(save_path: PathLike) -> FolditSaveSummary:
     """Return puzzle identity and base/bonus/total scores using one file read."""
     _, data = _read_save_bytes(save_path)
     return _extract_save_summary(data)
+
+
+def get_solution_mode_info(save_path: PathLike) -> FolditSolutionModeInfo:
+    """Return PDLT v3 mode, player ID, and reference base score.
+
+    The player ID's exact attribution role is not established. For mode values
+    other than 1 (solo) and 2 (evolver), ``mode`` is ``None``.
+    The reference score excludes any score bonuses outside the energy formula.
+    """
+    _, data = _read_save_bytes(save_path)
+    info = _find_solution_mode_info(data)
+    if info is None:
+        raise FolditApiError("PDLT v3 mode block not found or invalid.")
+    return info
 
 
 def get_player_name(save_path: PathLike) -> str:
@@ -1257,6 +1330,7 @@ __all__ = [
     "FolditApiError",
     "FolditBasicInfo",
     "FolditSaveSummary",
+    "FolditSolutionModeInfo",
     "FolditDisulfideInfo",
     "export_pdb",
     "get_basic_info",
@@ -1265,5 +1339,6 @@ __all__ = [
     "get_foldit_score",
     "get_player_name",
     "get_save_summary",
+    "get_solution_mode_info",
     "get_save_name",
 ]

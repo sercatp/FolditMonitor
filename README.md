@@ -60,6 +60,20 @@ The app also creates `logs/`, `puzzle_logs/`, and `foldit_backup/` when needed. 
 - `foldit_speed_boost*.py` — optional Frida-based speed-boost integration.
 - `alert.wav` — default alert sound.
 
+## Save Manager
+
+Save Manager shows saves for the selected puzzle across Foldit clients. It checks
+cached puzzle mappings against local `.ir_puzzle` files when those files are
+available. The Mode, Player ID, Source base, and Base gain columns use metadata
+found in the save file's PDLT block; unknown modes are left blank.
+
+You can filter the list, select several visible saves with the platform's normal
+multi-selection keys, or use **Select All**. **Copy to…** accepts one or more
+clients and an existing external folder. **Share to all** copies to running
+clients, and **Export PDB** handles the full selection. **Delete** permanently
+removes selected save files after a confirmation and skips files that changed
+since the list was refreshed.
+
 Speed Boost is disabled by default. To expose its menu, set
 `speed_boost.enabled` to `true` in the generated `Foldit Monitor.json` and
 restart the monitor. The same section contains the configured return-address

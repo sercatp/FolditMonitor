@@ -584,6 +584,11 @@ def open_containing_folder(path):
     open_folder(folder_path)
 
 
+def delete_file(path):
+    """Permanently delete one file on Windows, macOS, or Linux."""
+    os.unlink(os.path.abspath(path))
+
+
 def open_file(path, reveal_end=False):
     """Open a file and optionally send a Windows-only navigation shortcut."""
     open_path(path)

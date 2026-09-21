@@ -4,16 +4,18 @@ import queue
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QItemSelectionModel, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
@@ -34,7 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from save_catalog import ClientLocation, CopyReport, SaveCatalog, SaveIndex, SaveRecord, normalize_path
+from save_catalog import ClientLocation, CopyReport, DeleteReport, SaveCatalog, SaveIndex, SaveRecord, normalize_path
 from savefile_api import export_pdb
 from stats_ui_qt import QtEventPump
 from window_manager import open_containing_folder
@@ -57,16 +59,72 @@ def _format_size(size: int) -> str:
     return f"{value:.1f} GB"
 
 
+@dataclass(frozen=True)
+class PdbExportItemResult:
+    source_path: str
+    output_path: str
+    error: str = ""
+
+
+@dataclass
+class PdbExportReport:
+    items: List[PdbExportItemResult] = field(default_factory=list)
+
+    @property
+    def exported(self) -> int:
+        return sum(not item.error for item in self.items)
+
+    @property
+    def failed(self) -> int:
+        return sum(bool(item.error) for item in self.items)
+
+
+def export_records_to_pdb(
+    records: Sequence[SaveRecord],
+    puzzle_id: str,
+    output_folder: str,
+    exporter: Callable[[str, str], str] = export_pdb,
+) -> PdbExportReport:
+    report = PdbExportReport()
+    reserved: set[str] = set()
+    multiple = len(records) > 1
+    for record in records:
+        save_name = record.save_name or Path(record.file_name).stem
+        parts = [part for part in (puzzle_id, record.client_name if multiple else "", save_name) if part]
+        raw_name = " ".join(parts)
+        base_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", raw_name).strip(". ")[:150].rstrip(". ") or "save"
+        for number in range(1, 10001):
+            suffix = "" if number == 1 else f" ({number})"
+            output_path = os.path.join(output_folder, f"{base_name}{suffix}.pdb")
+            path_key = normalize_path(output_path)
+            if path_key not in reserved and not os.path.exists(output_path):
+                reserved.add(path_key)
+                break
+        else:
+            report.items.append(PdbExportItemResult(record.path, "", "No available filename"))
+            continue
+        try:
+            exporter(record.path, output_path)
+            report.items.append(PdbExportItemResult(record.path, output_path))
+        except Exception as exc:
+            report.items.append(PdbExportItemResult(record.path, output_path, str(exc)))
+    return report
+
+
 class CopyTargetsDialog(QDialog):
-    def __init__(self, parent: QWidget, clients: Sequence[ClientLocation], source_path: str):
+    def __init__(self, parent: QWidget, clients: Sequence[ClientLocation], source_path: Optional[str] = None):
         super().__init__(parent)
-        self.clients = [client for client in clients if normalize_path(client.path) != normalize_path(source_path)]
-        self.setWindowTitle("Copy save to clients")
-        self.resize(520, 340)
-        self.setMinimumSize(440, 280)
+        self.clients = [
+            client for client in clients
+            if source_path is None or normalize_path(client.path) != normalize_path(source_path)
+        ]
+        self.external_folder: Optional[str] = None
+        self.setWindowTitle("Copy saves")
+        self.resize(560, 400)
+        self.setMinimumSize(460, 340)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Select one or more destination clients:", self))
+        layout.addWidget(QLabel("Select destination clients and/or an external folder:", self))
         self.list_widget = QListWidget(self)
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         for index, client in enumerate(self.clients):
@@ -74,6 +132,15 @@ class CopyTargetsDialog(QDialog):
             item = QListWidgetItem(f"{marker}{client.name} — {client.path}", self.list_widget)
             item.setData(SCOPE_ROLE, index)
         layout.addWidget(self.list_widget, 1)
+        layout.addWidget(QLabel("External folder:", self))
+        external_row = QHBoxLayout()
+        self.external_path_edit = QLineEdit(self)
+        self.external_path_edit.setPlaceholderText("Choose or enter an existing folder")
+        browse_button = QPushButton("Browse…", self)
+        browse_button.clicked.connect(self._browse_external_folder)
+        external_row.addWidget(self.external_path_edit, 1)
+        external_row.addWidget(browse_button)
+        layout.addLayout(external_row)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
             parent=self,
@@ -83,10 +150,35 @@ class CopyTargetsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def selected_clients(self) -> List[ClientLocation]:
-        if self.exec() != QDialog.DialogCode.Accepted:
-            return []
+    def _browse_external_folder(self):
+        start = self.external_path_edit.text().strip() or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, "Choose destination folder", start)
+        if folder:
+            self.external_path_edit.setText(folder)
+
+    def _chosen_clients(self) -> List[ClientLocation]:
         return [self.clients[int(item.data(SCOPE_ROLE))] for item in self.list_widget.selectedItems()]
+
+    def accept(self):
+        raw_folder = self.external_path_edit.text().strip()
+        folder = os.path.abspath(os.path.expanduser(raw_folder)) if raw_folder else None
+        if folder and not os.path.isdir(folder):
+            QMessageBox.warning(self, "Copy saves", f"Destination folder does not exist:\n{folder}")
+            return
+        if not self._chosen_clients() and not folder:
+            QMessageBox.warning(self, "Copy saves", "Select a client or an external folder.")
+            return
+        self.external_folder = folder
+        super().accept()
+
+    def selected_destinations(self) -> tuple[List[ClientLocation], Optional[str]]:
+        if self.exec() != QDialog.DialogCode.Accepted:
+            return [], None
+        return self._chosen_clients(), self.external_folder
+
+    def selected_clients(self) -> List[ClientLocation]:
+        clients, _folder = self.selected_destinations()
+        return clients
 
 
 class SaveManagerWindowQt(QMainWindow):
@@ -137,6 +229,8 @@ class SaveManagerWindowQt(QMainWindow):
         self.mapping_error = ""
         self.mapping_warning = ""
         self.copying = False
+        self.deleting = False
+        self.exporting = False
         self.filter_active = False
         self.filter_valid = True
         self.last_normal_scope = "all"
@@ -237,11 +331,17 @@ class SaveManagerWindowQt(QMainWindow):
         self.client_tree.currentItemChanged.connect(self._on_client_selected)
 
         self.save_table = QTableWidget(splitter)
-        self.table_columns = ("client", "name", "total", "base", "modified", "size", "file")
+        self.table_columns = (
+            "client", "name", "total", "base", "mode", "player_id",
+            "source_base", "base_gain", "modified", "size", "file",
+        )
         self.save_table.setColumnCount(len(self.table_columns))
-        self.save_table.setHorizontalHeaderLabels(("Client", "Save name", "Total", "Base", "Modified", "Size", "File"))
+        self.save_table.setHorizontalHeaderLabels((
+            "Client", "Save name", "Total", "Base", "Mode", "Player ID",
+            "Source base", "Base gain", "Modified", "Size", "File",
+        ))
         self.save_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.save_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.save_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.save_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.save_table.setAlternatingRowColors(True)
         self.save_table.setWordWrap(False)
@@ -254,9 +354,14 @@ class SaveManagerWindowQt(QMainWindow):
         header.setSectionsClickable(True)
         header.sectionClicked.connect(self._sort_by_index)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        widths = (90, 145, 80, 80, 135, 70, 240)
+        widths = (90, 145, 80, 80, 72, 80, 88, 80, 135, 70, 240)
         for column, width in enumerate(widths):
             self.save_table.setColumnWidth(column, width)
+        self.save_table.horizontalHeaderItem(5).setToolTip(
+            "Numeric ID stored in PDLT. In observed evolver saves it matches the imported source player."
+        )
+        self.save_table.horizontalHeaderItem(6).setToolTip("Source base score stored in PDLT for evolver saves")
+        self.save_table.horizontalHeaderItem(7).setToolTip("Current base score minus source base score")
         self.save_table.itemSelectionChanged.connect(self._update_action_states)
         self.save_table.cellDoubleClicked.connect(lambda _row, _column: self._show_record_details())
         splitter.addWidget(self.client_tree)
@@ -271,11 +376,18 @@ class SaveManagerWindowQt(QMainWindow):
         self.share_button = QPushButton("Share to all", central)
         self.export_button = QPushButton("Export PDB", central)
         self.folder_button = QPushButton("Open folder", central)
+        self.select_all_button = QPushButton("Select All", central)
+        self.delete_button = QPushButton("Delete", central)
         self.copy_button.clicked.connect(self._copy_to)
         self.share_button.clicked.connect(self._share_to_all)
         self.export_button.clicked.connect(self._export_pdb)
         self.folder_button.clicked.connect(self._open_folder)
-        for button in (self.copy_button, self.share_button, self.export_button, self.folder_button):
+        self.select_all_button.clicked.connect(self._select_all_visible)
+        self.delete_button.clicked.connect(self._delete_selected)
+        for button in (
+            self.copy_button, self.share_button, self.export_button, self.folder_button,
+            self.select_all_button, self.delete_button,
+        ):
             actions.addWidget(button)
         actions.addStretch(1)
         close_button = QPushButton("Close", central)
@@ -531,14 +643,30 @@ class SaveManagerWindowQt(QMainWindow):
                 break
             event_type, generation, *payload = event
             if event_type == "copy_done":
-                copy_puzzle_id, report = payload
+                copy_puzzle_id, report, refresh_clients = payload
                 self.copying = False
                 self._show_copy_report(report)
-                if copy_puzzle_id == self.puzzle_id:
+                if refresh_clients and copy_puzzle_id == self.puzzle_id:
                     self.refresh(False)
                 else:
                     self._update_action_states()
                     self._update_status()
+                continue
+            if event_type == "delete_done":
+                delete_puzzle_id, report = payload
+                self.deleting = False
+                if delete_puzzle_id == self.puzzle_id:
+                    self.refresh(False)
+                else:
+                    self._update_action_states()
+                    self._update_status()
+                self._show_delete_report(report)
+                continue
+            if event_type == "export_done":
+                self.exporting = False
+                self._show_export_report(payload[0])
+                self._update_action_states()
+                self._update_status()
                 continue
             if generation != self.generation:
                 continue
@@ -660,7 +788,9 @@ class SaveManagerWindowQt(QMainWindow):
             self.sort_descending = not self.sort_descending
         else:
             self.sort_column = column
-            self.sort_descending = column in ("total", "base", "modified", "size")
+            self.sort_descending = column in (
+                "total", "base", "player_id", "source_base", "base_gain", "modified", "size"
+            )
         self._refresh_table()
 
     def _record_sort_value(self, record: SaveRecord):
@@ -669,6 +799,16 @@ class SaveManagerWindowQt(QMainWindow):
             "name": record.save_name.casefold(),
             "total": record.total_score,
             "base": record.base_score,
+            "mode": record.solution_mode or "",
+            "player_id": record.mode_player_id,
+            "source_base": record.mode_reference_base_score if record.solution_mode == "evolver" else None,
+            "base_gain": (
+                record.base_score - record.mode_reference_base_score
+                if record.solution_mode == "evolver"
+                and record.base_score is not None
+                and record.mode_reference_base_score is not None
+                else None
+            ),
             "modified": record.modified,
             "size": record.size,
             "file": record.file_name.casefold(),
@@ -683,12 +823,14 @@ class SaveManagerWindowQt(QMainWindow):
         return present + missing
 
     def _refresh_table(self):
-        selected = self._selected_record()
-        selected_path = normalize_path(selected.path) if selected else None
+        selected_paths = {normalize_path(record.path) for record in self._selected_records()}
+        current = self._current_record()
+        current_path = normalize_path(current.path) if current else None
         self.visible_records = self._sorted_records(self._filtered_records())
         self.save_table.blockSignals(True)
         self.save_table.setRowCount(len(self.visible_records))
-        selected_row = -1
+        selection = self.save_table.selectionModel()
+        selection.clearSelection()
         for row, record in enumerate(self.visible_records):
             if record.error:
                 save_name = "⚠ Parse error"
@@ -701,91 +843,195 @@ class SaveManagerWindowQt(QMainWindow):
                 save_name,
                 "" if record.total_score is None else f"{record.total_score:.3f}",
                 "" if record.base_score is None else f"{record.base_score:.3f}",
+                (record.solution_mode or "").capitalize(),
+                "" if record.mode_player_id is None else str(record.mode_player_id),
+                (
+                    f"{record.mode_reference_base_score:.3f}"
+                    if record.solution_mode == "evolver" and record.mode_reference_base_score is not None
+                    else ""
+                ),
+                (
+                    f"{record.base_score - record.mode_reference_base_score:+.3f}"
+                    if record.solution_mode == "evolver"
+                    and record.base_score is not None
+                    and record.mode_reference_base_score is not None
+                    else ""
+                ),
                 datetime.datetime.fromtimestamp(record.modified).strftime("%Y-%m-%d %H:%M:%S"),
                 _format_size(record.size),
                 record.file_name,
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if column in (2, 3, 5):
+                if column in (2, 3, 5, 6, 7, 9):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 item.setToolTip(record.error or record.path)
                 self.save_table.setItem(row, column, item)
-            if selected_path and normalize_path(record.path) == selected_path:
-                selected_row = row
-        if selected_row >= 0:
-            self.save_table.selectRow(selected_row)
+            path_key = normalize_path(record.path)
+            if path_key in selected_paths:
+                selection.select(
+                    self.save_table.model().index(row, 0),
+                    QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+                )
+            if path_key == current_path:
+                selection.setCurrentIndex(
+                    self.save_table.model().index(row, 0), QItemSelectionModel.SelectionFlag.NoUpdate
+                )
         self.save_table.blockSignals(False)
         self._update_action_states()
 
-    def _selected_record(self) -> Optional[SaveRecord]:
+    def _selected_records(self) -> List[SaveRecord]:
+        return [
+            self.visible_records[index.row()]
+            for index in self.save_table.selectionModel().selectedRows()
+            if 0 <= index.row() < len(self.visible_records)
+        ]
+
+    def _current_record(self) -> Optional[SaveRecord]:
         row = self.save_table.currentRow()
         return self.visible_records[row] if 0 <= row < len(self.visible_records) else None
 
+    def _selected_record(self) -> Optional[SaveRecord]:
+        selected = self._selected_records()
+        return selected[0] if len(selected) == 1 else None
+
     def _update_action_states(self):
-        enabled = self._selected_record() is not None and not self.copying
-        for button in (self.copy_button, self.share_button, self.export_button, self.folder_button):
-            button.setEnabled(enabled)
+        idle = not self.copying and not self.deleting and not self.exporting
+        selected = self._selected_records()
+        for button in (self.copy_button, self.share_button, self.export_button):
+            button.setEnabled(bool(selected) and idle)
+        self.folder_button.setEnabled(len(selected) == 1 and idle)
+        self.select_all_button.setEnabled(bool(self.visible_records) and idle)
+        self.delete_button.setEnabled(bool(selected) and idle)
+
+    def _select_all_visible(self):
+        self.save_table.selectAll()
+
+    def _delete_selected(self):
+        if self.copying or self.deleting or self.exporting:
+            return
+        records = self._selected_records()
+        if not records:
+            return
+        preview = "\n".join(f"• {record.client_name}: {record.file_name}" for record in records[:6])
+        if len(records) > 6:
+            preview += f"\n… and {len(records) - 6} more"
+        choice = QMessageBox.warning(
+            self,
+            "Delete saves",
+            f"Permanently delete {len(records)} selected save file(s)?\n"
+            f"Running Foldit may recreate automatic saves.\n\n{preview}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+        self.deleting = True
+        self._update_action_states()
+        self.status_label.setText(f"Deleting {len(records)} save file(s)…")
+        generation = self.generation
+        puzzle_id = self.puzzle_id
+
+        def worker():
+            self.events.put(("delete_done", generation, puzzle_id, self.catalog.delete_records(tuple(records))))
+
+        threading.Thread(target=worker, daemon=True, name="save-delete").start()
+
+    def _show_delete_report(self, report: DeleteReport):
+        lines = [f"Deleted: {report.deleted}", f"Skipped: {report.skipped}", f"Failed: {report.failed}"]
+        problems = [item for item in report.items if item.status != "deleted"]
+        if problems:
+            lines.extend(("", *(f"{item.path}: {item.error}" for item in problems[:5])))
+            QMessageBox.warning(self, "Save deletion complete", "\n".join(lines))
+        else:
+            QMessageBox.information(self, "Save deletion complete", "\n".join(lines))
 
     def _copy_to(self):
-        record = self._selected_record()
-        if record is None:
+        records = self._selected_records()
+        if not records:
             return
-        targets = CopyTargetsDialog(self, self.clients, record.client_path).selected_clients()
-        if targets:
-            self._start_copy(record, targets)
+        targets, external_folder = CopyTargetsDialog(self, self.clients).selected_destinations()
+        if targets or external_folder:
+            self._start_copy(records, targets, external_folder)
 
     def _share_to_all(self):
-        record = self._selected_record()
-        if record is None:
+        records = self._selected_records()
+        if not records:
             return
-        targets = [
-            client
-            for client in self.clients
-            if client.running and normalize_path(client.path) != normalize_path(record.client_path)
-        ]
-        if not targets:
+        targets = [client for client in self.clients if client.running]
+        if not any(
+            normalize_path(client.path) != normalize_path(record.client_path)
+            for record in records for client in targets
+        ):
             QMessageBox.information(self, "Save Manager", "No other running clients found.")
             return
-        self._start_copy(record, targets)
+        self._start_copy(records, targets, skip_own_client=True)
 
-    def _start_copy(self, record: SaveRecord, targets: Sequence[ClientLocation]):
-        if self.copying:
+    def _start_copy(
+        self,
+        records: Sequence[SaveRecord],
+        targets: Sequence[ClientLocation],
+        external_folder: Optional[str] = None,
+        skip_own_client: bool = False,
+    ):
+        if self.copying or self.deleting or self.exporting:
             return
         self.copying = True
         self._update_action_states()
-        self.status_label.setText(f"Copying {record.file_name} to {len(targets)} client(s)…")
+        self.status_label.setText(f"Copying {len(records)} save file(s)…")
         generation = self.generation
         copy_puzzle_id = self.puzzle_id
 
         def worker():
-            self.events.put(("copy_done", generation, copy_puzzle_id, self.catalog.copy_record(record, targets)))
+            report = self.catalog.copy_records(
+                tuple(records), tuple(targets), external_folder, skip_own_client
+            )
+            self.events.put(("copy_done", generation, copy_puzzle_id, report, bool(targets)))
 
         threading.Thread(target=worker, daemon=True, name="save-copy").start()
 
     def _show_copy_report(self, report: CopyReport):
         lines = [f"Copied: {report.copied}", f"Skipped: {report.skipped}", f"Failed: {report.failed}"]
-        failures = [item for item in report.items if item.status == "failed"]
-        if failures:
-            lines.extend(("", *(f"{item.client_name}: {item.error}" for item in failures[:5])))
+        problems = [item for item in report.items if item.status != "copied"]
+        if problems:
+            lines.extend(("", *(
+                f"{Path(item.source_path).name} → {item.client_name}: {item.error or item.status}"
+                for item in problems[:5]
+            )))
+        if report.failed:
             QMessageBox.warning(self, "Save copy complete", "\n".join(lines))
         else:
             QMessageBox.information(self, "Save copy complete", "\n".join(lines))
 
     def _export_pdb(self):
-        record = self._selected_record()
-        if record is None:
+        records = self._selected_records()
+        if not records or self.copying or self.deleting or self.exporting:
             return
-        try:
-            save_name = record.save_name or Path(record.file_name).stem
-            pdb_name = re.sub(r'[<>:"/\\|?*]+', "_", save_name).strip(". ") or Path(record.file_name).stem
-            if self.puzzle_id:
-                pdb_name = f"{self.puzzle_id} {pdb_name}"
-            pdb_path = os.path.join(self.logs_folder, f"{pdb_name}.pdb")
-            export_pdb(record.path, pdb_path)
-            QMessageBox.information(self, "Success", f"PDB exported to:\n{pdb_path}")
-        except Exception as exc:
-            QMessageBox.critical(self, "Error", f"Error exporting PDB: {exc}")
+        self.exporting = True
+        self._update_action_states()
+        self.status_label.setText(f"Exporting {len(records)} PDB file(s)…")
+        generation = self.generation
+        puzzle_id = self.puzzle_id
+
+        def worker():
+            report = export_records_to_pdb(tuple(records), puzzle_id, self.logs_folder)
+            self.events.put(("export_done", generation, report))
+
+        threading.Thread(target=worker, daemon=True, name="save-pdb-export").start()
+
+    def _show_export_report(self, report: PdbExportReport):
+        if report.exported == 1 and report.failed == 0:
+            QMessageBox.information(self, "Success", f"PDB exported to:\n{report.items[0].output_path}")
+            return
+        lines = [f"Exported: {report.exported}", f"Failed: {report.failed}"]
+        failures = [item for item in report.items if item.error]
+        if failures:
+            lines.extend(("", *(
+                f"{Path(item.source_path).name}: {item.error}" for item in failures[:5]
+            )))
+            QMessageBox.warning(self, "PDB export complete", "\n".join(lines))
+        else:
+            QMessageBox.information(self, "PDB export complete", "\n".join(lines))
 
     def _open_folder(self):
         record = self._selected_record()
@@ -802,6 +1048,10 @@ class SaveManagerWindowQt(QMainWindow):
             f"Player: {record.player_name or '—'}",
             f"Total: {'—' if record.total_score is None else f'{record.total_score:.3f}'}",
             f"Base: {'—' if record.base_score is None else f'{record.base_score:.3f}'}",
+            f"Mode: {record.solution_mode or '—'}",
+            f"PDLT player ID: {record.mode_player_id if record.mode_player_id is not None else '—'}",
+            f"Source base: {'—' if record.solution_mode != 'evolver' or record.mode_reference_base_score is None else f'{record.mode_reference_base_score:.3f}'}",
+            f"Base gain: {'—' if record.solution_mode != 'evolver' or record.mode_reference_base_score is None or record.base_score is None else f'{record.base_score - record.mode_reference_base_score:+.3f}'}",
             f"File: {record.path}",
         ]
         if record.error:

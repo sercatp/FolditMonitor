@@ -11,18 +11,29 @@ from unittest.mock import patch
 
 import savefile_api
 import window_manager
-from save_catalog import ClientLocation, PuzzleMappingStore, SaveCatalog, SaveIndex
+from save_catalog import ClientLocation, PuzzleMappingStore, SaveCatalog, SaveIndex, SaveRecord, normalize_path
 from savefile_api import FolditSaveSummary
 
 
 class SaveSummaryApiCases(unittest.TestCase):
+    @staticmethod
+    def _mode_block(raw_mode, player_id=415886):
+        build = b"20250926-ed7de9856f-win_x64"
+        reference_energy = -2010.5697409246077
+        return (
+            b"PDLT"
+            + struct.pack("<5I", 3, raw_mode, player_id, 988042, len(build))
+            + build
+            + struct.pack("<dBdd", reference_energy, 0xFF, reference_energy, reference_energy)
+        )
+
     def test_summary_returns_base_bonus_total_and_puzzle_from_one_read(self):
         meta = SimpleNamespace(payload="Best save")
         energy = SimpleNamespace(total_energy=125.5)
         player = SimpleNamespace(puzzle_id=2014362, player_name="Serca")
 
         with (
-            patch.object(savefile_api, "_read_save_bytes", return_value=(Path("sample.ir_solution"), b"data")) as read,
+            patch.object(savefile_api, "_read_save_bytes", return_value=(Path("sample.ir_solution"), b"data" + self._mode_block(2))) as read,
             patch.object(savefile_api, "_find_meta", return_value=meta),
             patch.object(savefile_api, "_find_energy", return_value=energy),
             patch.object(savefile_api, "_find_player", return_value=player),
@@ -37,6 +48,28 @@ class SaveSummaryApiCases(unittest.TestCase):
         self.assertAlmostEqual(summary.base_score, 6745.0)
         self.assertAlmostEqual(summary.bonus_score, 500.0)
         self.assertAlmostEqual(summary.total_score, 7245.0)
+        self.assertEqual(summary.solution_mode, "evolver")
+        self.assertEqual(summary.mode_player_id, 415886)
+        self.assertAlmostEqual(summary.mode_reference_base_score, 28105.697409246077)
+
+    def test_mode_block_distinguishes_solo_evolver_and_unidentified_values(self):
+        for code, expected in ((1, "solo"), (2, "evolver"), (3, None)):
+            with self.subTest(code=code):
+                data = b"shared solution without energy" + self._mode_block(code)
+                with patch.object(savefile_api, "_read_save_bytes", return_value=(Path("sample.ir_solution"), data)):
+                    info = savefile_api.get_solution_mode_info("sample.ir_solution")
+                self.assertEqual(info.mode, expected)
+                self.assertEqual(info.raw_mode, code)
+                self.assertEqual(info.player_id, 415886)
+                self.assertAlmostEqual(info.reference_base_score, 28105.697409246077)
+
+    def test_mode_block_rejects_truncated_or_invalid_data(self):
+        for data in (b"no PDLT", self._mode_block(2)[:20], self._mode_block(2).replace(b"PDLT", b"XXXX")):
+            with self.subTest(data=data), patch.object(
+                savefile_api, "_read_save_bytes", return_value=(Path("sample.ir_solution"), data)
+            ):
+                with self.assertRaises(savefile_api.FolditApiError):
+                    savefile_api.get_solution_mode_info("sample.ir_solution")
 
     def test_basic_info_remains_total_score_compatible(self):
         meta = SimpleNamespace(payload="Compatible")
@@ -225,10 +258,24 @@ class SaveCatalogCases(unittest.TestCase):
         catalog.load_metadata(record)
         save_path.unlink()
         self.assertEqual(catalog.scan_client("2014362", self.location), [])
-
         with closing(sqlite3.connect(self.index_path)) as connection:
             count = connection.execute("SELECT COUNT(*) FROM save_index").fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_mode_fields_survive_metadata_cache(self):
+        save_path = self.client / "puzzle_2014362_time_100.ir_solution"
+        save_path.write_bytes(b"save")
+        self.reader = lambda _path: FolditSaveSummary(
+            2014362, "Serca", "Evolver save", 28121.231, 0.0, 28121.231,
+            "evolver", 415886, 28105.697,
+        )
+        catalog = self._catalog()
+        catalog.load_metadata(catalog.scan_client("2014362", self.location)[0])
+        cached = self._catalog().scan_client("2014362", self.location)[0]
+        self.assertTrue(cached.metadata_loaded)
+        self.assertEqual(cached.solution_mode, "evolver")
+        self.assertEqual(cached.mode_player_id, 415886)
+        self.assertAlmostEqual(cached.mode_reference_base_score, 28105.697)
 
     def test_older_parser_cache_schema_is_rebuilt(self):
         save_path = self.client / "puzzle_2014362_time_100.ir_solution"
@@ -240,7 +287,7 @@ class SaveCatalogCases(unittest.TestCase):
         self.assertEqual(self.reader_calls, [save_path.name])
 
         with closing(sqlite3.connect(self.index_path)) as connection, connection:
-            connection.execute("PRAGMA user_version = 3")
+            connection.execute("PRAGMA user_version = 4")
 
         second_catalog = self._catalog()
         second_record = second_catalog.scan_client("2014362", self.location)[0]
@@ -288,6 +335,52 @@ class SaveCatalogCases(unittest.TestCase):
             resolution = catalog.resolve_internal_puzzle_ids("2790", [active_client])
         self.assertEqual(resolution.internal_ids, ("2014362",))
         read_log.assert_not_called()
+
+    def test_stale_cached_mapping_is_replaced_using_puzzle_titles(self):
+        wrong_id = "2014390"
+        right_id = "2014388"
+        for internal_id, title in (
+            (wrong_id, "2814: Revisiting Puzzle 115"),
+            (right_id, "2815: Electron Density Reconstruction"),
+        ):
+            (self.client / f"{int(internal_id):010d}.ir_puzzle").write_text(
+                f'version: 1\n{{\n "id" : "{internal_id}"\n "title" : "{title}"\n}}\n',
+                encoding="utf-8",
+            )
+        (self.client / "log.txt").write_text(
+            f"Loading puzzle {wrong_id}\n", encoding="utf-8"
+        )
+        store = PuzzleMappingStore(str(self.root / "logs" / "puzzle_map.csv"))
+        self.assertTrue(store.add("2815", wrong_id, "active-log"))
+        catalog = SaveCatalog(SaveIndex(str(self.index_path)), self.reader, store)
+        client = ClientLocation("Foldit1", str(self.client), True, "2815")
+
+        resolution = catalog.resolve_internal_puzzle_ids("2815", [client])
+
+        self.assertEqual(resolution.internal_ids, (right_id,))
+        self.assertEqual([row.internal_id for row in store.get("2815")], [right_id])
+        self.assertEqual(store.get("2815")[0].source, "puzzle-file")
+
+    def test_puzzle_title_prevents_stale_active_log_from_creating_mapping(self):
+        wrong_id = "2014390"
+        right_id = "2014388"
+        for internal_id, title in ((wrong_id, "2814: Other"), (right_id, "2815: Current")):
+            (self.client / f"{int(internal_id):010d}.ir_puzzle").write_text(
+                f'"id" : "{internal_id}"\n"title" : "{title}"\n', encoding="utf-8"
+            )
+        (self.client / "log.txt").write_text(
+            f"Loading puzzle {wrong_id}\n", encoding="utf-8"
+        )
+        catalog = self._catalog()
+        client = ClientLocation("Foldit1", str(self.client), True, "2815")
+
+        self.assertEqual(
+            catalog.resolve_internal_puzzle_ids("2815", [client]).internal_ids,
+            (right_id,),
+        )
+        self.assertEqual(
+            [row.internal_id for row in catalog.mapping_store.get("2815")], [right_id]
+        )
 
     def test_conflicting_active_clients_are_saved_and_scanned_together(self):
         second_client = self.root / "Foldit2"
@@ -417,6 +510,80 @@ class SaveCatalogCases(unittest.TestCase):
         self.assertEqual((skipped_dir / source.name).read_bytes(), b"existing")
         self.assertEqual((report.copied, report.skipped, report.failed), (1, 1, 1))
 
+    def test_batch_copy_to_external_folder_preserves_name_collisions(self):
+        other_client = self.root / "Foldit2"
+        target_client = self.root / "Foldit3"
+        external = self.root / "archive"
+        for folder in (other_client, target_client, external):
+            folder.mkdir()
+        file_name = "puzzle_2014362_time_100.ir_solution"
+        first = self.client / file_name
+        second = other_client / file_name
+        first.write_bytes(b"first version")
+        second.write_bytes(b"second version")
+        (external / file_name).write_bytes(b"existing archive")
+
+        records = []
+        for path, client_name, client_path in (
+            (first, "Foldit1", self.client), (second, "Foldit2", other_client)
+        ):
+            stat = path.stat()
+            records.append(SaveRecord(
+                str(path), client_name, str(client_path), "2014362", "2014362",
+                path.name, stat.st_size, stat.st_mtime_ns, stat.st_mtime,
+            ))
+        report = SaveCatalog.copy_records(
+            records, [ClientLocation("Foldit3", str(target_client), True)], str(external)
+        )
+        self.assertEqual((report.copied, report.skipped, report.failed), (3, 1, 0))
+        self.assertEqual((external / file_name).read_bytes(), b"existing archive")
+        self.assertEqual((external / f"Foldit1 {file_name}").read_bytes(), b"first version")
+        self.assertEqual((external / f"Foldit2 {file_name}").read_bytes(), b"second version")
+        self.assertEqual((target_client / file_name).read_bytes(), b"first version")
+
+    def test_batch_share_skips_each_source_client(self):
+        other_client = self.root / "Foldit2"
+        other_client.mkdir()
+        records = []
+        for client_name, client_path, number in (
+            ("Foldit1", self.client, 100), ("Foldit2", other_client, 200)
+        ):
+            path = client_path / f"puzzle_2014362_time_{number}.ir_solution"
+            path.write_bytes(client_name.encode())
+            stat = path.stat()
+            records.append(SaveRecord(
+                str(path), client_name, str(client_path), "2014362", "2014362",
+                path.name, stat.st_size, stat.st_mtime_ns, stat.st_mtime,
+            ))
+        clients = [self.location, ClientLocation("Foldit2", str(other_client), True)]
+        report = SaveCatalog.copy_records(records, clients, skip_own_client=True)
+        self.assertEqual((report.copied, report.skipped, report.failed), (2, 0, 0))
+        self.assertTrue((self.client / records[1].file_name).exists())
+        self.assertTrue((other_client / records[0].file_name).exists())
+
+    def test_delete_records_removes_only_unchanged_client_save_files(self):
+        first = self.client / "puzzle_2014362_time_100.ir_solution"
+        changed = self.client / "puzzle_2014362_time_200.ir_solution"
+        first.write_bytes(b"first")
+        changed.write_bytes(b"second")
+        catalog = self._catalog()
+        records = catalog.scan_client("2014362", self.location)
+        changed.write_bytes(b"changed since scan")
+        outside = self.root / "outside.ir_solution"
+        outside.write_bytes(b"outside")
+        outside_stat = outside.stat()
+        records.append(SaveRecord(
+            str(outside), "Foldit1", str(self.client), "2014362", "2014362",
+            outside.name, outside_stat.st_size, outside_stat.st_mtime_ns, outside_stat.st_mtime,
+        ))
+        with patch("save_catalog.delete_file", wraps=window_manager.delete_file) as delete_file:
+            report = catalog.delete_records(records)
+        self.assertEqual((report.deleted, report.skipped, report.failed), (1, 2, 0))
+        delete_file.assert_called_once_with(str(first))
+        self.assertFalse(first.exists())
+        self.assertTrue(changed.exists())
+        self.assertTrue(outside.exists())
+
 
 class SaveManagerIntegrationSourceCases(unittest.TestCase):
     def test_open_containing_folder_uses_default_folder_handler(self):
@@ -488,6 +655,158 @@ class SaveManagerPuzzleSelectorCases(unittest.TestCase):
                     window.refresh()
                     refreshed = [window.puzzle_selector.itemText(i) for i in range(window.puzzle_selector.count())]
                     self.assertEqual(refreshed, ["2817", "2818b", "2819"])
+                finally:
+                    window.close()
+        self.assertIsNotNone(app)
+
+
+class SaveManagerSelectionAndDeleteCases(unittest.TestCase):
+    def test_copy_dialog_accepts_external_folder_and_rejects_missing_destination(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+        from save_manager_qt import CopyTargetsDialog
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder:
+            dialog = CopyTargetsDialog(None, [ClientLocation("Foldit9", folder, True)])
+            with patch.object(QMessageBox, "warning") as warning:
+                dialog.accept()
+            warning.assert_called_once()
+            with patch.object(QFileDialog, "getExistingDirectory", return_value=folder):
+                dialog._browse_external_folder()
+            self.assertEqual(dialog.external_path_edit.text(), folder)
+            dialog.accept()
+            self.assertEqual(dialog.external_folder, folder)
+            self.assertEqual(dialog.result(), dialog.DialogCode.Accepted)
+            dialog.close()
+        self.assertIsNotNone(app)
+
+    def test_batch_export_keeps_existing_pdb_and_makes_distinct_names(self):
+        from save_manager_qt import export_records_to_pdb
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            existing = root / "2815 Foldit9 Same name.pdb"
+            existing.write_text("existing", encoding="utf-8")
+            records = []
+            for number in (1, 2):
+                path = root / f"puzzle_2014388_time_{number}.ir_solution"
+                path.write_bytes(str(number).encode())
+                stat = path.stat()
+                records.append(SaveRecord(
+                    str(path), "Foldit9", str(root), "2815", "2014388",
+                    path.name, stat.st_size, stat.st_mtime_ns, stat.st_mtime,
+                    save_name="Same name", metadata_loaded=True,
+                ))
+
+            def fake_export(source, destination):
+                Path(destination).write_bytes(Path(source).read_bytes())
+                return destination
+
+            report = export_records_to_pdb(records, "2815", folder, fake_export)
+            self.assertEqual((report.exported, report.failed), (2, 0))
+            self.assertEqual(existing.read_text(encoding="utf-8"), "existing")
+            self.assertEqual((root / "2815 Foldit9 Same name (2).pdb").read_bytes(), b"1")
+            self.assertEqual((root / "2815 Foldit9 Same name (3).pdb").read_bytes(), b"2")
+
+    def test_select_all_targets_filtered_rows_and_delete_requires_confirmation(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        from save_manager_qt import QtEventPump, SaveManagerWindowQt
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder:
+            client_dir = Path(folder) / "Foldit9"
+            client_dir.mkdir()
+            client = ClientLocation("Foldit9", str(client_dir), True, "2815")
+            other_dir = Path(folder) / "Foldit10"
+            other_dir.mkdir()
+            other = ClientLocation("Foldit10", str(other_dir), True, "2815")
+            records = []
+            for index, save_name in enumerate(("Keep one", "Keep two", "Other"), 1):
+                path = client_dir / f"puzzle_2014388_time_{index}.ir_solution"
+                path.write_bytes(save_name.encode())
+                stat = path.stat()
+                records.append(SaveRecord(
+                    str(path), "Foldit9", str(client_dir), "2815", "2014388",
+                    path.name, stat.st_size, stat.st_mtime_ns, stat.st_mtime,
+                    save_name=save_name, base_score=28121.0, total_score=28121.0,
+                    solution_mode="evolver", mode_player_id=415886,
+                    mode_reference_base_score=28105.0, metadata_loaded=True,
+                ))
+            with (
+                patch.object(QtEventPump, "ensure_started"),
+                patch.object(QtEventPump, "register_window"),
+                patch.object(QtEventPump, "unregister_window"),
+                patch.object(SaveManagerWindowQt, "_scan_worker"),
+            ):
+                window = SaveManagerWindowQt(
+                    None, "2815", lambda: [client, other], str(Path(folder) / "index.sqlite3"), folder,
+                )
+                try:
+                    window.records_by_client[normalize_path(client.path)] = records
+                    window.name_filter.setText("Keep")
+                    window._apply_filters()
+                    self.assertEqual(len(window.visible_records), 2)
+                    window.select_all_button.click()
+                    self.assertEqual(len(window._selected_records()), 2)
+                    window._refresh_table()
+                    self.assertEqual(len(window._selected_records()), 2)
+                    self.assertTrue(window.copy_button.isEnabled())
+                    self.assertTrue(window.share_button.isEnabled())
+                    self.assertTrue(window.export_button.isEnabled())
+                    self.assertFalse(window.folder_button.isEnabled())
+                    self.assertEqual(window.save_table.item(0, 4).text(), "Evolver")
+                    self.assertEqual(window.save_table.item(0, 5).text(), "415886")
+                    self.assertEqual(window.save_table.item(0, 6).text(), "28105.000")
+                    self.assertEqual(window.save_table.item(0, 7).text(), "+16.000")
+
+                    from save_manager_qt import CopyTargetsDialog
+                    with (
+                        patch.object(CopyTargetsDialog, "selected_destinations", return_value=([], folder)),
+                        patch.object(window, "_start_copy") as start_copy,
+                    ):
+                        window.copy_button.click()
+                    self.assertEqual(len(start_copy.call_args.args[0]), 2)
+                    self.assertEqual(start_copy.call_args.args[2], folder)
+                    with patch.object(window, "_start_copy") as start_share:
+                        window.share_button.click()
+                    self.assertEqual(len(start_share.call_args.args[0]), 2)
+                    self.assertTrue(start_share.call_args.kwargs["skip_own_client"])
+
+                    from save_manager_qt import PdbExportItemResult, PdbExportReport
+                    export_report = PdbExportReport([
+                        PdbExportItemResult(records[0].path, str(Path(folder) / "one.pdb")),
+                        PdbExportItemResult(records[1].path, str(Path(folder) / "two.pdb")),
+                    ])
+                    with (
+                        patch("save_manager_qt.threading.Thread") as export_thread,
+                        patch("save_manager_qt.export_records_to_pdb", return_value=export_report) as exporter,
+                        patch.object(QMessageBox, "information") as information,
+                    ):
+                        window.export_button.click()
+                        export_thread.call_args.kwargs["target"]()
+                        window._drain_events()
+                    self.assertEqual(len(exporter.call_args.args[0]), 2)
+                    self.assertIn("Exported: 2", information.call_args.args[2])
+                    self.assertTrue(window.export_button.isEnabled())
+
+                    with patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.Cancel):
+                        window.delete_button.click()
+                    self.assertTrue(all(Path(record.path).exists() for record in records))
+
+                    with (
+                        patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.Yes),
+                        patch.object(QMessageBox, "information") as info,
+                        patch("save_manager_qt.threading.Thread") as thread_class,
+                    ):
+                        window.delete_button.click()
+                        thread_class.call_args.kwargs["target"]()
+                        window._drain_events()
+                    self.assertIn("Deleted: 2", info.call_args.args[2])
+                    self.assertFalse(Path(records[0].path).exists())
+                    self.assertFalse(Path(records[1].path).exists())
+                    self.assertTrue(Path(records[2].path).exists())
                 finally:
                     window.close()
         self.assertIsNotNone(app)
