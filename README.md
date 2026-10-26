@@ -92,6 +92,8 @@ restart the monitor. The same section contains the configured return-address
 
 Ligand Viewer displays ligands from Foldit saves in an interactive 3D view and provides a brief analysis of their surroundings.
 
+[Ligand Example](https://sercatp.github.io/FolditMonitor/) — explore an interactive 3D report in your browser.
+
 ![Ligand Viewer](docs/images/ligand-viewer.jpg)
 
 ## Possible issues
