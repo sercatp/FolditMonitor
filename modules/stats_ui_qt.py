@@ -3,7 +3,7 @@ import tkinter as tk
 import weakref
 from typing import Any, Callable, Dict, List, Optional
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QRect, Qt, QTimer
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -62,6 +62,35 @@ from modules.stats_module import (
     resolve_settings_dict,
 )
 from modules.window_manager import open_path
+
+
+def _stats_window_position(saved: Optional[tuple[int, int]], size: tuple[int, int],
+                           work_areas: List[QRect]) -> tuple[int, int]:
+    """Keep Qt window coordinates within the logical desktop work areas."""
+    areas = [area for area in work_areas if area.width() > 0 and area.height() > 0]
+    if not areas:
+        return saved if saved is not None else (60, 60)
+    width, height = max(1, size[0]), max(1, size[1])
+    area = areas[0]
+    if saved is not None:
+        x, y = saved
+
+        def overlap(candidate):
+            horizontal = max(0, min(x + width, candidate.x() + candidate.width()) - max(x, candidate.x()))
+            vertical = max(0, min(y + height, candidate.y() + candidate.height()) - max(y, candidate.y()))
+            return horizontal * vertical
+
+        area = max(areas, key=overlap)
+        if overlap(area) == 0:
+            saved = None
+            area = areas[0]
+    if saved is None:
+        x = area.x() + max(0, (area.width() - width) // 2)
+        y = area.y() + max(0, (area.height() - height) // 2)
+    else:
+        x, y = saved
+    return (max(area.x(), min(x, area.x() + max(0, area.width() - width))),
+            max(area.y(), min(y, area.y() + max(0, area.height() - height))))
 
 
 class QtEventPump:
@@ -1059,6 +1088,7 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
 
     def focus_window(self):
         self.showNormal()
+        self._keep_window_visible()
         self.raise_()
         self.activateWindow()
 
@@ -1067,27 +1097,28 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
         stats_pos = display.get("stats_window_position", {})
         x = stats_pos.get("x", -1)
         y = stats_pos.get("y", -1)
-        if isinstance(x, int) and isinstance(y, int) and x >= 0 and y >= 0:
+        if type(x) is int and type(y) is int and (x, y) != (-1, -1):
             return x, y
         return None
 
     def _apply_initial_position(self, parent: Any):
-        saved = self._get_saved_position()
-        if saved:
-            x, y = saved
-        else:
-            parent_x = 60
-            parent_y = 60
-            if parent is not None:
-                try:
-                    parent_x = int(parent.winfo_rootx()) + 30
-                    parent_y = max(0, int(parent.winfo_rooty()) - 40)
-                except (AttributeError, RuntimeError, TypeError, ValueError, tk.TclError):
-                    pass
-            x, y = parent_x, parent_y
-
         self._adjust_window_size()
-        self.move(x, y)
+        self._place_window(self._get_saved_position())
+
+    def _place_window(self, position):
+        primary = QApplication.primaryScreen()
+        screens = QApplication.screens()
+        if primary is not None:
+            screens = [primary] + [screen for screen in screens if screen != primary]
+        frame = self.frameGeometry()
+        x, y = _stats_window_position(position, (frame.width(), frame.height()),
+                                      [screen.availableGeometry() for screen in screens])
+        if frame.x() != x or frame.y() != y:
+            self.move(x, y)
+
+    def _keep_window_visible(self):
+        frame = self.frameGeometry()
+        self._place_window((frame.x(), frame.y()))
 
     def _save_window_position(self):
         pos = self.frameGeometry().topLeft()
@@ -1532,6 +1563,7 @@ class StatsWindowQt(StatsWindowControllerMixin, QMainWindow):
         height = min(target_height, int(available.height() * 0.92))
         self.resize(width, height)
         self._window_size_initialized = True
+        self._keep_window_visible()
 
     def top_row_min_width(self) -> int:
         root_layout = self.centralWidget().layout()

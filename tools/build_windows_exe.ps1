@@ -23,7 +23,17 @@ if ($LASTEXITCODE -ne 0) {
 
 # The Qt windows and Speed Boost integration are imported on demand, so
 # PyInstaller cannot discover these local modules through static imports alone.
-& python -m PyInstaller --noconfirm --clean --windowed --onedir --name "FolditMonitor" --paths $projectRoot --add-data "$resourcesPath;modules/resources" --hidden-import modules.app --hidden-import modules.stats_ui_qt --hidden-import modules.save_manager_qt --hidden-import modules.foldit_speed_boost_integration --hidden-import modules.ligand_viewer --collect-all frida --workpath $buildRoot --distpath $distRoot --specpath $buildRoot "Foldit Monitor.pyw"
+# SciPy and Plotly support optional backends that the monitor never uses.
+# Exclude them so a shared Python environment does not inflate the package.
+$excludedModules = @(
+    "torch", "torchvision", "torchaudio", "tensorflow", "jax", "jaxlib",
+    "matplotlib", "pandas", "pyarrow", "polars", "sklearn", "IPython", "pytest"
+)
+$excludeArgs = foreach ($moduleName in $excludedModules) {
+    "--exclude-module"
+    $moduleName
+}
+& python -m PyInstaller --noconfirm --clean --windowed --onedir --name "FolditMonitor" --paths $projectRoot --add-data "$resourcesPath;modules/resources" --hidden-import modules.app --hidden-import modules.stats_ui_qt --hidden-import modules.save_manager_qt --hidden-import modules.foldit_speed_boost_integration --hidden-import modules.ligand_viewer --collect-all frida @excludeArgs --workpath $buildRoot --distpath $distRoot --specpath $buildRoot "Foldit Monitor.pyw"
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller did not complete successfully."
 }
