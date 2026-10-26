@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param()
 
 $ErrorActionPreference = "Stop"
@@ -8,8 +8,7 @@ $distRoot = Join-Path $projectRoot "dist"
 $releaseRoot = Join-Path $projectRoot "release"
 $packageRoot = Join-Path $distRoot "FolditMonitor"
 $archivePath = Join-Path $releaseRoot "FolditMonitor-windows-x64.zip"
-$alertPath = Join-Path $projectRoot "alert.wav"
-$defaultsProfilePath = Join-Path $projectRoot "Foldit Monitor.defaults.json"
+$resourcesPath = Join-Path $projectRoot "modules\resources"
 
 Set-Location $projectRoot
 
@@ -24,7 +23,7 @@ if ($LASTEXITCODE -ne 0) {
 
 # The Qt windows and Speed Boost integration are imported on demand, so
 # PyInstaller cannot discover these local modules through static imports alone.
-& python -m PyInstaller --noconfirm --clean --windowed --onedir --name "FolditMonitor" --paths $projectRoot --add-data "$alertPath;." --add-data "$defaultsProfilePath;." --hidden-import stats_ui_qt --hidden-import save_manager_qt --hidden-import foldit_speed_boost_integration --collect-all frida --workpath $buildRoot --distpath $distRoot --specpath $buildRoot "Foldit Monitor.pyw"
+& python -m PyInstaller --noconfirm --clean --windowed --onedir --name "FolditMonitor" --paths $projectRoot --add-data "$resourcesPath;modules/resources" --hidden-import modules.app --hidden-import modules.stats_ui_qt --hidden-import modules.save_manager_qt --hidden-import modules.foldit_speed_boost_integration --hidden-import modules.ligand_viewer --collect-all frida --workpath $buildRoot --distpath $distRoot --specpath $buildRoot "Foldit Monitor.pyw"
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller did not complete successfully."
 }

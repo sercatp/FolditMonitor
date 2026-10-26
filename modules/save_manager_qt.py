@@ -36,10 +36,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from save_catalog import ClientLocation, CopyReport, DeleteReport, SaveCatalog, SaveIndex, SaveRecord, normalize_path
-from savefile_api import export_pdb
-from stats_ui_qt import QtEventPump
-from window_manager import open_containing_folder
+from modules.save_catalog import ClientLocation, CopyReport, DeleteReport, SaveCatalog, SaveIndex, SaveRecord, normalize_path
+from modules.savefile_api import export_pdb
+from modules.stats_ui_qt import QtEventPump
+from modules.window_manager import open_containing_folder
 
 
 ClientProvider = Callable[[], Sequence[ClientLocation]]
@@ -833,7 +833,7 @@ class SaveManagerWindowQt(QMainWindow):
         selection.clearSelection()
         for row, record in enumerate(self.visible_records):
             if record.error:
-                save_name = "⚠ Parse error"
+                save_name = f"⚠ {record.save_name}" if record.save_name else "⚠ Parse error"
             elif record.metadata_loaded:
                 save_name = record.save_name
             else:

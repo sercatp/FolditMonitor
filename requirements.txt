@@ -6,6 +6,8 @@ Pillow>=10
 pygame>=2.5; python_version < "3.14"
 PySide6>=6.7
 numpy>=1.26
+scipy>=1.14
+plotly>=5.24,<7
 
 # The speed boost targets Windows' game_library.dll and is optional.
 frida==17.15.4; sys_platform == "win32"

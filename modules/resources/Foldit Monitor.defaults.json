@@ -9,7 +9,14 @@
   "display": {
     "tooltip_lines": 15,
     "always_on_top": false,
-    "show_puzzle_column": false,
+    "show_puzzle_column": true,
+    "monitor_columns": [
+      {"id": "Score", "visible": true},
+      {"id": "CPU", "visible": true},
+      {"id": "Puzzle", "visible": true},
+      {"id": "Folder", "visible": true},
+      {"id": "Type", "visible": true}
+    ],
     "window_position": {
       "x": 1,
       "y": 1
@@ -75,6 +82,11 @@
   "backup": {
     "folder_name": "foldit_backup",
     "save_to_backup": true
+  },
+  "ligand_viewer": {
+    "quality": "Standard",
+    "reach": 8.0,
+    "probe_radius": 0.0
   },
   "speed_boost": {
     "enabled": false,

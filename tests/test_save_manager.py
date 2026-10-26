@@ -9,13 +9,29 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import savefile_api
-import window_manager
-from save_catalog import ClientLocation, PuzzleMappingStore, SaveCatalog, SaveIndex, SaveRecord, normalize_path
-from savefile_api import FolditSaveSummary
+from modules import savefile_api
+from modules import window_manager
+from modules.save_catalog import ClientLocation, PuzzleMappingStore, SaveCatalog, SaveIndex, SaveRecord, normalize_path
+from modules.savefile_api import FolditSaveSummary
 
 
 class SaveSummaryApiCases(unittest.TestCase):
+    @staticmethod
+    def _saved_energy_data(stored_energy, values, *, padding=b"", disulfides=0):
+        name = b"Ligand pose"
+        return (
+            b"SOLN"
+            + b"META"
+            + struct.pack("<I", len(name))
+            + name
+            + padding
+            + struct.pack("<IdI", 0, stored_energy, len(values))
+            + struct.pack(f"<{len(values)}d", *values)
+            + b"RESI"
+            + struct.pack("<I", len(values))
+            + b"\x00".join([b"CYS:disulfide"] * disulfides)
+        )
+
     @staticmethod
     def _mode_block(raw_mode, player_id=415886):
         build = b"20250926-ed7de9856f-win_x64"
@@ -86,6 +102,126 @@ class SaveSummaryApiCases(unittest.TestCase):
         self.assertEqual(info.player_name, "Player")
         self.assertEqual(info.save_name, "Compatible")
         self.assertAlmostEqual(info.foldit_score, 7250.0)
+
+    def test_mismatched_recorded_total_is_used_without_inventing_bonus_breakdown(self):
+        data = self._saved_energy_data(-327.00375260707676, [1.0, 2.0])
+        player = SimpleNamespace(puzzle_id=2014402, player_name="Player")
+        with (
+            patch.object(savefile_api, "_read_save_bytes", return_value=(Path("sample.ir_solution"), data)),
+            patch.object(savefile_api, "_find_player", return_value=player),
+        ):
+            summary = savefile_api.get_save_summary("sample.ir_solution")
+            score = savefile_api.get_foldit_score("sample.ir_solution")
+            bonus = savefile_api.get_bonus_score("sample.ir_solution")
+
+        self.assertAlmostEqual(summary.total_score, 11270.037526070768)
+        self.assertAlmostEqual(score, summary.total_score)
+        self.assertIsNone(summary.base_score)
+        self.assertIsNone(summary.bonus_score)
+        self.assertIsNone(bonus)
+
+    def test_matching_recorded_energy_keeps_legacy_disulfide_bonus(self):
+        data = self._saved_energy_data(3.0, [1.0, 2.0], disulfides=2)
+        player = SimpleNamespace(puzzle_id=2014300, player_name="Player")
+        with (
+            patch.object(savefile_api, "_read_save_bytes", return_value=(Path("sample.ir_solution"), data)),
+            patch.object(savefile_api, "_find_player", return_value=player),
+        ):
+            summary = savefile_api.get_save_summary("sample.ir_solution")
+
+        self.assertEqual(summary.base_score, 7970.0)
+        self.assertEqual(summary.bonus_score, 250.0)
+        self.assertEqual(summary.total_score, 8220.0)
+
+    def test_mismatched_recorded_total_does_not_double_count_disulfides(self):
+        data = self._saved_energy_data(-327.0, [1.0, 2.0], disulfides=2)
+        player = SimpleNamespace(puzzle_id=2013851, player_name="Player")
+        with (
+            patch.object(savefile_api, "_read_save_bytes", return_value=(Path("sample.ir_solution"), data)),
+            patch.object(savefile_api, "_find_player", return_value=player),
+        ):
+            summary = savefile_api.get_save_summary("sample.ir_solution")
+
+        self.assertEqual(summary.total_score, 11270.0)
+        self.assertIsNone(summary.base_score)
+        self.assertIsNone(summary.bonus_score)
+
+    def test_disulfide_query_still_works_without_score_block(self):
+        data = b"RESI" + struct.pack("<I", 2) + b"CYS:disulfide\x00CYS:disulfide"
+        with patch.object(
+            savefile_api, "_read_save_bytes", return_value=(Path("sample.ir_solution"), data)
+        ):
+            self.assertEqual(savefile_api.get_bonus_score("sample.ir_solution"), 250.0)
+
+    def test_unanchored_double_does_not_override_legacy_score(self):
+        data = self._saved_energy_data(-327.0, [1.0, 2.0], padding=b"other")
+        player = SimpleNamespace(puzzle_id=2014300, player_name="Player")
+        with (
+            patch.object(savefile_api, "_read_save_bytes", return_value=(Path("sample.ir_solution"), data)),
+            patch.object(savefile_api, "_find_player", return_value=player),
+        ):
+            summary = savefile_api.get_save_summary("sample.ir_solution")
+
+        self.assertEqual(summary.base_score, 7970.0)
+        self.assertEqual(summary.bonus_score, 0.0)
+        self.assertEqual(summary.total_score, 7970.0)
+
+
+class SharedSolutionWithoutEnergyArrayCases(unittest.TestCase):
+    @staticmethod
+    def _shared_data(energy=-1569.1207097351128, *, padding=b"", flag=b"\x01"):
+        name = b"B2828"
+        player = b"Bruno Kestemont\x00"
+        return (
+            struct.pack("<I", 11) + b"SOLN" + struct.pack("<I", 7)
+            + b"META" + struct.pack("<I", len(name)) + name + padding
+            + struct.pack("<IdI", 0, energy, 0) + flag
+            + struct.pack("<4I", 2014419, 2014419, 1, len(player)) + player
+            + b"\x00" * 13 + b"POSE" + b"RESI" + struct.pack("<I", 229)
+        )
+
+    def test_shared_summary_and_basic_info_use_recorded_total_from_one_read(self):
+        data = self._shared_data()
+        with patch.object(
+            savefile_api, "_read_save_bytes", return_value=(Path("shared.ir_solution"), data)
+        ) as read:
+            summary = savefile_api.get_save_summary("shared.ir_solution")
+            self.assertEqual(read.call_count, 1)
+            info = savefile_api.get_basic_info("shared.ir_solution")
+            self.assertEqual(read.call_count, 2)
+            score = savefile_api.get_foldit_score("shared.ir_solution")
+
+        self.assertEqual(summary.puzzle_id, 2014419)
+        self.assertEqual(info.player_name, "Bruno Kestemont")
+        self.assertEqual(info.save_name, "B2828")
+        self.assertAlmostEqual(score, 23691.20709735113)
+        self.assertEqual(info.foldit_score, score)
+        self.assertEqual(summary.total_score, score)
+        self.assertIsNone(summary.base_score)
+        self.assertIsNone(summary.bonus_score)
+
+    def test_recorded_total_does_not_add_disulfide_bonus_again(self):
+        data = self._shared_data(-235.80979587767294) + b"CYS:disulfide\x00CYS:disulfide"
+        with patch.object(
+            savefile_api, "_read_save_bytes", return_value=(Path("shared.ir_solution"), data)
+        ):
+            self.assertAlmostEqual(savefile_api.get_foldit_score("shared.ir_solution"), 10358.097958776729)
+            self.assertIsNone(savefile_api.get_bonus_score("shared.ir_solution"))
+
+    def test_empty_array_requires_exact_boundary_and_valid_player_record(self):
+        data = self._shared_data()
+        invalid = (
+            self._shared_data(padding=b"other"),
+            self._shared_data(flag=b"\x00"),
+            data.replace(struct.pack("<2I", 2014419, 2014419), struct.pack("<2I", 2014419, 2014420)),
+            data[:42],
+            self._shared_data(math.nan),
+            self._shared_data(math.inf),
+        )
+        for candidate in invalid:
+            with self.subTest(candidate=candidate[:60]):
+                with self.assertRaises(savefile_api.FolditApiError):
+                    savefile_api._find_energy(candidate)
 
 
 class EnergyBlockDetectionCases(unittest.TestCase):
@@ -277,6 +413,60 @@ class SaveCatalogCases(unittest.TestCase):
         self.assertEqual(cached.mode_player_id, 415886)
         self.assertAlmostEqual(cached.mode_reference_base_score, 28105.697)
 
+    def test_unknown_breakdown_keeps_total_score_in_cache(self):
+        save_path = self.client / "puzzle_2014362_time_100.ir_solution"
+        save_path.write_bytes(b"save")
+        self.reader = lambda _path: FolditSaveSummary(
+            2014362, "Serca", "Ligand", None, None, 11270.037526
+        )
+        catalog = self._catalog()
+        record = catalog.scan_client("2014362", self.location)[0]
+        catalog.load_metadata(record)
+        cached = self._catalog().scan_client("2014362", self.location)[0]
+        self.assertIsNone(cached.base_score)
+        self.assertIsNone(cached.bonus_score)
+        self.assertAlmostEqual(cached.total_score, 11270.037526)
+
+    def test_partial_metadata_survives_cache_and_explicit_retry(self):
+        save_path = self.client / "puzzle_2014362_time_100.ir_solution"
+        save_path.write_bytes(b"save")
+        outcomes = [
+            FolditSaveSummary(
+                2014362, "Serca", "Readable name", None, 250.0, None,
+                errors={"total_score": "Energy block unavailable"},
+            ),
+            FolditSaveSummary(2014362, "Serca", "Readable name", 10000.0, 250.0, 10250.0),
+        ]
+        self.reader = lambda _path: outcomes.pop(0)
+        catalog = self._catalog()
+        catalog.load_metadata(catalog.scan_client("2014362", self.location)[0])
+        cached = self._catalog().scan_client("2014362", self.location)[0]
+        self.assertEqual(cached.save_name, "Readable name")
+        self.assertEqual(cached.player_name, "Serca")
+        self.assertEqual(cached.bonus_score, 250.0)
+        self.assertIsNone(cached.total_score)
+        self.assertIn("Energy block unavailable", cached.error)
+        catalog.load_metadata(cached)
+        self.assertEqual(len(outcomes), 1)
+        catalog.load_metadata(cached, force_error_retry=True)
+        self.assertEqual(cached.total_score, 10250.0)
+        self.assertEqual(cached.error, "")
+
+    def test_unknown_puzzle_and_player_do_not_hide_available_name_and_score(self):
+        save_path = self.client / "puzzle_2014362_time_100.ir_solution"
+        save_path.write_bytes(b"save")
+        self.reader = lambda _path: FolditSaveSummary(
+            None, None, "Readable name", 10000.0, 0.0, 10000.0,
+            errors={"puzzle_id": "Player block unavailable", "player_name": "Player block unavailable"},
+        )
+        catalog = self._catalog()
+        record = catalog.scan_client("2014362", self.location)[0]
+        catalog.load_metadata(record)
+        self.assertEqual(record.save_name, "Readable name")
+        self.assertEqual(record.player_name, "")
+        self.assertEqual(record.total_score, 10000.0)
+        self.assertEqual(record.error, "Player block unavailable")
+
     def test_older_parser_cache_schema_is_rebuilt(self):
         save_path = self.client / "puzzle_2014362_time_100.ir_solution"
         save_path.write_bytes(b"one")
@@ -286,14 +476,15 @@ class SaveCatalogCases(unittest.TestCase):
         first_catalog.load_metadata(first_record)
         self.assertEqual(self.reader_calls, [save_path.name])
 
-        with closing(sqlite3.connect(self.index_path)) as connection, connection:
-            connection.execute("PRAGMA user_version = 4")
+        for previous_version in (4, 5, 6):
+            with closing(sqlite3.connect(self.index_path)) as connection, connection:
+                connection.execute(f"PRAGMA user_version = {previous_version}")
 
-        second_catalog = self._catalog()
-        second_record = second_catalog.scan_client("2014362", self.location)[0]
-        self.assertFalse(second_record.metadata_loaded)
-        second_catalog.load_metadata(second_record)
-        self.assertEqual(self.reader_calls, [save_path.name, save_path.name])
+            next_catalog = self._catalog()
+            next_record = next_catalog.scan_client("2014362", self.location)[0]
+            self.assertFalse(next_record.metadata_loaded)
+            next_catalog.load_metadata(next_record)
+        self.assertEqual(self.reader_calls, [save_path.name] * 4)
 
     def test_parse_error_is_cached_and_retried_explicitly(self):
         save_path = self.client / "puzzle_2014362_time_100.ir_solution"
@@ -576,7 +767,7 @@ class SaveCatalogCases(unittest.TestCase):
             str(outside), "Foldit1", str(self.client), "2014362", "2014362",
             outside.name, outside_stat.st_size, outside_stat.st_mtime_ns, outside_stat.st_mtime,
         ))
-        with patch("save_catalog.delete_file", wraps=window_manager.delete_file) as delete_file:
+        with patch("modules.save_catalog.delete_file", wraps=window_manager.delete_file) as delete_file:
             report = catalog.delete_records(records)
         self.assertEqual((report.deleted, report.skipped, report.failed), (1, 2, 0))
         delete_file.assert_called_once_with(str(first))
@@ -594,10 +785,10 @@ class SaveManagerIntegrationSourceCases(unittest.TestCase):
 
     def test_main_and_stats_entry_points_are_wired(self):
         root = Path(__file__).resolve().parents[1]
-        monitor_source = (root / "Foldit Monitor.pyw").read_text(encoding="utf-8-sig")
-        tk_stats_source = (root / "stats_ui.py").read_text(encoding="utf-8")
-        qt_stats_source = (root / "stats_ui_qt.py").read_text(encoding="utf-8")
-        save_manager_source = (root / "save_manager_qt.py").read_text(encoding="utf-8")
+        monitor_source = (root / "modules" / "app.py").read_text(encoding="utf-8-sig")
+        tk_stats_source = (root / "modules" / "stats_ui.py").read_text(encoding="utf-8")
+        qt_stats_source = (root / "modules" / "stats_ui_qt.py").read_text(encoding="utf-8")
+        save_manager_source = (root / "modules" / "save_manager_qt.py").read_text(encoding="utf-8")
         self.assertIn('MANAGE_SAVES_LABEL = "Manage Saves"', monitor_source)
         self.assertIn('initial_scope="client"', monitor_source)
         self.assertIn('text="Saves"', tk_stats_source)
@@ -607,7 +798,7 @@ class SaveManagerIntegrationSourceCases(unittest.TestCase):
         callback_source = monitor_source.split("def open_save_manager_window", 1)[1].split(
             "def refresh_stats_puzzle_menu", 1
         )[0]
-        self.assertIn("from save_manager_qt import show_save_manager", callback_source)
+        self.assertIn("from modules.save_manager_qt import show_save_manager", callback_source)
         self.assertNotIn("after_idle", callback_source)
         self.assertNotIn("subprocess", callback_source)
         self.assertIn('QCheckBox("Include quick/auto saves"', save_manager_source)
@@ -619,10 +810,43 @@ class SaveManagerIntegrationSourceCases(unittest.TestCase):
 
 
 class SaveManagerPuzzleSelectorCases(unittest.TestCase):
+    def test_partial_metadata_keeps_readable_name_and_score_visible(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from modules.save_manager_qt import QtEventPump, SaveManagerWindowQt
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as folder:
+            client = ClientLocation("Foldit1", folder, True, "2828")
+            record = SaveRecord(
+                str(Path(folder) / "shared.ir_solution"), "Foldit1", folder, "2828", "2014419",
+                "shared.ir_solution", 100, 1, 1.0, save_name="B2828", total_score=23691.2071,
+                metadata_loaded=True, error="Player block unavailable",
+            )
+            with (
+                patch.object(QtEventPump, "ensure_started"),
+                patch.object(QtEventPump, "register_window"),
+                patch.object(QtEventPump, "unregister_window"),
+                patch.object(SaveManagerWindowQt, "focus_window"),
+                patch.object(SaveManagerWindowQt, "_scan_worker"),
+            ):
+                window = SaveManagerWindowQt(
+                    None, "2828", lambda: [client], str(Path(folder) / "index.sqlite3"), folder,
+                )
+                try:
+                    window.records_by_client = {normalize_path(folder): [record]}
+                    window._refresh_table()
+                    self.assertEqual(window.save_table.item(0, 1).text(), "⚠ B2828")
+                    self.assertEqual(window.save_table.item(0, 2).text(), "23691.207")
+                    self.assertIn("Player block unavailable", window.save_table.item(0, 1).toolTip())
+                finally:
+                    window.close()
+        self.assertIsNotNone(app)
+
     def test_switches_between_running_puzzles_and_scans_all_clients(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
-        from save_manager_qt import QtEventPump, SaveManagerWindowQt
+        from modules.save_manager_qt import QtEventPump, SaveManagerWindowQt
 
         app = QApplication.instance() or QApplication([])
         with tempfile.TemporaryDirectory() as folder:
@@ -664,7 +888,7 @@ class SaveManagerSelectionAndDeleteCases(unittest.TestCase):
     def test_copy_dialog_accepts_external_folder_and_rejects_missing_destination(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
-        from save_manager_qt import CopyTargetsDialog
+        from modules.save_manager_qt import CopyTargetsDialog
 
         app = QApplication.instance() or QApplication([])
         with tempfile.TemporaryDirectory() as folder:
@@ -682,7 +906,7 @@ class SaveManagerSelectionAndDeleteCases(unittest.TestCase):
         self.assertIsNotNone(app)
 
     def test_batch_export_keeps_existing_pdb_and_makes_distinct_names(self):
-        from save_manager_qt import export_records_to_pdb
+        from modules.save_manager_qt import export_records_to_pdb
 
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -712,7 +936,7 @@ class SaveManagerSelectionAndDeleteCases(unittest.TestCase):
     def test_select_all_targets_filtered_rows_and_delete_requires_confirmation(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication, QMessageBox
-        from save_manager_qt import QtEventPump, SaveManagerWindowQt
+        from modules.save_manager_qt import QtEventPump, SaveManagerWindowQt
 
         app = QApplication.instance() or QApplication([])
         with tempfile.TemporaryDirectory() as folder:
@@ -761,7 +985,7 @@ class SaveManagerSelectionAndDeleteCases(unittest.TestCase):
                     self.assertEqual(window.save_table.item(0, 6).text(), "28105.000")
                     self.assertEqual(window.save_table.item(0, 7).text(), "+16.000")
 
-                    from save_manager_qt import CopyTargetsDialog
+                    from modules.save_manager_qt import CopyTargetsDialog
                     with (
                         patch.object(CopyTargetsDialog, "selected_destinations", return_value=([], folder)),
                         patch.object(window, "_start_copy") as start_copy,
@@ -774,14 +998,14 @@ class SaveManagerSelectionAndDeleteCases(unittest.TestCase):
                     self.assertEqual(len(start_share.call_args.args[0]), 2)
                     self.assertTrue(start_share.call_args.kwargs["skip_own_client"])
 
-                    from save_manager_qt import PdbExportItemResult, PdbExportReport
+                    from modules.save_manager_qt import PdbExportItemResult, PdbExportReport
                     export_report = PdbExportReport([
                         PdbExportItemResult(records[0].path, str(Path(folder) / "one.pdb")),
                         PdbExportItemResult(records[1].path, str(Path(folder) / "two.pdb")),
                     ])
                     with (
-                        patch("save_manager_qt.threading.Thread") as export_thread,
-                        patch("save_manager_qt.export_records_to_pdb", return_value=export_report) as exporter,
+                        patch("modules.save_manager_qt.threading.Thread") as export_thread,
+                        patch("modules.save_manager_qt.export_records_to_pdb", return_value=export_report) as exporter,
                         patch.object(QMessageBox, "information") as information,
                     ):
                         window.export_button.click()
@@ -798,7 +1022,7 @@ class SaveManagerSelectionAndDeleteCases(unittest.TestCase):
                     with (
                         patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.Yes),
                         patch.object(QMessageBox, "information") as info,
-                        patch("save_manager_qt.threading.Thread") as thread_class,
+                        patch("modules.save_manager_qt.threading.Thread") as thread_class,
                     ):
                         window.delete_button.click()
                         thread_class.call_args.kwargs["target"]()

@@ -47,7 +47,7 @@ Available functions:
     get_basic_info(save_path) -> FolditBasicInfo
     get_save_summary(save_path) -> FolditSaveSummary
     get_solution_mode_info(save_path) -> FolditSolutionModeInfo
-    get_bonus_score(save_path) -> float
+    get_bonus_score(save_path) -> Optional[float]
     get_disulfide_info(save_path) -> FolditDisulfideInfo
     get_player_name(save_path) -> str
     get_save_name(save_path) -> str
@@ -61,13 +61,17 @@ Behavior:
       Other values are returned without a guessed mode.
     - The metadata functions do not export a PDB.
     - `export_pdb()` only exports the PDB and returns the written file path.
-    - On parse problems, the module raises `FolditApiError`.
+    - Summary/basic-info queries return available fields, with None for missing
+      values and an `errors` dict describing unavailable core fields.
+    - Pass `strict=True` to require all core fields in these queries.
+    - Name, player, score, and mode queries raise `FolditApiError` if their
+      requested field is unavailable. File access failures always raise it.
 """
 
 import math
 import re
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -142,22 +146,24 @@ class FolditApiError(RuntimeError):
 
 @dataclass(frozen=True)
 class FolditBasicInfo:
-    player_name: str
-    save_name: str
-    foldit_score: float
+    player_name: Optional[str]
+    save_name: Optional[str]
+    foldit_score: Optional[float]
+    errors: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class FolditSaveSummary:
-    puzzle_id: int
-    player_name: str
-    save_name: str
-    base_score: float
-    bonus_score: float
-    total_score: float
+    puzzle_id: Optional[int]
+    player_name: Optional[str]
+    save_name: Optional[str]
+    base_score: Optional[float]
+    bonus_score: Optional[float]
+    total_score: Optional[float]
     solution_mode: Optional[str] = None
     mode_player_id: Optional[int] = None
     mode_reference_base_score: Optional[float] = None
+    errors: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1039,7 +1045,10 @@ def _normalize_save_path(save_path: PathLike) -> Path:
 
 def _read_save_bytes(save_path: PathLike) -> tuple[Path, bytes]:
     path = _normalize_save_path(save_path)
-    return path, path.read_bytes()
+    try:
+        return path, path.read_bytes()
+    except OSError as exc:
+        raise FolditApiError(f"Cannot read save file {path}: {exc}") from exc
 
 
 def _find_meta(data: bytes) -> TaggedString:
@@ -1055,8 +1064,7 @@ def _find_meta(data: bytes) -> TaggedString:
 
 
 def _infer_energy_targets(data: bytes, meta: Optional[TaggedString] = None) -> Optional[Tuple[int, ...]]:
-    meta = meta or _find_meta(data)
-    prefer_after = meta.payload_off + meta.strlen
+    prefer_after = meta.payload_off + meta.strlen if meta is not None else 0
 
     targets: set[int] = set()
 
@@ -1118,10 +1126,42 @@ def _calculate_bonus_score(data: bytes) -> float:
 
 
 def _find_energy(data: bytes, meta: Optional[TaggedString] = None) -> EnergyBlock:
-    meta = meta or _find_meta(data)
+    if meta is None:
+        try:
+            meta = _find_meta(data)
+        except FolditApiError:
+            pass
+    # Downloaded shared solutions can retain the recorded total while omitting
+    # the per-residue energy cache entirely. Validate this layout at the exact
+    # META boundary, including the following player record; accepting zero-count
+    # arrays in the scanning parsers would also accept arbitrary zero padding.
+    start = meta.payload_off + meta.strlen if meta is not None else 0
+    prefix_length = u32(data, start)
+    if meta is not None and prefix_length is not None and prefix_length <= 64:
+        energy_off = start + 4 + prefix_length
+        energy = f64(data, energy_off)
+        end = energy_off + 12
+        if (
+            energy is not None
+            and math.isfinite(energy)
+            and u32(data, energy_off + 8) == 0
+            and data[end:end + 1] == b"\x01"
+            and find_puzzle_player_block(data, start=end + 1, window=1) is not None
+        ):
+            return EnergyBlock(
+                off=start,
+                energy_off=energy_off,
+                total_energy=energy,
+                n_off=energy_off + 8,
+                n=0,
+                arr_off=end,
+                per_residue=[],
+                end_off=end,
+                variant="B-empty",
+            )
     energy_block = find_energy_block(
         data,
-        start=meta.payload_off + meta.strlen,
+        start=start,
         n_targets=_infer_energy_targets(data, meta),
     )
     if not energy_block:
@@ -1129,16 +1169,68 @@ def _find_energy(data: bytes, meta: Optional[TaggedString] = None) -> EnergyBloc
     return energy_block
 
 
+def _find_recorded_total_score(
+    data: bytes, meta: Optional[TaggedString], energy_block: EnergyBlock
+) -> Optional[float]:
+    """Read a separately stored score only when it owns the detected array.
+
+    Some ligand saves store the pose's total energy immediately before an
+    energy array whose sum differs from that total. The older array parser then
+    identifies variant D and loses the real score. Requiring the exact META
+    boundary and the same array count avoids treating a nearby double as a
+    score in legacy or unrecognized layouts.
+    """
+    if not hasattr(meta, "payload_off") or not hasattr(meta, "strlen"):
+        return None
+    start = meta.payload_off + meta.strlen
+    prefix_length = u32(data, start)
+    if prefix_length is None or prefix_length > 128:
+        return None
+    energy_off = start + 4 + prefix_length
+    if (
+        getattr(energy_block, "n_off", None) != energy_off + 8
+        or getattr(energy_block, "arr_off", None) != energy_off + 12
+        or u32(data, energy_off + 8) != getattr(energy_block, "n", None)
+    ):
+        return None
+    energy = f64(data, energy_off)
+    if energy is None or not math.isfinite(energy):
+        return None
+    score = 8000.0 - 10.0 * energy
+    return score if math.isfinite(score) else None
+
+
+def _score_components(
+    data: bytes, meta: Optional[TaggedString], energy_block: EnergyBlock
+) -> Tuple[Optional[float], Optional[float], float]:
+    if getattr(energy_block, "variant", None) == "B-empty":
+        # Without the array there is no independent base energy or bonus
+        # breakdown. The recorded total already includes any scoring bonuses.
+        return None, None, _calculate_base_score(energy_block)
+    base_score = _calculate_base_score(energy_block)
+    bonus_score = _calculate_bonus_score(data)
+    legacy_total = base_score + bonus_score
+    recorded_total = _find_recorded_total_score(data, meta, energy_block)
+
+    # Ordinary saves either store the same base energy as the array or include
+    # exactly the already detected bonus. Keep their established breakdown.
+    if (
+        recorded_total is None
+        or math.isclose(recorded_total, base_score, rel_tol=1e-9, abs_tol=1e-5)
+        or math.isclose(recorded_total, legacy_total, rel_tol=1e-9, abs_tol=1e-5)
+    ):
+        return base_score, bonus_score, legacy_total
+
+    # The array is not a reliable base score in this layout, and the save does
+    # not expose a complete per-filter bonus breakdown. Only total is known.
+    return None, None, recorded_total
+
+
 def _find_player(data: bytes, energy_block: Optional[EnergyBlock] = None) -> PuzzlePlayerBlock:
     starts: List[int] = []
 
     if energy_block is not None:
         starts.append(energy_block.end_off)
-    else:
-        try:
-            starts.append(_find_energy(data).end_off)
-        except FolditApiError:
-            pass
 
     try:
         meta = _find_meta(data)
@@ -1199,45 +1291,83 @@ def _find_solution_mode_info(data: bytes) -> Optional[FolditSolutionModeInfo]:
     )
 
 
-def _extract_save_summary(data: bytes) -> FolditSaveSummary:
-    meta = _find_meta(data)
-    energy_block = _find_energy(data, meta)
-    player_block = _find_player(data, energy_block)
-    base_score = _calculate_base_score(energy_block)
-    bonus_score = _calculate_bonus_score(data)
+def _extract_save_summary(data: bytes, *, strict: bool = False) -> FolditSaveSummary:
+    errors: Dict[str, str] = {}
+    meta = None
+    energy_block = None
+    player_block = None
+    base_score = bonus_score = total_score = None
+    try:
+        meta = _find_meta(data)
+    except FolditApiError as exc:
+        errors["save_name"] = str(exc)
+    try:
+        energy_block = _find_energy(data, meta)
+        base_score, bonus_score, total_score = _score_components(data, meta, energy_block)
+    except FolditApiError as exc:
+        errors["total_score"] = str(exc)
+        # Disulfide markers can remain readable even without an energy block.
+        if find_resi_tag(data) is not None:
+            bonus_score = _calculate_bonus_score(data)
+    try:
+        player_block = _find_player(data, energy_block)
+    except FolditApiError as exc:
+        errors["player_name"] = errors["puzzle_id"] = str(exc)
     mode_info = _find_solution_mode_info(data)
+    if strict and errors:
+        raise FolditApiError("; ".join(dict.fromkeys(errors.values())))
     return FolditSaveSummary(
-        puzzle_id=player_block.puzzle_id,
-        player_name=player_block.player_name,
-        save_name=meta.payload,
+        puzzle_id=player_block.puzzle_id if player_block else None,
+        player_name=player_block.player_name if player_block else None,
+        save_name=meta.payload if meta else None,
         base_score=base_score,
         bonus_score=bonus_score,
-        total_score=base_score + bonus_score,
+        total_score=total_score,
         solution_mode=mode_info.mode if mode_info else None,
         mode_player_id=mode_info.player_id if mode_info else None,
         mode_reference_base_score=mode_info.reference_base_score if mode_info else None,
+        errors=errors,
     )
 
 
-def _extract_basic_info(data: bytes) -> FolditBasicInfo:
+def _extract_basic_info(data: bytes, *, strict: bool = False) -> FolditBasicInfo:
     summary = _extract_save_summary(data)
+    errors = {
+        ("foldit_score" if name == "total_score" else name): message
+        for name, message in summary.errors.items() if name != "puzzle_id"
+    }
+    if strict and errors:
+        raise FolditApiError("; ".join(dict.fromkeys(errors.values())))
     return FolditBasicInfo(
         player_name=summary.player_name,
         save_name=summary.save_name,
         foldit_score=summary.total_score,
+        errors=errors,
     )
 
 
-def get_basic_info(save_path: PathLike) -> FolditBasicInfo:
-    """Return player_name, save_name, and foldit_score using one file read."""
+def get_basic_info(save_path: PathLike, *, strict: bool = False) -> FolditBasicInfo:
+    """Read once; return available name/player/score fields and per-field errors.
+
+    Missing fields are None. With strict=True, an unavailable core field raises
+    FolditApiError instead of returning partial data. File access errors raise
+    regardless of strict mode.
+    """
     _, data = _read_save_bytes(save_path)
-    return _extract_basic_info(data)
+    return _extract_basic_info(data, strict=strict)
 
 
-def get_save_summary(save_path: PathLike) -> FolditSaveSummary:
-    """Return puzzle identity and base/bonus/total scores using one file read."""
+def get_save_summary(save_path: PathLike, *, strict: bool = False) -> FolditSaveSummary:
+    """Read once; independently extract identity, scores, and optional mode.
+
+    Unavailable core fields are None and described in errors. strict=True
+    requires save name, player/puzzle identity, and total score; optional mode
+    and score-breakdown fields do not affect strictness.
+    Base and bonus are None when the save omits the per-residue energy array,
+    or records a different total without a trustworthy breakdown of that total.
+    """
     _, data = _read_save_bytes(save_path)
-    return _extract_save_summary(data)
+    return _extract_save_summary(data, strict=strict)
 
 
 def get_solution_mode_info(save_path: PathLike) -> FolditSolutionModeInfo:
@@ -1267,15 +1397,28 @@ def get_save_name(save_path: PathLike) -> str:
 
 
 def get_foldit_score(save_path: PathLike) -> float:
-    """Return the overall Foldit score including detected bonus points."""
+    """Return the overall Foldit score, using its recorded total if available."""
     _, data = _read_save_bytes(save_path)
-    return _calculate_base_score(_find_energy(data)) + _calculate_bonus_score(data)
+    try:
+        meta = _find_meta(data)
+    except FolditApiError:
+        meta = None
+    return _score_components(data, meta, _find_energy(data, meta))[2]
 
 
-def get_bonus_score(save_path: PathLike) -> float:
-    """Return detected bonus points encoded in the save."""
+def get_bonus_score(save_path: PathLike) -> Optional[float]:
+    """Return known bonus points, or None if the breakdown is unknown."""
     _, data = _read_save_bytes(save_path)
-    return _calculate_bonus_score(data)
+    try:
+        try:
+            meta = _find_meta(data)
+        except FolditApiError:
+            meta = None
+        energy_block = _find_energy(data, meta)
+    except FolditApiError:
+        # This query historically needed only RESI, not a valid score block.
+        return _calculate_bonus_score(data) if find_resi_tag(data) else None
+    return _score_components(data, meta, energy_block)[1]
 
 
 def get_disulfide_info(save_path: PathLike) -> FolditDisulfideInfo:

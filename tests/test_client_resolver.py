@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from client_resolver import (
+from modules.client_resolver import (
     ClientResolver,
     OpenLogBackend,
     ProbeResult,
@@ -18,9 +18,9 @@ from client_resolver import (
     parse_log_fallbacks,
     track_from_log_path,
 )
-from logger import FolditLogHandler
-from settings import Settings
-from window_manager import WindowManager
+from modules.logger import FolditLogHandler
+from modules.settings import Settings
+from modules.window_manager import WindowManager
 
 
 class FakeBackend:
@@ -310,7 +310,7 @@ class ResolverBackendCases(unittest.TestCase):
                 calls.append(path)
                 return real_scandir(path)
 
-            with patch("client_resolver.os.scandir", side_effect=counting_scandir):
+            with patch("modules.client_resolver.os.scandir", side_effect=counting_scandir):
                 first = index.observe([root])
                 second = index.observe([root])
 
@@ -325,7 +325,7 @@ class ResolverBackendCases(unittest.TestCase):
             index.observe([root])
             log_path.write_text("changed", encoding="utf-8")
 
-            with patch("client_resolver.os.scandir") as scandir:
+            with patch("modules.client_resolver.os.scandir") as scandir:
                 observation = index.observe([root])[normalize_path(root)]
 
             scandir.assert_not_called()
@@ -342,7 +342,7 @@ class ResolverBackendCases(unittest.TestCase):
                 stderr="",
             )
             backend = OpenLogBackend(system="Darwin")
-            with patch("client_resolver.subprocess.run", return_value=completed) as run:
+            with patch("modules.client_resolver.subprocess.run", return_value=completed) as run:
                 clients = [fake_client(123, root), fake_client(456, root)]
                 result = backend.probe(clients)
 
@@ -563,7 +563,7 @@ class MacWindowBackendCases(unittest.TestCase):
             manager.system = "Darwin"
 
             found = manager.find_installation_folders([root])
-            with patch("window_manager.subprocess.Popen") as popen:
+            with patch("modules.window_manager.subprocess.Popen") as popen:
                 launched = manager.launch_client(str(resources))
 
             self.assertEqual(found, [os.path.realpath(str(resources))])

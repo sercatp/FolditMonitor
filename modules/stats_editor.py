@@ -2,7 +2,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from stats_domain import (
+from modules.stats_domain import (
     FIN_FIXED_COLUMNS,
     append_score_history_if_changed,
     append_text_history_if_changed,
@@ -16,7 +16,7 @@ from stats_domain import (
     normalize_state_value,
     replace_latest_score_history_if_changed,
 )
-from stats_module import PuzzleData, StatsManager, natural_sort_key
+from modules.stats_module import PuzzleData, StatsManager, natural_sort_key
 
 
 class StatsEditorError(Exception):

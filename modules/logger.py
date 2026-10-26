@@ -7,7 +7,7 @@ import threading
 from collections import deque
 from typing import Any, Dict, List, Optional
 
-from window_manager import open_file as open_exported_file
+from modules.window_manager import open_file as open_exported_file
 
 APPEND_PROBE_BYTES = 64
 INTERRUPTED_LOG_PROCESS_TOLERANCE_SECONDS = 2.0

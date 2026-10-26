@@ -1,0 +1,3123 @@
+# Foldit Client Manager from Serca v1.0
+
+# Large piece of monkey code
+import psutil
+import time
+import os
+import sys
+# pygame is imported lazily inside the sound helpers below: its SDL init costs ~1s,
+# and it is only needed when an alarm actually plays, never on the startup path.
+from collections import defaultdict, deque
+from modules.window_manager import (
+    WindowManager,
+    create_ribbon_icon,
+    enable_native_dpi_awareness,
+    open_file,
+    open_folder,
+)
+from modules.client_resolver import ClientResolver, normalize_path
+from modules.track_saves import replace_track_save_tree, resolve_track_copy_paths, track_directory_name
+
+enable_native_dpi_awareness()
+
+import tkinter as tk
+from tkinter import ttk, font, messagebox
+import threading
+import re
+from types import SimpleNamespace
+
+import datetime
+import shutil
+import tempfile
+from importlib import import_module
+
+PUZZLE_ID_RE = re.compile(r"""
+    (?<!\d)                     # Do not start inside a longer number.
+    (?P<puzzle>\d{3,}[A-Za-z]*) # 3+ digits with an optional Latin suffix.
+    (?=$|[^A-Za-z])             # Stop at the end or before a non-Latin char.
+""", re.VERBOSE)
+
+from modules.network import (
+    ARTIFACT_QUERY_CAPABILITY,
+    ARTIFACT_TRANSFER_CAPABILITY,
+    NetworkManager,
+    ConnectDialog,
+    RemoteTreeView,
+    sanitize_artifact_filename,
+)
+from modules.log_lookup import find_matching_log_file, values_match_log_query
+from modules.settings import Settings
+from modules.settings_ui import SettingsDialog
+from modules.monitor_columns import COLUMN_IDS, column_at_x, visible_column_ids
+from modules.tooltip import TooltipWindow
+from modules.logger import FolditLogHandler
+from modules.stats_module import StatsManager, parse_numeric_score
+from modules.row_appearance import (
+    ROW_APPEARANCE_TAG_PREFIX,
+    build_appearance_tag,
+    build_row_visual_state,
+    get_appearance_profile as get_palette_appearance_profile,
+    is_row_appearance_tag,
+    parse_appearance_tag,
+    resolve_row_appearance as resolve_palette_row_appearance,
+)
+from modules.stats_ui import (
+    close_stats_window_if_exists,
+    get_open_stats_window,
+    is_stats_window_user_interacting,
+    show_stats,
+)
+try:
+    from modules.savefile_api import export_pdb, get_basic_info
+except Exception as e:
+    export_pdb = None
+    get_basic_info = None
+    print(f"savefile_api unavailable: {e}")
+
+from modules.paths import get_app_paths
+
+app_paths = get_app_paths()
+app_paths.prepare_data()
+root_path = str(app_paths.root)
+settings_manager = Settings(str(app_paths.data))
+stats_manager = StatsManager(str(app_paths.data), settings_manager.settings)
+
+# Create a dictionary with the necessary settings for log processing
+foldit_log_settings = {
+    'MAX_LINES': settings_manager.settings['logging']['max_lines'],
+    'EXCLUSION_CRITERIA': settings_manager.settings['logging']['exclude_score_strings'],
+    'SCRIPT_TYPE_MAPPING': settings_manager.settings['script_type_mapping'],
+    'SCRIPT_TYPE_FALLBACK_MAX_LENGTH': settings_manager.settings['display'].get('script_type_fallback_max_length', 10),
+    'CHECK_INTERVAL': settings_manager.CHECK_INTERVAL,
+    'SCORE_PATTERNS': settings_manager.SCORE_PATTERNS,
+    'tooltip_lines': settings_manager.settings['display']['tooltip_lines'],
+    'max_line_length': settings_manager.settings['logging']['max_line_length'],
+    'managed_log_exports': settings_manager.settings['logging'].get('managed_log_exports', True),
+}
+# Create an instance with the correct settings
+foldit_log_handler = FolditLogHandler(foldit_log_settings)
+speed_boost = None
+ligand_viewer = None
+
+
+def create_speed_boost_integration(root_widget, tree_widget):
+    """Load the optional local feature without making monitor startup depend on it."""
+    if not settings_manager.SPEED_BOOST_ENABLED:
+        return None
+    try:
+        integration_module = import_module("modules.foldit_speed_boost_integration")
+        integration_class = integration_module.FolditSpeedBoostIntegration
+        return integration_class(
+            root_widget,
+            tree_widget,
+            get_pid_tag,
+            settings_manager,
+        )
+    except Exception as error:
+        print(f"Optional speed boost unavailable: {error}")
+        return None
+
+
+# Now use settings_manager instead of settings
+window_width = 360
+window_height = 55
+
+# Get the window position from the settings
+settings_x = settings_manager.settings['display']['window_position']['x']
+settings_y = settings_manager.settings['display']['window_position']['y']
+
+
+def is_ui_interacting():
+    return (
+        ('root' in globals() and (getattr(root, 'is_dragging', False) or getattr(root, 'resizing', False)))
+        or is_stats_window_user_interacting()
+    )
+
+normal_font = None
+bold_font = None
+italic_font = None
+bold_italic_font = None
+tooltip_font = None
+def init_fonts():
+    global normal_font, bold_font, italic_font, bold_italic_font, tooltip_font
+    family = settings_manager.settings['display']['fonts']['family']
+    size = settings_manager.settings['display']['fonts']['normal_size']
+    tooltip_size = settings_manager.settings['display']['fonts']['tooltip_size']
+
+    normal_font = font.Font(family=family, size=size)
+    bold_font = font.Font(family=family, size=size, weight="bold")
+    italic_font = font.Font(family=family, size=size, slant="italic")
+    bold_italic_font = font.Font(family=family, size=size, weight="bold", slant="italic")
+    tooltip_font = font.Font(family=family, size=tooltip_size)
+
+backup_folder_name = "foldit_backup"
+save2backup = True  # Whether to create a backup for destination folder when copying saves
+
+def new_monitor_state():
+    return {
+    'cpu_history': deque(maxlen=settings_manager.MONITOR_DURATION // settings_manager.CHECK_INTERVAL),
+    'high_cpu_count': 0,
+    'low_cpu_count': 0,
+    'low_cpu_start': None,
+    'last_log_lines': deque(maxlen=settings_manager.tooltip_lines),  # Storing the last 15 (tooltip_lines) lines
+    'last_log_update': None,  # Time of the last log update
+    'puzzle_number': None,
+    'last_score_value': None,
+    'last_script_change_token': 0,
+    'score_stale_ticks': 0,
+    'was_idle': False,
+    'alarm_on_change': False,  # one-shot: beep when score changes, then auto-disarm
+    }
+
+
+# Runtime process metrics remain PID-keyed; configured log-only clients use client_id.
+monitored_processes = defaultdict(new_monitor_state)
+monitored_logical_clients = defaultdict(new_monitor_state)
+monitored_process_start_times = {}
+monitored_process_client_ids = {}
+
+selected_rows = []  # Array for storing selected rows
+artifact_row_cache = {}
+artifact_row_cache_lock = threading.Lock()
+rendered_process_rows = {}
+client_log_paths_by_client = defaultdict(set)
+last_double_click_time = 0
+stats_button = None
+stats_puzzle_menu = None
+connect_menu = None
+logs_menu = None
+speed_boost_menu = None
+palette_menu = None
+palette_var = None
+row_appearance_tags = set()
+
+
+def get_folder_tag(tags):
+    """Return the folder path tag stored on a tree row."""
+    return next(
+        (tag for tag in tags if isinstance(tag, str) and ('\\' in tag or '/' in tag)),
+        None
+    )
+
+
+def get_foldit_parent_dir(folder_path):
+    clean_path = str(folder_path).strip()
+    if not clean_path:
+        return ''
+    normalized = os.path.normpath(clean_path)
+    if (
+        os.path.basename(normalized).casefold() == "resources"
+        and os.path.basename(os.path.dirname(normalized)).casefold() == "contents"
+    ):
+        app_path = os.path.dirname(os.path.dirname(normalized))
+        if app_path.casefold().endswith(".app"):
+            return os.path.dirname(app_path)
+    return os.path.dirname(clean_path)
+
+
+def get_data_root_display_name(folder_path):
+    normalized = os.path.normpath(str(folder_path or ""))
+    if (
+        os.path.basename(normalized).casefold() == "resources"
+        and os.path.basename(os.path.dirname(normalized)).casefold() == "contents"
+    ):
+        app_path = os.path.dirname(os.path.dirname(normalized))
+        if app_path.casefold().endswith(".app"):
+            return os.path.splitext(os.path.basename(app_path))[0]
+    return os.path.basename(normalized)
+
+
+def get_running_foldit_parent_dirs():
+    parent_dirs = []
+    for item in process_tree.get_children():
+        folder_path = get_folder_tag(process_tree.item(item, 'tags'))
+        parent_dir = get_foldit_parent_dir(folder_path)
+        if parent_dir and parent_dir not in parent_dirs:
+            parent_dirs.append(parent_dir)
+    return parent_dirs
+
+
+def get_pid_tag(tags):
+    """Return the process id tag stored on a tree row."""
+    for tag in tags:
+        if isinstance(tag, int):
+            return tag
+        if isinstance(tag, str) and tag.isdigit():
+            return int(tag)
+    return None
+
+
+def get_pid_for_folder(folder_path):
+    clean_folder = str(folder_path).strip()
+    if not clean_folder:
+        return None
+
+    for item in process_tree.get_children():
+        tags = process_tree.item(item, 'tags')
+        if get_folder_tag(tags) != clean_folder:
+            continue
+        return get_pid_tag(tags)
+    return None
+
+
+def get_puzzle_id(pid):
+    puzzle_number = monitored_processes.get(pid, {}).get('puzzle_number') if pid is not None else None
+    return str(puzzle_number).strip() if puzzle_number else None
+
+
+def clean_artifact_name_part(value, fallback="unknown"):
+    text = str(value or "").strip()
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", text)
+    text = re.sub(r"\s+", " ", text).strip().strip(". ")
+    return text or fallback
+
+
+def build_artifact_filename(row, kind, suffix, save_name=None):
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    parts = [
+        timestamp,
+        row.get("client_name") or row.get("client") or "client",
+        row.get("puzzle_id") or "puzzle",
+    ]
+    if save_name:
+        parts.append(save_name)
+    else:
+        parts.extend([
+            row.get("script_type") or "script",
+            row.get("score") or "score",
+        ])
+    stem = "_".join(clean_artifact_name_part(part) for part in parts if str(part or "").strip())
+    return sanitize_artifact_filename(f"{stem}.{suffix}", fallback=f"{timestamp}.{suffix}")
+
+
+def get_cached_artifact_row(row_id):
+    clean_row_id = str(row_id or "").strip()
+    if not clean_row_id:
+        return None
+    with artifact_row_cache_lock:
+        row = artifact_row_cache.get(clean_row_id)
+        return dict(row) if row else None
+
+
+def get_row_log_path(row_id):
+    row = get_cached_artifact_row(row_id)
+    return str(row.get("log_path", "")).strip() if row else ""
+
+
+def is_shared_data_root(folder_path):
+    root_key = normalize_path(folder_path)
+    with artifact_row_cache_lock:
+        matches = {
+            str(row.get("row_id", ""))
+            for row in artifact_row_cache.values()
+            if str(row.get("data_root", "")).strip()
+            and normalize_path(row.get("data_root")) == root_key
+        }
+    return len(matches) > 1
+
+
+def find_latest_ir_solution(folder):
+    ir_files = [
+        os.path.join(folder, name)
+        for name in os.listdir(folder)
+        if name.endswith(".ir_solution")
+    ]
+    if not ir_files:
+        return None
+    return max(ir_files, key=os.path.getmtime)
+
+
+def build_remote_artifact(kind, row_id, address, connection_id):
+    """Build an artifact requested by a connected peer from a cached local row."""
+    clean_kind = str(kind or "").strip().lower()
+    row = get_cached_artifact_row(row_id)
+    if not row:
+        raise RuntimeError("Remote row is no longer available")
+
+    folder = row.get("folder")
+    if not folder or not os.path.isdir(folder):
+        raise RuntimeError("Client folder is no longer available")
+
+    if clean_kind == "log":
+        script_path = str(row.get("log_path", "")).strip()
+        if not os.path.exists(script_path):
+            raise FileNotFoundError("The resolved Foldit script log was not found")
+
+        log_data = foldit_log_handler.get_fresh_data(script_path)
+        if log_data:
+            row["script_type"] = log_data.get("script_type") or row.get("script_type")
+            score = log_data.get("highest_score")
+            row["score"] = str(score).split(".")[0] if score is not None else row.get("score")
+
+        return {
+            "kind": "log",
+            "path": script_path,
+            "filename": build_artifact_filename(row, "log", "txt"),
+        }
+
+    if clean_kind == "pdb":
+        if export_pdb is None:
+            raise RuntimeError("savefile_api is unavailable")
+        if is_shared_data_root(folder):
+            raise RuntimeError(
+                "PDB export is disabled because several Track clients share this data folder"
+            )
+
+        ir_path = find_latest_ir_solution(folder)
+        if not ir_path:
+            raise FileNotFoundError("No .ir_solution file was found")
+
+        save_name = None
+        if get_basic_info is not None:
+            try:
+                save_info = get_basic_info(ir_path)
+                save_name = " ".join((save_info.save_name or "").split())
+            except Exception:
+                save_name = None
+        if not save_name:
+            save_name = os.path.splitext(os.path.basename(ir_path))[0]
+
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix="foldit_remote_pdb_",
+            suffix=".pdb",
+            delete=False,
+        )
+        temp_path = temp_file.name
+        temp_file.close()
+        try:
+            export_pdb(ir_path, temp_path)
+        except Exception:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            raise
+
+        return {
+            "kind": "pdb",
+            "path": temp_path,
+            "filename": build_artifact_filename(row, "pdb", "pdb", save_name=save_name),
+            "cleanup_path": temp_path,
+        }
+
+    raise RuntimeError(f"Unsupported artifact kind: {kind}")
+
+
+def build_remote_artifact_query(kind, query, address, connection_id):
+    """Build an artifact requested by a connected peer from a log lookup query."""
+    clean_kind = str(kind or "").strip().lower()
+    clean_query = dict(query or {})
+    if clean_kind != "log":
+        raise RuntimeError(f"Unsupported artifact query kind: {kind}")
+
+    match_path = find_matching_log_file(
+        clean_query,
+        get_known_client_log_roots(clean_query.get("client_name")),
+    )
+    if match_path:
+        return {
+            "kind": "log",
+            "path": match_path,
+            "filename": os.path.basename(match_path),
+        }
+
+    export_path = export_matching_live_log(clean_query, open_after=False)
+    if export_path:
+        return {
+            "kind": "log",
+            "path": export_path,
+            "filename": os.path.basename(export_path),
+        }
+
+    raise FileNotFoundError("No matching log was found")
+
+
+def get_post_copy_shortcut(source_puzzle_id, target_puzzle_id):
+    source_id = str(source_puzzle_id).strip() if source_puzzle_id else ""
+    target_id = str(target_puzzle_id).strip() if target_puzzle_id else ""
+    if source_id and target_id and source_id != target_id:
+        return "ctrl+p"
+    return "ctrl+o"
+
+
+def format_client_column_value(folder_name):
+    return re.sub(r'foldit', 'f', str(folder_name), flags=re.IGNORECASE)
+
+
+def client_lookup_keys(client_name):
+    clean_name = str(client_name or "").strip()
+    keys = {clean_name, format_client_column_value(clean_name)}
+    keys.add(clean_name.replace("oldit", ""))
+    return {key for key in keys if key}
+
+
+def remember_client_log_path(client_name, log_path):
+    clean_path = str(log_path or "").strip()
+    if not clean_path:
+        return
+    for key in client_lookup_keys(client_name):
+        client_log_paths_by_client[key].add(normalize_path(clean_path))
+
+
+def get_known_client_log_roots(client_name):
+    roots = set()
+    for key in client_lookup_keys(client_name):
+        roots.update(os.path.dirname(path) for path in client_log_paths_by_client.get(key, set()))
+    return sorted(roots)
+
+
+def get_known_client_log_paths(client_name):
+    paths = set()
+    for key in client_lookup_keys(client_name):
+        paths.update(client_log_paths_by_client.get(key, set()))
+    return sorted(paths)
+
+
+def _score_from_log_data(log_data):
+    if not log_data:
+        return None
+    return log_data.get("highest_score")
+
+
+def export_matching_live_log(query, open_after=False):
+    clean_query = dict(query or {})
+    for script_path in get_known_client_log_paths(clean_query.get("client_name")):
+        if not os.path.exists(script_path):
+            continue
+        log_data = foldit_log_handler.get_data(script_path) or foldit_log_handler.get_fresh_data(script_path)
+        if not log_data:
+            continue
+        if not values_match_log_query(
+            clean_query,
+            client_name=clean_query.get("client_name"),
+            puzzle_id=clean_query.get("puzzle_id"),
+            script_type=log_data.get("script_type"),
+            score=_score_from_log_data(log_data),
+        ):
+            continue
+        return foldit_log_handler.export_log_file(
+            script_path,
+            open_file=bool(open_after),
+            puzzle_id=clean_query.get("puzzle_id"),
+        )
+    return None
+
+
+def get_appearance_profile(state_name):
+    return get_palette_appearance_profile(settings_manager.ROW_APPEARANCE, state_name)
+
+
+def apply_treeview_palette():
+    """Apply the palette's non-row Treeview surface colors."""
+    tree_profile = get_appearance_profile('tree')
+    normal_profile = get_appearance_profile('normal')
+    foreground = normal_profile.get('foreground') or '#000000'
+    background = (
+        tree_profile.get('background')
+        or normal_profile.get('background')
+        or '#ffffff'
+    )
+    heading_background = tree_profile.get('heading_background') or background
+    heading_foreground = tree_profile.get('heading_foreground') or foreground
+
+    style = ttk.Style()
+    style.configure(
+        'Treeview',
+        foreground=foreground,
+        background=background,
+        fieldbackground=background,
+    )
+    style.configure(
+        'Treeview.Heading',
+        background=heading_background,
+        foreground=heading_foreground,
+    )
+
+
+def update_score_stale_ticks(process_state, is_idle, score_value, script_change_token):
+    previous_score = parse_numeric_score(process_state.get('last_score_value'))
+    previous_ticks = max(0, int(process_state.get('score_stale_ticks', 0) or 0))
+    previous_idle = bool(process_state.get('was_idle', False))
+    try:
+        previous_token = max(0, int(process_state.get('last_script_change_token', 0) or 0))
+    except (TypeError, ValueError):
+        previous_token = 0
+    try:
+        current_token = max(0, int(script_change_token or 0))
+    except (TypeError, ValueError):
+        current_token = 0
+
+    current_score = parse_numeric_score(score_value)
+    if (
+        is_idle
+        or previous_idle
+        or current_score is None
+        or previous_score is None
+        or current_token != previous_token
+        or abs(current_score - previous_score) > 1e-9
+    ):
+        stale_ticks = 0
+    else:
+        stale_ticks = previous_ticks + 1
+
+    process_state['score_stale_ticks'] = stale_ticks
+    process_state['last_score_value'] = current_score
+    process_state['last_script_change_token'] = current_token
+    process_state['was_idle'] = bool(is_idle)
+    return stale_ticks
+
+
+def ensure_row_appearance_tag(treeview, font_key, foreground, background):
+    tag_name = build_appearance_tag(font_key, foreground, background)
+    if tag_name not in row_appearance_tags:
+        fonts_by_key = {
+            'normal': normal_font,
+            'bold': bold_font,
+            'italic': italic_font,
+            'bold_italic': bold_italic_font,
+        }
+        tag_options = {
+            'font': fonts_by_key.get(font_key, normal_font),
+        }
+        if foreground:
+            tag_options['foreground'] = foreground
+        if background:
+            tag_options['background'] = background
+        treeview.tag_configure(tag_name, **tag_options)
+        row_appearance_tags.add(tag_name)
+    return tag_name
+
+
+def build_row_appearance_tag(treeview, row_state):
+    appearance = resolve_palette_row_appearance(
+        row_state,
+        settings_manager.ROW_APPEARANCE,
+        settings_manager.STALE_TICK_LIMIT,
+    )
+    return ensure_row_appearance_tag(treeview, *appearance)
+
+
+def apply_row_appearance(item_id):
+    if not process_tree.exists(item_id):
+        return
+
+    tags = [
+        tag for tag in process_tree.item(item_id, 'tags')
+        if not is_row_appearance_tag(tag)
+    ]
+    pid = get_pid_tag(tags)
+    process_state = monitored_processes.get(pid, {}) if pid is not None else {}
+    try:
+        stale_ticks = max(0, int(process_state.get('score_stale_ticks', 0) or 0))
+    except (TypeError, ValueError):
+        stale_ticks = 0
+
+    appearance_tag = build_row_appearance_tag(
+        process_tree,
+        build_row_visual_state(
+            is_idle='idle_window' in tags,
+            is_visible='visible_window' in tags,
+            is_focused='focused_window' in tags,
+            is_fin='fin_state' in tags,
+            is_copy_source='copy_source' in tags,
+            stale_ticks=stale_ticks,
+        )
+    )
+    tags.append(appearance_tag)
+    process_tree.item(item_id, tags=tags)
+
+#--------------------------------------------------------------------------------------------------------------PROCESS MONITOR
+
+def get_foldit_clients():
+    return window_manager.list_foldit_clients()
+
+
+def update_process_cpu_usage(clients):
+    """Update the CPU usage of processes and check thresholds."""
+    global monitored_processes
+    current_time = time.time()
+
+    for client in clients:
+        proc = client.process
+        pid = client.pid
+        try:
+            process_start = float(getattr(client, "process_start_time", 0.0) or 0.0)
+            previous_start = monitored_process_start_times.get(pid)
+            if previous_start is not None and process_start and previous_start != process_start:
+                monitored_processes[pid] = new_monitor_state()
+                monitored_process_client_ids.pop(pid, None)
+            if process_start:
+                monitored_process_start_times[pid] = process_start
+            cpu_usage = proc.cpu_percent(interval=None)
+            monitored_processes[pid]['cpu_history'].append((current_time, cpu_usage))
+            cpu_history_copy = list(monitored_processes[pid]['cpu_history'])
+            if 'high_cpu_state' not in monitored_processes[pid]:
+                monitored_processes[pid]['high_cpu_state'] = False
+            high_cpu_count = sum(1 for _, usage in cpu_history_copy if usage > settings_manager.HIGH_CPU_THRESHOLD)
+            if high_cpu_count / max(1, len(cpu_history_copy)) >= 0.90:
+                monitored_processes[pid]['high_cpu_state'] = True
+            low_cpu_count = sum(1 for _, usage in cpu_history_copy if usage < settings_manager.LOW_CPU_THRESHOLD)
+            if low_cpu_count / max(1, len(cpu_history_copy)) >= 0.90:
+                if monitored_processes[pid]['high_cpu_state']:
+                    play_alert_sound()
+                    monitored_processes[pid]['high_cpu_state'] = False
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            if pid in monitored_processes:
+                del monitored_processes[pid]
+            monitored_process_start_times.pop(pid, None)
+            monitored_process_client_ids.pop(pid, None)
+
+def schedule_update():
+    """Schedule the periodic update of the process list."""
+    if is_ui_interacting():
+        root.after(200, schedule_update)
+        return
+
+    update_process_list()
+    if network_manager.has_clients():
+        network_manager.send_tree_data()
+    root.after(settings_manager.CHECK_INTERVAL * 1000, schedule_update)
+
+def update_process_list():
+    """Update the process list in the GUI."""
+    global monitored_processes, artifact_row_cache, rendered_process_rows
+
+    process_clients = get_foldit_clients()
+    update_process_cpu_usage(process_clients)
+    clients = client_resolver.submit(process_clients)
+
+    existing_items = set(process_tree.get_children())
+    selected_item_order = [item for item in selected_rows if process_tree.exists(item)]
+    copy_source_item = selected_item_order[0] if selected_item_order else None
+    current_items = set()
+    current_artifact_rows = {}
+    stats_targets_by_puzzle = {}
+    order_dirty = False
+    layout_dirty = False
+    speed_boost_states = (
+        {
+            int(client.pid): {
+                "pid": int(client.pid),
+                "client_name": client.client_name,
+                "is_window_visible": bool(client.is_window_visible),
+                "script_running": False,
+            }
+            for client in clients
+            if client.pid is not None
+        }
+        if speed_boost is not None
+        else None
+    )
+
+    for client in clients:
+        try:
+            pid = client.pid
+            folder = client.data_root
+            if not folder:
+                continue
+            if client.log_path:
+                remember_client_log_path(client.client_name, client.log_path)
+            if pid is not None:
+                previous_client_id = monitored_process_client_ids.get(pid)
+                if previous_client_id is not None and previous_client_id != client.client_id:
+                    previous_state = monitored_processes[pid]
+                    replacement = new_monitor_state()
+                    replacement['cpu_history'] = previous_state['cpu_history']
+                    replacement['high_cpu_state'] = previous_state.get('high_cpu_state', False)
+                    monitored_processes[pid] = replacement
+                monitored_process_client_ids[pid] = client.client_id
+                process_state = monitored_processes[pid]
+            else:
+                process_state = monitored_logical_clients[client.client_id]
+            cpu_history = process_state['cpu_history']
+            cpu_percent = sum(usage for _, usage in cpu_history) / len(cpu_history) if cpu_history else 0.0
+            client_column_value = format_client_column_value(client.client_name)
+            # Keep the tiny client column compact. Binding details belong in the
+            # tooltip/diagnostics; only states requiring attention get an icon.
+            if client.binding_status in ("collision", "ambiguous"):
+                client_column_value = f"⚠ {client_column_value}"
+            is_window_visible = client.is_window_visible
+
+            puzzle_number = get_puzzle_number(client.window_title) or client.puzzle_id_override or None
+            process_state['puzzle_number'] = puzzle_number
+
+            score_display = ""
+            highest_score = None
+            script_type = ""
+            script_change_token = 0
+            script_running = False
+            script_path = client.log_path if client.binding_status == "resolved" else ""
+            log_data = foldit_log_handler.get_display_data(script_path) if script_path else None
+            if log_data:
+                script_type = log_data.get('script_type', '')
+                script_running = bool(log_data.get('run_open', False))
+                highest_score = log_data.get('highest_score')
+                try:
+                    script_change_token = max(0, int(log_data.get('script_change_token', 0) or 0))
+                except (TypeError, ValueError):
+                    script_change_token = 0
+                process_state['last_log_lines'] = deque(
+                    log_data.get('last_log_lines', []),
+                    maxlen=settings_manager.tooltip_lines
+                )
+                process_state['last_log_update'] = time.time()
+
+            score_display = ""
+            if highest_score is not None:
+                score_display = f"{str(highest_score).split('.')[0] + '.' + str(highest_score).split('.')[1][:1]}"
+
+            # Create a unique identifier for the process
+            item_id = client.row_id
+            current_items.add(item_id)
+
+            # Update an existing item or create a new one
+            tags = [folder]
+            if pid is not None:
+                tags.insert(0, pid)
+            is_idle = pid is not None and (not is_window_visible) and cpu_percent < settings_manager.LOW_CPU_THRESHOLD
+            if is_window_visible:
+                tags.append('visible_window')
+            if getattr(client, 'is_window_focused', False):
+                tags.append('focused_window')
+            elif is_idle:
+                tags.append('idle_window')
+
+            puzzle_key = str(puzzle_number) if puzzle_number else ''
+            if puzzle_key and puzzle_key not in stats_targets_by_puzzle:
+                stats_targets_by_puzzle[puzzle_key] = stats_manager.get_active_targets(puzzle_key)
+            is_fin = bool(
+                puzzle_key
+                and stats_targets_by_puzzle.get(puzzle_key, {}).get(client.client_name) == 'horizontal'
+            )
+            if is_fin:
+                tags.append('fin_state')
+
+            if speed_boost_states is not None and pid is not None:
+                speed_boost_states[pid] = {
+                    "pid": pid,
+                    "client_name": client.client_name,
+                    "is_window_visible": is_window_visible,
+                    "script_running": script_running,
+                }
+
+            alarm_armed = bool(process_state.get('alarm_on_change'))
+            alarm_prev_score = (
+                parse_numeric_score(process_state.get('last_score_value'))
+                if alarm_armed else None
+            )
+
+            stale_ticks = update_score_stale_ticks(
+                process_state,
+                is_idle=is_idle,
+                score_value=highest_score,
+                script_change_token=script_change_token,
+            )
+
+            # Per-client "Alarm on change": beep once when the monitored score
+            # changes, then disarm. Watches the same per-script highest score the
+            # stale-fade tracks.
+            if alarm_armed:
+                alarm_new_score = parse_numeric_score(highest_score)
+                if (
+                    alarm_prev_score is not None
+                    and alarm_new_score is not None
+                    and abs(alarm_new_score - alarm_prev_score) > 1e-9
+                ):
+                    play_alert_sound()
+                    process_state['alarm_on_change'] = False
+
+            is_copy_source = item_id == copy_source_item
+            if is_copy_source:
+                tags.append('copy_source')
+
+            tags.append(
+                build_row_appearance_tag(
+                    process_tree,
+                    build_row_visual_state(
+                        is_idle=is_idle,
+                        is_visible=is_window_visible,
+                        is_focused=getattr(client, 'is_window_focused', False),
+                        is_fin=is_fin,
+                        is_copy_source=is_copy_source,
+                        stale_ticks=stale_ticks,
+                    ),
+                )
+            )
+
+            # Create values with puzzle number
+            cpu_display = f"{cpu_percent:.0f}" if pid is not None else ""
+            values = [score_display, cpu_display, client_column_value, script_type,
+                      str(puzzle_number) if puzzle_number else ""]
+
+            current_artifact_rows[item_id] = {
+                "row_id": item_id,
+                "pid": pid,
+                "folder": folder,
+                "data_root": folder,
+                "client": client_column_value,
+                "client_name": client.client_name,
+                "client_id": client.client_id,
+                "log_path": client.log_path,
+                "track": client.track,
+                "binding_status": client.binding_status,
+                "binding_source": client.binding_source,
+                "binding_detail": client.binding_detail,
+                "script_type": script_type,
+                "score": score_display,
+                "puzzle_id": str(puzzle_number) if puzzle_number else "",
+                "log_lines": list(process_state.get("last_log_lines", ())),
+            }
+
+            render_state = (tuple(values), tuple(tags), str(client.client_name))
+            previous_render = rendered_process_rows.get(item_id)
+            if item_id not in existing_items:
+                process_tree.insert('', 'end', iid=item_id, values=values, tags=tags)
+                order_dirty = True
+                layout_dirty = True
+            elif previous_render != render_state:
+                process_tree.item(item_id, values=values, tags=tags)
+                if previous_render is None or previous_render[2] != render_state[2]:
+                    order_dirty = True
+                previous_lengths = tuple(len(str(value)) for value in previous_render[0]) if previous_render else ()
+                current_lengths = tuple(len(str(value)) for value in render_state[0])
+                if previous_lengths != current_lengths:
+                    layout_dirty = True
+            rendered_process_rows[item_id] = render_state
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    # Remove items that no longer exist
+    items_to_remove = existing_items - current_items
+    for item_id in items_to_remove:
+        process_tree.delete(item_id)
+        rendered_process_rows.pop(item_id, None)
+        order_dirty = True
+        layout_dirty = True
+        try:
+            monitored_processes.pop(int(item_id), None)
+            monitored_process_start_times.pop(int(item_id), None)
+            monitored_process_client_ids.pop(int(item_id), None)
+        except (TypeError, ValueError):
+            pass
+
+    with artifact_row_cache_lock:
+        artifact_row_cache = current_artifact_rows
+
+    if speed_boost is not None and speed_boost_states is not None:
+        speed_boost.on_clients_refreshed(speed_boost_states.values())
+
+
+    if order_dirty:
+        items = [
+            (
+                str(current_artifact_rows.get(item, {}).get("client_name", "")),
+                item,
+            )
+            for item in process_tree.get_children()
+        ]
+        items.sort(key=lambda x: natural_sort(x[0]))
+
+        for idx, (_, item) in enumerate(items):
+            process_tree.move(item, '', idx)
+
+    current_parent_dirs = get_running_foldit_parent_dirs()
+    if current_parent_dirs:
+        settings_manager.save_last_seen_foldit_parent(current_parent_dirs[0])
+
+    if layout_dirty:
+        adjust_column_widths(process_tree)
+        adjust_window_size(changeWidth=False)
+    check_client_changes(clients)
+
+    selected_rows[:] = [item for item in selected_item_order if item in current_items]
+
+def natural_sort(value):
+    """Function to perform a natural sort."""
+    return [int(s) if s.isdigit() else s.lower() for s in re.split(r'(\d+)', value)]
+
+#-------------------------------------------------------------------------------------------------------------GUI MAIN WINDOW
+def get_row_font(tags):
+    fonts_by_key = {
+        'normal': normal_font,
+        'bold': bold_font,
+        'italic': italic_font,
+        'bold_italic': bold_italic_font,
+    }
+    appearance_tag = next((tag for tag in tags if is_row_appearance_tag(tag)), '')
+    parsed_appearance = parse_appearance_tag(appearance_tag)
+    font_key = parsed_appearance[0] if parsed_appearance else 'normal'
+    return fonts_by_key.get(font_key, normal_font)
+
+
+def adjust_column_widths(treeview):
+    """Adjust the column widths to fit their content."""
+    for col in treeview['columns']:
+        # Reset column width first
+        treeview.column(col, width=0)
+
+        current_font = normal_font
+
+        # Find maximum width considering all items and their fonts
+        max_pixels = current_font.measure(treeview.heading(col)['text'])
+
+        for item in treeview.get_children():
+            item_tags = treeview.item(item)['tags']
+            current_font = get_row_font(item_tags)
+
+            # Measure text width with the appropriate font
+            text = str(treeview.set(item, col))  # Convert to string to handle non-string values
+            width_pixels = current_font.measure(text)
+            max_pixels = max(max_pixels, width_pixels)
+
+        # Add padding and set the exact width
+        final_width = max_pixels + 10
+        treeview.column(col, width=final_width, stretch=False)
+
+def adjust_window_size(changeWidth=True, force=False):
+    """Adjust the window size to fit all trees"""
+    # Check the size lock flag
+    if not force and hasattr(root, 'size_locked') and root.size_locked:
+        return
+
+    # Set flag for programmatic resize. This flag is used to distinguish between user resize and auto-resize
+    root.programmatic_resize = True
+
+    total_height = 0
+
+    # Calculate row height based on font metrics
+    font_height = max(
+        normal_font.metrics()['linespace'],
+        bold_font.metrics()['linespace'],
+        italic_font.metrics()['linespace'],
+        bold_italic_font.metrics()['linespace'],
+    )
+    row_height = font_height + 0  # Add padding (0px top and bottom)
+
+    # Set row height for main tree
+    style = ttk.Style()
+    style.configure('Treeview', rowheight=row_height)
+
+    # Calculate height for main tree.
+    # Treeview defaults to ~10 rows if "height" is not set, which can push the bottom button frame
+    # out of view when auto-sized for a small number of clients.
+    main_items = len(process_tree.get_children())
+    visible_main_items = max(1, main_items)
+    process_tree.configure(height=visible_main_items)
+    header_height = 25
+    #header_height = process_tree.winfo_reqheight() - (row_height * main_items)
+    main_tree_height = (row_height * visible_main_items) + header_height
+    # print (main_tree_height, total_height, row_height, main_items, header_height )
+    total_height += main_tree_height
+
+
+    border_padding = 4
+    button_height = 25
+    if 'button_frame' in globals():
+        button_height = max(button_height, button_frame.winfo_reqheight())
+    total_height += border_padding + button_height + 2
+
+    # Force table height to prevent GUI problems #Treeview #remotetreeview bug
+    #process_tree.place(x=0, y=0, relwidth=1, height=main_tree_height + border_padding)
+
+
+    # Add height for remote trees
+    if hasattr(root, 'remote_trees'):
+        for remote_tree in root.remote_trees.values():
+            items_count = len(remote_tree.tree.get_children())
+            # Make the remote tree request exactly its row count, like the main tree does.
+            # Otherwise it keeps Treeview's default 10-row request and the leftover window
+            # space gets split between the panels via expand=True -> empty rows in the top
+            # panel and a scrollbar in the bottom one.
+            remote_tree.tree.configure(height=max(1, items_count), style='Treeview')
+            remote_header_height = remote_tree.header.winfo_reqheight()
+            remote_height = (row_height * items_count) + remote_header_height
+            total_height += remote_height + 20
+
+    # Add fixed heights
+
+
+
+    # Set minimum and maximum heights
+    min_height = (row_height + header_height) + border_padding + button_height + 2
+    max_height = int(root.winfo_screenheight() * 0.8)
+    window_height = min(max(min_height, total_height), max_height)
+    window_width = max(240, process_tree.winfo_reqwidth() + 1)
+    if 'button_frame' in globals():
+        window_width = max(window_width, button_frame.winfo_reqwidth() + border_padding)
+    root.geometry(f"{window_width}x{window_height}")
+    # Save the last automatic size
+    if not force:
+        root.last_auto_size = (window_width, window_height)
+
+    # Clear programmatic resize flag after short delay
+    root.after(100, lambda: setattr(root, 'programmatic_resize', False))
+
+
+def make_window_draggable(window):
+    """Make the window draggable by clicking anywhere on it."""
+    window.is_dragging = False
+    window.last_update_time = 0
+
+    def start_move(event):
+        if time.time() - last_double_click_time > 1.5:
+            window.is_dragging = True
+            window.drag_start_pointer = window.winfo_pointerxy()
+            window.drag_start_window = (window.winfo_x(), window.winfo_y())
+
+    def stop_move(_event):
+        window.is_dragging = False
+
+    def do_move(_event):
+        if time.time() - last_double_click_time > 1.5 and window.is_dragging:
+            pointer_x, pointer_y = window.winfo_pointerxy()
+            start_pointer_x, start_pointer_y = window.drag_start_pointer
+            start_window_x, start_window_y = window.drag_start_window
+            x = start_window_x + pointer_x - start_pointer_x
+            y = start_window_y + pointer_y - start_pointer_y
+            window.geometry(f"{x:+d}{y:+d}")
+
+    window.bind("<Button-1>", start_move)
+    window.bind("<ButtonRelease-1>", stop_move)
+    window.bind("<B1-Motion>", do_move)
+
+
+def on_window_state_change(event):
+    """Handle window state change events."""
+    #print("Window state changed:", root.state())
+
+def on_close():
+    """Handle application closing"""
+    if ligand_viewer is not None:
+        ligand_viewer.shutdown()
+    if speed_boost is not None:
+        speed_boost.shutdown()
+    if 'client_resolver' in globals():
+        client_resolver.stop()
+    foldit_log_handler.stop_all_monitoring()
+    stats_manager.flush_all()
+    stats_window = get_open_stats_window()
+    if stats_window is not None:
+        try:
+            stats_window._save_window_position()
+        except Exception:
+            pass
+    if 'root' in globals() and root.winfo_exists():
+        settings_manager.save_window_position(root.winfo_x(), root.winfo_y())
+    if 'network_manager' in globals():
+        network_manager.shutdown()
+    root.destroy()
+
+
+#----------------------------------------------------------------------------------------------------------- TOOLTIP WINDOW
+def setup_tooltip(root):
+    """Configure tooltips."""
+    fonts = {'tooltip': tooltip_font}
+    tooltip = TooltipWindow(root, fonts)
+
+    def get_tooltip_text(item):
+        """Get the tooltip text for an item."""
+        row = get_cached_artifact_row(item) or {}
+        log_path = get_row_log_path(item)
+        if log_path and row.get("binding_status") == "resolved":
+            return get_last_log_lines(log_path, row.get("client_name", ""))
+        return row.get("binding_detail") or None
+
+    tooltip.set_update_callback(get_tooltip_text)
+
+    def on_enter(event, tree_widget=None, is_remote=False):
+        tree = tree_widget if tree_widget else process_tree
+        column = column_at_x(tree, event.x)
+        item = tree.identify('item', event.x, event.y)
+
+        if column == "Score" and item:
+            if is_remote:
+                tree_id = getattr(tree.master, '_name', None)
+                remote_tree = root.remote_trees.get(tree_id) if tree_id else None
+                if remote_tree and item in remote_tree.log_data:
+                    log_lines = remote_tree.log_data[item]
+                    # Each stored line already carries its own trailing newline, so strip
+                    # any CR/LF per line and re-join with a single "\n" (matches the local
+                    # tooltip and stays correct regardless of the sender's OS line endings).
+                    log_text = "\n".join(
+                        "{:5d}:  {}".format(num, str(line).rstrip("\r\n"))
+                        for num, line in log_lines
+                    )
+                else:
+                    row = get_cached_artifact_row(item) or {}
+                    log_text = row.get("binding_detail") or "Log data not available"
+            else:
+                log_path = get_row_log_path(item)
+                row = get_cached_artifact_row(item) or {}
+                if log_path and row.get("binding_status") == "resolved":
+                    log_text = get_last_log_lines(log_path, row.get("client_name", ""))
+                else:
+                    log_text = row.get("binding_detail") or "Log data not available"
+
+            x = root.winfo_x()
+            y = root.winfo_y()
+            tooltip.delayed_show(log_text, x, y, item, column, tree)
+
+    def on_leave(event):
+        tooltip.hide()
+
+    process_tree.bind('<Motion>', lambda e: on_enter(e))
+    process_tree.bind('<Leave>', on_leave)
+
+    def bind_remote_tree(remote_tree):
+        remote_tree.tree.bind('<Motion>',
+            lambda e: on_enter(e, tree_widget=remote_tree.tree, is_remote=True))
+        remote_tree.tree.bind('<Leave>', on_leave)
+
+    tooltip.bind_remote_tree = bind_remote_tree
+
+    return tooltip
+
+def get_last_log_lines(log_path, client_name=""):
+    """Get the last lines of the log from the FolditLogHandler"""
+    script_path = str(log_path)
+    data = foldit_log_handler.get_display_data(script_path)
+
+    if not data:
+        return "Log data not available"
+
+    max_length = settings_manager.MAX_LINE_LENGTH  # Get max length from settings
+    last_lines = data['last_log_lines']  # Get the last log lines
+    formatted_lines = []
+
+    # Add the first line with the folder name, script, and score
+    folder_name = str(client_name).strip() or os.path.basename(os.path.dirname(script_path))
+    script_name = data.get('script_type', 'Unknown')
+    highest_score = data.get('highest_score', 'N/A')
+    header = f"{folder_name} | {script_name} | {highest_score}"
+    formatted_lines.append(header+"\n")
+
+    def trim_long_line(line, max_length):
+        """Trim long line with smart tab handling and middle truncation"""
+        def visual_length(s, tab_size=4):
+            # Handle different types of tabs including non-breaking spaces
+            return len(s.replace('\t', ' ' * tab_size).replace('\u2003', ' ' * tab_size).replace('\u00A0', ' ' * tab_size))
+
+        def replace_tabs(s, tab_size):
+            # Replace various types of tabs and spaces
+            return s.replace('\t', ' ' * tab_size).replace('\u2003', ' ' * tab_size).replace('\u00A0', ' ' * tab_size)
+
+        original_line = line
+        current_tab_size = 4
+
+        # Reduce tab size until line fits or minimum tab size reached
+        while current_tab_size >= 1 and visual_length(line, current_tab_size) > max_length:
+            current_tab_size -= 1
+
+        # Apply best tab replacement
+        if current_tab_size >= 1:
+            line = replace_tabs(original_line, current_tab_size)
+
+        # If still too long after tab replacement, trim middle
+        if len(line) > max_length:
+            max_allowed = max_length - 3  # 3 symbols for "..."
+            start_len = max_allowed // 2
+            end_len = max_allowed - start_len
+            return f"{line[:start_len]}...{line[-end_len:]}"
+        return line
+
+    for line_num, line in last_lines:
+        trimmed_line = trim_long_line(line, max_length)
+        formatted_lines.append(f"{line_num:5d}:  {trimmed_line}")
+
+    formatted_lines[-1] = formatted_lines[-1].rstrip()  # Remove trailing newline
+    return "".join(formatted_lines)  # Return formatted log lines
+
+def on_focus_out(event):
+    """Handler for losing focus of the window"""
+    return None
+
+def get_puzzle_number(window_title):
+    """Extracts the first likely puzzle id from the Foldit window title."""
+    if not window_title:
+        return None
+    match = PUZZLE_ID_RE.search(window_title)
+    if match:
+        return match.group("puzzle")
+    return None
+
+
+def open_stats_for_puzzle(puzzle_id):
+    clean_puzzle_id = str(puzzle_id).strip()
+    if clean_puzzle_id:
+        show_stats(
+            root,
+            stats_manager,
+            settings_manager,
+            clean_puzzle_id,
+            log_lookup_handler=handle_stats_log_lookup,
+            save_manager_handler=open_save_manager_window,
+        )
+
+
+def normalize_save_manager_path(path):
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def get_save_manager_clients():
+    """Return installations from the monitor's plain-data cache (no Tk access)."""
+    running_paths = {}
+    with artifact_row_cache_lock:
+        cached_rows = [dict(row) for row in artifact_row_cache.values()]
+    for row in cached_rows:
+        folder = str(row.get("folder", "")).strip()
+        if folder:
+            running_paths[normalize_save_manager_path(folder)] = (
+                os.path.abspath(folder),
+                str(row.get("puzzle_id", "")).strip(),
+            )
+
+    parent_dirs = []
+    for folder, _active_puzzle_id in running_paths.values():
+        parent_dir = get_foldit_parent_dir(folder)
+        if parent_dir and parent_dir not in parent_dirs:
+            parent_dirs.append(parent_dir)
+    remembered_parent = str(settings_manager.LAST_SEEN_FOLDIT_PARENT).strip()
+    if remembered_parent and os.path.isdir(remembered_parent) and remembered_parent not in parent_dirs:
+        parent_dirs.append(remembered_parent)
+
+    folders = list(window_manager.find_installation_folders(parent_dirs))
+    known_keys = {normalize_save_manager_path(folder) for folder in folders}
+    for key, (folder, _active_puzzle_id) in running_paths.items():
+        if key not in known_keys:
+            folders.append(folder)
+            known_keys.add(key)
+
+    folders.sort(key=lambda folder: natural_sort(get_data_root_display_name(folder)))
+    return [
+        SimpleNamespace(
+            name=get_data_root_display_name(folder),
+            path=os.path.abspath(folder),
+            running=normalize_save_manager_path(folder) in running_paths,
+            active_puzzle_id=running_paths.get(normalize_save_manager_path(folder), ("", ""))[1],
+        )
+        for folder in folders
+    ]
+
+
+def open_save_manager_window(puzzle_id, initial_client_path=None, initial_scope="client"):
+    """Open the Qt Save Manager without crossing back into Tk from Qt callbacks."""
+    clean_puzzle_id = str(puzzle_id or "").strip()
+    if not clean_puzzle_id:
+        return
+    try:
+        from modules.save_manager_qt import show_save_manager
+
+        show_save_manager(
+            root,
+            clean_puzzle_id,
+            get_save_manager_clients,
+            os.path.join(stats_manager.logs_folder, "_save_index.sqlite3"),
+            stats_manager.logs_folder,
+            initial_client_path=initial_client_path,
+            initial_scope=initial_scope,
+        )
+    except Exception as exc:
+        print(f"Error opening Save Manager: {exc}")
+
+
+def refresh_stats_puzzle_menu():
+    if stats_button is None or stats_puzzle_menu is None:
+        return
+
+    puzzles = stats_manager.get_active_puzzles()
+    stats_puzzle_menu.delete(0, tk.END)
+
+    if puzzles:
+        for puzzle_id in puzzles:
+            stats_puzzle_menu.add_command(
+                label=puzzle_id,
+                command=lambda pid=puzzle_id: open_stats_for_puzzle(pid),
+            )
+        stats_button.state(["!disabled"])
+        return
+
+    stats_puzzle_menu.add_command(label="No active puzzles", state="disabled")
+    stats_button.state(["disabled"])
+
+
+def toggle_stats_window():
+    """LMB on Stats: open the last viewed puzzle, or close the stats window if it is open."""
+    if get_open_stats_window() is not None:
+        close_stats_window_if_exists()
+        return
+
+    puzzles = stats_manager.get_active_puzzles()
+    if not puzzles:
+        return
+    last_puzzle = str(settings_manager.STATS_LAST_PUZZLE).strip()
+    open_stats_for_puzzle(last_puzzle if last_puzzle in puzzles else puzzles[0])
+
+
+def show_stats_puzzle_menu(event=None):
+    """RMB on Stats: menu with all active puzzles."""
+    refresh_stats_puzzle_menu()
+    if stats_button is None or stats_puzzle_menu is None:
+        return "break"
+
+    if not stats_manager.get_active_puzzles() or "disabled" in stats_button.state():
+        return "break"
+
+    x = stats_button.winfo_rootx()
+    y = stats_button.winfo_rooty() + stats_button.winfo_height()
+    try:
+        stats_puzzle_menu.tk_popup(x, y)
+    finally:
+        stats_puzzle_menu.grab_release()
+    return "break"
+
+def check_client_changes(clients):
+    """Check for changes in client state."""
+    def finalize_interrupted_stats(script_path, client_name, puzzle_id):
+        if not client_name or not puzzle_id:
+            return False
+        get_snapshot = getattr(
+            foldit_log_handler,
+            'get_interrupted_stats_snapshot',
+            None,
+        )
+        finalize_interrupted = getattr(
+            stats_manager,
+            'finalize_interrupted_run',
+            None,
+        )
+        snapshot = get_snapshot(script_path) if get_snapshot is not None else None
+        if not snapshot or finalize_interrupted is None:
+            return False
+        return bool(
+            finalize_interrupted(
+                client_name=client_name,
+                puzzle_id=puzzle_id,
+                script_name=snapshot.get('script'),
+                score=snapshot.get('score'),
+            )
+        )
+
+    current_stats_clients = set()
+    current_client_runtime = {}
+    active_script_paths = set()
+    current_clients = clients
+    known_script_paths = {
+        str(getattr(client, "log_path", "") or "")
+        for client in current_clients
+        if str(getattr(client, "log_path", "") or "")
+    }
+    for client in current_clients:
+        known_script_paths.update(
+            str(path)
+            for path in getattr(client, "candidate_log_paths", ())
+            if str(path).strip()
+        )
+
+    for client in current_clients:
+        try:
+            folder = str(getattr(client, "data_root", "") or getattr(client, "folder", ""))
+            if not folder:
+                continue
+            client_name = client.client_name
+
+            binding_status = str(getattr(client, "binding_status", "resolved") or "resolved")
+            script_path = str(getattr(client, "log_path", "") or "")
+            if binding_status != "resolved" or not script_path:
+                continue
+            remember_log_path = globals().get("remember_client_log_path")
+            if remember_log_path is not None:
+                remember_log_path(client_name, script_path)
+            active_script_paths.add(script_path)
+            state_store = (
+                monitored_processes.get(client.pid, {})
+                if client.pid is not None
+                else monitored_logical_clients.get(getattr(client, "client_id", ""), {})
+            )
+            puzzle_number = state_store.get('puzzle_number') or getattr(client, "puzzle_id_override", "")
+            puzzle_id = str(puzzle_number) if puzzle_number else None
+
+            process_create_time = getattr(client, "process_start_time", None)
+            if client.pid is not None and not process_create_time:
+                try:
+                    process_create_time = client.process.create_time()
+                except Exception:
+                    process_create_time = None
+
+            remember_client_context = getattr(foldit_log_handler, 'remember_client_context', None)
+            if remember_client_context is not None:
+                remember_client_context(
+                    script_path,
+                    folder_path=folder,
+                    puzzle_id=puzzle_id,
+                    client_name=client_name,
+                )
+
+            source_predates_process = getattr(
+                foldit_log_handler,
+                'source_predates_process',
+                None,
+            )
+            stale_source = bool(
+                source_predates_process is not None
+                and process_create_time is not None
+                and source_predates_process(script_path, process_create_time)
+            )
+            interrupted_path = None
+            if stale_source:
+                interrupted_path = foldit_log_handler.recover_interrupted_log_file(
+                    script_path,
+                    process_create_time=process_create_time,
+                    puzzle_id=puzzle_id,
+                )
+                if interrupted_path:
+                    finalize_interrupted_stats(script_path, client_name, puzzle_id)
+
+            if interrupted_path:
+                # This open file belongs to the previous Foldit process.  Re-check
+                # its mtime on the next normal poll; attach only after this process
+                # actually changes or replaces it.  A closed stale file is safe to
+                # attach as a baseline because it emits no bootstrap script event.
+                foldit_log_handler.stop_monitoring(script_path)
+                handler = None
+            else:
+                foldit_log_handler.start_monitoring(script_path)
+                handler = foldit_log_handler.current_handlers.get(script_path)
+
+            if puzzle_id:
+                current_stats_clients.add(client_name)
+                stats_manager.touch_client(client_name, puzzle_id)
+                item_id = str(getattr(client, "row_id", client.pid))
+                cpu_percent = 0.0
+                is_idle = False
+                score_stale_ticks = 0
+                if process_tree.exists(item_id):
+                    values = process_tree.item(item_id, 'values')
+                    tags = process_tree.item(item_id, 'tags')
+                    if len(values) > 1:
+                        try:
+                            cpu_percent = float(values[1])
+                        except (TypeError, ValueError):
+                            cpu_percent = 0.0
+                    is_idle = 'idle_window' in tags
+                process_state = state_store
+                try:
+                    score_stale_ticks = max(0, int(process_state.get('score_stale_ticks', 0) or 0))
+                except (TypeError, ValueError):
+                    score_stale_ticks = 0
+                current_client_runtime[client_name] = {
+                    'puzzle_id': puzzle_id,
+                    'cpu_percent': cpu_percent,
+                    'is_idle': is_idle,
+                    'score_stale_ticks': score_stale_ticks,
+                }
+
+            if handler:
+                for event in handler.consume_stats_events():
+                    event_kind = str(event.get('kind', '')).strip().lower()
+                    if event_kind in {'start', 'update', 'resume'} and puzzle_id:
+                        stats_manager.handle_monitor_update(
+                            client_name=client_name,
+                            puzzle_id=puzzle_id,
+                            script_name=event.get('script'),
+                            score=event.get('score'),
+                            run_event=event_kind,
+                        )
+                    elif event_kind == 'state' and puzzle_id:
+                        stats_manager.handle_script_state_snapshot(
+                            client_name=client_name,
+                            puzzle_id=puzzle_id,
+                            script_name=event.get('script'),
+                            score=event.get('score'),
+                        )
+                    elif event_kind == 'finish':
+                        speed_boost_integration = globals().get('speed_boost')
+                        if speed_boost_integration is not None and client.pid is not None:
+                            speed_boost_integration.on_script_finished(client.pid)
+                        foldit_log_handler.export_log_file(
+                            script_path,
+                            open_file=False,
+                            puzzle_id=puzzle_id,
+                        )
+
+        except Exception as e:
+            print(f"Error checking client changes: {e}")
+
+    for monitored_path in list(foldit_log_handler.current_handlers.keys()):
+        if monitored_path not in active_script_paths:
+            archive_interrupted = getattr(
+                foldit_log_handler,
+                'archive_interrupted_on_disappearance',
+                None,
+            )
+            if archive_interrupted is not None and monitored_path not in known_script_paths:
+                interrupted_path = archive_interrupted(monitored_path)
+                if interrupted_path:
+                    get_client_context = getattr(
+                        foldit_log_handler,
+                        'get_client_context',
+                        None,
+                    )
+                    context = (
+                        get_client_context(monitored_path)
+                        if get_client_context is not None
+                        else {}
+                    )
+                    finalize_interrupted_stats(
+                        monitored_path,
+                        context.get('client_name'),
+                        context.get('puzzle_id'),
+                    )
+            foldit_log_handler.stop_monitoring(monitored_path)
+
+    stats_manager.sync_active_clients(current_stats_clients)
+    stats_manager.sync_client_runtime(current_client_runtime)
+    refresh_stats_puzzle_menu()
+    stats_manager.maybe_autosave()
+
+#--------------------------------------------------------------------------------------------------------------------------NETWORKING
+reconnect_targets = set()   # {(address, port)} kept alive while auto-reconnect is on
+reconnect_pending = set()   # {(address, port)} currently being dialed
+RECONNECT_INTERVAL = 15     # seconds between gentle reconnect sweeps (don't hammer the server)
+
+def connect_to_remote_async(address, port, show_error=True):
+    def worker():
+        success = network_manager.connect_to_server(address, port)
+        if success:
+            return
+
+        if show_error:
+            root.after(
+                0,
+                lambda: messagebox.showerror("Error", f"Connection to {address}:{port} failed")
+            )
+
+    threading.Thread(target=worker, daemon=True).start()
+
+def show_connect_dialog():
+    dialog = ConnectDialog(
+        root,
+        settings_manager.DEFAULT_ADDRESS,
+        settings_manager.DEFAULT_PORT,
+        default_auto_reconnect=settings_manager.NETWORK_AUTO_RECONNECT,
+    )
+    root.wait_window(dialog.dialog)
+    if dialog.result:
+        address, port, auto_reconnect = dialog.result
+        settings_manager.save_network_auto_reconnect(auto_reconnect)
+        if auto_reconnect:
+            reconnect_targets.add((address, port))
+        else:
+            reconnect_targets.discard((address, port))
+        connect_to_remote_async(address, port)
+
+def create_remote_tree(address, connection_id, port=None):
+    tree_id = f'remote_tree_{address}_{connection_id}'
+
+    if not network_manager.has_connection(address, connection_id):
+        return
+
+    if not hasattr(root, 'remote_trees'):
+        root.remote_trees = {}
+
+    if tree_id not in root.remote_trees:
+        root.size_locked = False #remove window size lock to add new tree
+
+        # If we're reviving a connection, drop any stale panel for the same host whose
+        # underlying connection is already gone (incl. a just-dropped one not yet marked
+        # dead), so we never end up with a leftover panel next to the fresh one. Panels
+        # of still-live connections (e.g. a second connection to the same host) are kept.
+        stale_prefix = f'remote_tree_{address}_'
+        for other_id, other_tree in list(root.remote_trees.items()):
+            if other_id == tree_id or getattr(other_tree, 'address', None) != address:
+                continue
+            other_cid = other_id[len(stale_prefix):] if other_id.startswith(stale_prefix) else None
+            if other_cid is not None and not network_manager.has_connection(address, other_cid):
+                other_tree.frame.destroy()
+                del root.remote_trees[other_id]
+
+        # Define the displayed connection ID
+        display_id = ""
+        if port and port != settings_manager.DEFAULT_PORT:
+            display_id = f":{port}"
+
+        fonts = {
+            'normal': normal_font,
+            'bold': bold_font,
+            'italic': italic_font,
+            'bold_italic': bold_italic_font,
+        }
+
+        remote_tree = RemoteTreeView(
+            root,
+            address,
+            display_id,
+            fonts,
+            monitor_columns=settings_manager.settings['display']['monitor_columns'],
+        )
+        root.remote_trees[tree_id] = remote_tree
+        remote_tree.port = port
+        remote_tree.network_connection_id = connection_id
+
+        # Set name for remote_tree frame for identification
+        remote_tree.frame._name = tree_id
+
+        # Bind event handlers
+        if hasattr(root, 'tooltip'):
+            root.tooltip.bind_remote_tree(remote_tree)
+        remote_tree.tree.bind('<Double-1>', lambda e, rt=remote_tree: on_remote_tree_double_click(e, rt))
+        remote_tree.tree.bind('<Button-3>', lambda e, rt=remote_tree: show_remote_tree_context_menu(e, rt))
+
+        adjust_window_size()
+        adjust_column_widths(process_tree)  # Add column width correction
+
+        # Add menu item for disconnecting
+        base_menu_label = f"Disconnect {address}{display_id}"
+        menu_label = unique_menu_item_label(connect_menu, base_menu_label, connection_id)
+
+        def remove_menu_item():
+            try:
+                remove_menu_item_by_label(connect_menu, menu_label)
+            except Exception as e:
+                print(f"Error removing menu item: {e}")
+
+        def disconnect_handler():
+            try:
+                # Manual disconnect: stop auto-reconnect for this host and remove the panel.
+                reconnect_targets.discard((address, port))
+                network_manager.disconnect_client(address, connection_id, user_initiated=True)
+            except Exception as e:
+                print(f"Error in disconnect handler: {e}")
+
+        insert_menu_item_before_label(
+            connect_menu,
+            "Disconnect all",
+            menu_label,
+            disconnect_handler,
+        )
+
+        # Register callback for removing menu item when disconnecting
+        network_manager.register_disconnect_callback(address, connection_id, remove_menu_item)
+
+def remove_remote_tree(address, connection_id, user_initiated=False):
+    tree_id = f'remote_tree_{address}_{connection_id}'
+    if not (hasattr(root, 'remote_trees') and tree_id in root.remote_trees):
+        return
+
+    remote_tree = root.remote_trees[tree_id]
+    port = getattr(remote_tree, 'port', None)
+
+    # Unexpected drop of a kept-alive host: keep the panel but show it's disconnected
+    # (frozen data, red header). The reconnect sweep will revive/replace it.
+    if (not user_initiated) and ((address, port) in reconnect_targets):
+        remote_tree.mark_dead()
+        return
+
+    root.size_locked = False #remove window size lock and auto-resize on next update
+    remote_tree.frame.destroy()
+    del root.remote_trees[tree_id]
+    adjust_window_size()
+
+def update_remote_trees():
+    """Update all remote trees with their corresponding data"""
+    for connection in network_manager.get_connections_snapshot():
+        # Only the side that initiated a connection shows a panel for it; connections
+        # we merely accepted (incl. our own loopback) must not spawn extra panels.
+        if not connection.get('initiated'):
+            continue
+        address = connection['address']
+        connection_id = connection['connection_id']
+        tree_id = f'remote_tree_{address}_{connection_id}'
+
+        if not hasattr(root, 'remote_trees'):
+            root.remote_trees = {}
+
+        if tree_id not in root.remote_trees:
+            create_remote_tree(address, connection_id, connection.get('port'))
+
+        if tree_id not in root.remote_trees:
+            continue
+
+        if connection['data'] is not None:
+            remote_tree = root.remote_trees[tree_id]
+            remote_tree.update_items(connection['data'], capabilities=connection.get('capabilities'))
+            adjust_column_widths(remote_tree.tree)
+
+
+def request_remote_artifact(remote_tree, item, kind, open_after=False, notify=True):
+    if getattr(remote_tree, "dead", False):
+        if notify:
+            messagebox.showerror("Error", "Remote host is disconnected")
+        return None
+    if not remote_tree.supports_capability(ARTIFACT_TRANSFER_CAPABILITY):
+        if notify:
+            messagebox.showerror("Error", "Remote host does not support artifact transfer")
+        return None
+
+    item_payload = remote_tree.item_payloads.get(item, {})
+    row_id = str(item_payload.get("row_id") or "").strip()
+    if not row_id:
+        if notify:
+            messagebox.showerror("Error", "Remote row id is not available")
+        return None
+
+    connection_id = getattr(remote_tree, "network_connection_id", None)
+    if not connection_id:
+        if notify:
+            messagebox.showerror("Error", "Remote connection id is not available")
+        return None
+
+    try:
+        request_id = network_manager.send_artifact_request(
+            remote_tree.address,
+            connection_id,
+            kind,
+            row_id,
+            open_after=open_after,
+            notify=notify,
+        )
+    except Exception as e:
+        if notify:
+            messagebox.showerror("Error", f"Failed to request remote artifact: {e}")
+        return None
+
+    if request_id is None and notify:
+        messagebox.showerror("Error", "Failed to send remote artifact request")
+    return request_id
+
+
+def request_remote_matching_log(query, open_after=True, notify=True):
+    count = 0
+    if not hasattr(root, "remote_trees"):
+        return count
+
+    for remote_tree in root.remote_trees.values():
+        if getattr(remote_tree, "dead", False):
+            continue
+        if not remote_tree.supports_capability(ARTIFACT_QUERY_CAPABILITY):
+            continue
+        connection_id = getattr(remote_tree, "network_connection_id", None)
+        if not connection_id:
+            continue
+        try:
+            request_id = network_manager.send_artifact_query_request(
+                remote_tree.address,
+                connection_id,
+                "log",
+                query,
+                open_after=open_after,
+                notify=notify,
+            )
+        except Exception as e:
+            if notify:
+                messagebox.showerror("Error", f"Failed to request remote matching log: {e}")
+            continue
+        if request_id is not None:
+            count += 1
+
+    return count
+
+
+def handle_stats_log_lookup(query):
+    clean_query = dict(query or {})
+    match_path = find_matching_log_file(
+        clean_query,
+        get_known_client_log_roots(clean_query.get("client_name")),
+    )
+    if match_path:
+        open_file(match_path, reveal_end=True)
+        return {"status": "opened", "path": match_path, "source": "local"}
+
+    export_path = export_matching_live_log(clean_query, open_after=True)
+    if export_path:
+        return {"status": "opened", "path": export_path, "source": "live"}
+
+    remote_count = request_remote_matching_log(clean_query, open_after=True, notify=False)
+    if remote_count:
+        return {"status": "remote_requested", "count": remote_count}
+    return {"status": "not_found"}
+
+
+def handle_remote_artifact_received(metadata):
+    path = metadata.get("path")
+    kind = metadata.get("kind")
+    if not path:
+        return
+
+    if kind == "log" and metadata.get("open_after"):
+        open_file(path, reveal_end=True)
+        return
+
+    if not metadata.get("notify", True):
+        return
+
+    if kind == "pdb":
+        messagebox.showinfo("Success", f"Remote PDB saved to:\n{path}")
+    elif kind == "log":
+        messagebox.showinfo("Success", f"Remote log saved to:\n{path}")
+    else:
+        messagebox.showinfo("Success", f"Remote artifact saved to:\n{path}")
+
+
+def handle_remote_artifact_error(metadata):
+    message = metadata.get("message") or "Remote artifact transfer failed"
+    if metadata.get("notify", True):
+        messagebox.showerror("Error", message)
+    else:
+        print(f"Remote artifact error: {message}")
+
+
+def iter_remote_artifact_rows():
+    if not hasattr(root, "remote_trees"):
+        return
+    for remote_tree in root.remote_trees.values():
+        if getattr(remote_tree, "dead", False):
+            continue
+        if not remote_tree.supports_capability(ARTIFACT_TRANSFER_CAPABILITY):
+            continue
+        for item in remote_tree.tree.get_children():
+            yield remote_tree, item
+
+
+def open_all_remote_logs():
+    count = 0
+    for remote_tree, item in iter_remote_artifact_rows() or []:
+        if request_remote_artifact(remote_tree, item, "log", open_after=True, notify=False):
+            count += 1
+    if count == 0:
+        messagebox.showinfo("Info", "No remote logs available")
+
+
+def dump_all_remote_logs():
+    count = 0
+    for remote_tree, item in iter_remote_artifact_rows() or []:
+        if request_remote_artifact(remote_tree, item, "log", open_after=False, notify=False):
+            count += 1
+    if count:
+        messagebox.showinfo("Info", f"Requested {count} remote logs")
+    else:
+        messagebox.showinfo("Info", "No remote logs available")
+
+
+def on_remote_tree_double_click(event, remote_tree):
+    column = column_at_x(remote_tree.tree, event.x)
+    item = remote_tree.tree.identify('item', event.x, event.y)
+    if not item:
+        return "break"
+    if column in ("Score", "Type"):
+        request_remote_artifact(remote_tree, item, "log", open_after=True, notify=True)
+    return "break"
+
+
+def show_remote_tree_context_menu(event, remote_tree):
+    item = remote_tree.tree.identify('item', event.x, event.y)
+    if not item:
+        return "break"
+    if not remote_tree.supports_capability(ARTIFACT_TRANSFER_CAPABILITY):
+        return "break"
+
+    menu = tk.Menu(root, tearoff=0)
+    menu.add_command(
+        label="Open remote log",
+        command=lambda rt=remote_tree, row=item: request_remote_artifact(
+            rt, row, "log", open_after=True, notify=True
+        ),
+    )
+    menu.add_command(
+        label="Dump remote log",
+        command=lambda rt=remote_tree, row=item: request_remote_artifact(
+            rt, row, "log", open_after=False, notify=True
+        ),
+    )
+    menu.add_separator()
+    menu.add_command(
+        label="Export remote PDB",
+        command=lambda rt=remote_tree, row=item: request_remote_artifact(
+            rt, row, "pdb", open_after=False, notify=True
+        ),
+    )
+    try:
+        menu.tk_popup(event.x_root, event.y_root)
+    finally:
+        menu.grab_release()
+    return "break"
+
+
+def disconnect_all_clients():
+    """Disconnect all existing connections and stop auto-reconnect."""
+    reconnect_targets.clear()
+    reconnect_pending.clear()
+    for connection in network_manager.get_connections_snapshot():
+        network_manager.disconnect_client(
+            connection['address'], connection['connection_id'], user_initiated=True)
+
+    # Remove any frozen "disconnected" panels left over from earlier drops.
+    if hasattr(root, 'remote_trees'):
+        for dead_id, dead_tree in list(root.remote_trees.items()):
+            if getattr(dead_tree, 'dead', False):
+                dead_tree.frame.destroy()
+                del root.remote_trees[dead_id]
+        adjust_window_size()
+
+def connect_to_startup_list():
+    """Try to connect to all addresses from startup_connect_list"""
+    startup_connect_list = [
+        (addr, port) for addr, port in settings_manager.settings['network']['startup_connections']
+    ]
+    for address, port in startup_connect_list:
+        # Startup connections are explicitly configured, so always keep them alive.
+        reconnect_targets.add((address, port))
+        connect_to_remote_async(address, port, show_error=False)
+
+def is_target_connected(address, port):
+    """True if we already have an initiated connection to this address/port."""
+    for connection in network_manager.get_connections_snapshot():
+        if (connection.get('initiated')
+                and connection['address'] == address
+                and connection.get('port') == port):
+            return True
+    return False
+
+def _dial_reconnect(address, port):
+    """Dial one reconnect target in the background, clearing its pending flag when done."""
+    def worker():
+        try:
+            network_manager.connect_to_server(address, port)
+        except Exception as e:
+            print(f"Reconnect to {address}:{port} failed: {e}")
+        finally:
+            root.after(0, lambda: reconnect_pending.discard((address, port)))
+    threading.Thread(target=worker, daemon=True).start()
+
+def schedule_reconnect():
+    """Gently re-dial any kept-alive target that is currently disconnected."""
+    try:
+        for address, port in list(reconnect_targets):
+            target = (address, port)
+            if target in reconnect_pending or is_target_connected(address, port):
+                continue
+            reconnect_pending.add(target)
+            _dial_reconnect(address, port)
+    finally:
+        root.after(RECONNECT_INTERVAL * 1000, schedule_reconnect)
+
+#----------------------------------------------------------------------------------------------------------- COPY FOLDIT SAVES
+def clear_all_selections():
+    """Clearing all selections"""
+    global selected_rows
+    for item in selected_rows:
+        if not process_tree.exists(item):
+            continue
+        tags = list(process_tree.item(item, 'tags'))
+        if 'copy_source' in tags:
+            tags.remove('copy_source')
+            process_tree.item(item, tags=tags)
+            apply_row_appearance(item)
+    selected_rows.clear()
+
+def handle_middle_click(event):
+    """Middle mouse button click handler: pick source/target rows for copying saves."""
+    global selected_rows
+    item = process_tree.identify('item', event.x, event.y)
+    if not item:
+        return "break"
+
+    # If the element is already selected - clear all selections
+    if item in selected_rows:
+        clear_all_selections()
+        return "break"
+
+    # Add selection
+    if len(selected_rows) < 2:
+        selected_rows.append(item)
+        tags = list(process_tree.item(item, 'tags'))
+        if len(selected_rows) == 1 and 'copy_source' not in tags:
+            tags.append('copy_source')
+        process_tree.item(item, tags=tags)
+        apply_row_appearance(item)
+
+    if len(selected_rows) >= 2:
+        # Get tags for source and target
+        source_tags = process_tree.item(selected_rows[0], 'tags')
+        target_tags = process_tree.item(selected_rows[1], 'tags')
+
+        # Get folder paths from tags
+        source_folder = get_folder_tag(source_tags)
+        target_folder = get_folder_tag(target_tags)
+
+        if source_folder and target_folder:
+            copy_foldit_saves(
+                source_folder,
+                target_folder,
+                copy_saves=True,
+                copy_ir=True,
+                source_row_id=selected_rows[0],
+                target_row_id=selected_rows[1],
+            )
+
+            # Clear selections after 1 second
+            root.after(1000, clear_all_selections)
+
+    return "break"
+
+_copy_in_progress = False  # guard: don't start a second copy over a running one
+
+
+def copy_foldit_saves(
+    source_folder,
+    target_folder,
+    copy_saves=True,
+    copy_ir=False,
+    source_row_id=None,
+    target_row_id=None,
+):
+    """Copy Foldit saves between two clients.
+
+    The disk work runs in a background thread so a slow or busy disk never freezes
+    (or crashes) the GUI; results are marshalled back to the main thread, mirroring
+    connect_to_remote_async / _read_share_info."""
+    global _copy_in_progress
+    if _copy_in_progress:
+        return
+    job = _resolve_copy_job(
+        source_folder,
+        target_folder,
+        copy_saves,
+        copy_ir,
+        source_row_id=source_row_id,
+        target_row_id=target_row_id,
+    )
+    _copy_in_progress = True
+    threading.Thread(target=_run_copy_jobs, args=([job],), daemon=True).start()
+
+
+def copy_to_all_clients(source_folder, source_row_id=None):
+    """Copy the latest .ir_solution from source folder to all other clients (threaded)."""
+    global _copy_in_progress
+    if _copy_in_progress:
+        return
+    jobs = []
+    seen_targets = set()
+    for item in process_tree.get_children():
+        tags = process_tree.item(item, 'tags')
+        target_folder = next((tag for tag in tags if '\\' in tag or '/' in tag), None)
+        target_key = normalize_path(target_folder) if target_folder else ""
+        if (
+            target_folder
+            and target_key != normalize_path(source_folder)
+            and target_key not in seen_targets
+        ):
+            # Imported/shared .ir_solution files live at data-root level, so one
+            # copy per distinct root is sufficient even when it hosts many Tracks.
+            seen_targets.add(target_key)
+            jobs.append(
+                _resolve_copy_job(
+                    source_folder,
+                    target_folder,
+                    copy_saves=False,
+                    copy_ir=True,
+                    source_row_id=source_row_id,
+                    target_row_id=item,
+                )
+            )
+    if not jobs:
+        return
+    _copy_in_progress = True
+    threading.Thread(target=_run_copy_jobs, args=(jobs,), daemon=True).start()
+
+
+def _resolve_copy_job(
+    source_folder,
+    target_folder,
+    copy_saves,
+    copy_ir,
+    source_row_id=None,
+    target_row_id=None,
+):
+    """Gather everything that needs the Tk tree / process state. Runs on the main
+    thread before the worker starts (Tkinter must never be touched off-thread)."""
+    source_row = get_cached_artifact_row(source_row_id) if source_row_id else None
+    target_row = get_cached_artifact_row(target_row_id) if target_row_id else None
+    source_pid = source_row.get("pid") if source_row else get_pid_for_folder(source_folder)
+    target_pid = target_row.get("pid") if target_row else get_pid_for_folder(target_folder)
+    return {
+        'source_folder': source_folder,
+        'target_folder': target_folder,
+        'copy_saves': copy_saves,
+        'copy_ir': copy_ir,
+        'source_name': source_row.get("client_name") if source_row else os.path.basename(source_folder),
+        'target_name': target_row.get("client_name") if target_row else os.path.basename(target_folder),
+        'source_log_path': source_row.get("log_path", "") if source_row else os.path.join(source_folder, "scriptlog.default.xml"),
+        'source_track': source_row.get("track", "default") if source_row else "default",
+        'target_track': target_row.get("track", "default") if target_row else "default",
+        'source_pid': source_pid,
+        'target_pid': target_pid,
+        'source_puzzle_id': source_row.get("puzzle_id") if source_row else get_puzzle_id(source_pid),
+        'target_puzzle_id': target_row.get("puzzle_id") if target_row else get_puzzle_id(target_pid),
+    }
+
+
+def _run_copy_jobs(jobs):
+    """Worker thread: run the copy jobs sequentially (sequential keeps the disk sane),
+    then clear the selection and report any errors back on the main thread."""
+    errors = []
+    for job in jobs:
+        try:
+            err = _perform_copy_job(job)
+        except Exception as e:  # last-resort guard so the worker never dies silently
+            err = f"Unexpected error copying to {job.get('target_name', '?')}: {e}"
+        if err:
+            errors.append(err)
+
+    def finish():
+        global _copy_in_progress
+        _copy_in_progress = False
+        clear_all_selections()
+        if errors:
+            messagebox.showerror("Error", "\n".join(errors[:5]))
+
+    root.after(0, finish)
+
+
+def _perform_copy_job(job):
+    """Disk I/O for one copy. Runs in the worker thread: only os/shutil and the
+    thread-safe foldit_log_handler here, never Tk. Returns an error string or None;
+    schedules stats / the post-copy client shortcut on the main thread via root.after."""
+    source_folder = job['source_folder']
+    target_folder = job['target_folder']
+
+    # Read the source log first (the handler is internally locked -> safe off-thread).
+    source_score = None
+    source_log_data = None
+    source_snapshot = None
+    try:
+        source_script_path = job.get('source_log_path') or os.path.join(source_folder, "scriptlog.default.xml")
+        foldit_log_handler.start_monitoring(source_script_path)
+        source_log_data = foldit_log_handler.get_fresh_data(source_script_path)
+        source_snapshot = foldit_log_handler.get_stats_snapshot(source_script_path, fresh=True)
+        if source_log_data:
+            source_score = source_log_data.get('highest_score')
+    except Exception as e:
+        print(f"Error reading source log for copy: {e}")
+
+    if job['copy_saves']:
+        try:
+            source_location, dest_path = resolve_track_copy_paths(
+                source_folder,
+                job.get('source_track'),
+                target_folder,
+                job.get('target_track'),
+            )
+            source_track_path = source_location.path
+            backup_path = None
+            if save2backup:
+                backup_folder = os.path.join(os.path.dirname(source_folder), backup_folder_name)
+                os.makedirs(backup_folder, exist_ok=True)
+                # Back up only the destination Track; sibling Tracks in the same
+                # Foldit data root must remain untouched.
+                if os.path.exists(dest_path):
+                    current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                    backup_path = os.path.join(backup_folder,
+                        f"{source_location.internal_puzzle_id} {current_time} "
+                        f"{os.path.basename(target_folder)} {track_directory_name(job.get('target_track'))}")
+
+            replace_track_save_tree(source_track_path, dest_path, backup_path)
+        except Exception as e:
+            return f"Error copying saves: {e}"
+
+        # Record the copy marker in the source puzzle stats (main thread).
+        if job['source_puzzle_id']:
+            root.after(0, lambda: stats_manager.handle_copy_saves_event(
+                source_client=job['source_name'],
+                target_client=job['target_name'],
+                puzzle_id=job['source_puzzle_id'],
+                source_score=source_score,
+                source_script_type=source_log_data.get('script_type') if source_log_data is not None else None,
+                source_state_script=source_snapshot.get('script') if source_snapshot is not None else None,
+                source_state_score=source_snapshot.get('score') if source_snapshot is not None else None,
+            ))
+
+    if job['copy_ir']:
+        try:
+            # Tracks in one data root already share imported/root-level solutions.
+            if normalize_path(source_folder) != normalize_path(target_folder):
+                ir_files = [f for f in os.listdir(source_folder) if f.endswith('.ir_solution')]
+                if ir_files:
+                    latest_ir = max(ir_files, key=lambda f: os.path.getmtime(os.path.join(source_folder, f)))
+                    ir_path = os.path.join(source_folder, latest_ir)
+                    # Only copy a fresh (< 1 day old) solution.
+                    if time.time() - os.path.getmtime(ir_path) < 3600 * 24:
+                        shutil.copy2(ir_path, target_folder)
+        except Exception as e:
+            return f"Error copying IR solution: {e}"
+
+    # Activate destination window and send the post-copy shortcut (main thread).
+    if job['copy_saves'] and job['target_pid'] is not None:
+        target_pid = job['target_pid']
+        shortcut = get_post_copy_shortcut(job['source_puzzle_id'], job['target_puzzle_id'])
+        root.after(0, lambda: window_manager.send_client_shortcut(target_pid, shortcut))
+
+    return None
+
+def export_save_to_pdb(save_path, save_name, puzzle_id=None):
+    """Export selected save to puzzle_logs as PDB."""
+    try:
+        if export_pdb is None:
+            raise RuntimeError("savefile_api is unavailable")
+        pdb_name = re.sub(r'[<>:"/\\|?*]+', '_', str(save_name or "")).strip('. ')
+        if not pdb_name:
+            pdb_name = os.path.splitext(os.path.basename(save_path))[0]
+        clean_puzzle_id = str(puzzle_id).strip()
+        if clean_puzzle_id:
+            pdb_name = f"{clean_puzzle_id} {pdb_name}"
+        pdb_path = os.path.join(stats_manager.logs_folder, f"{pdb_name}.pdb")
+        export_pdb(save_path, pdb_path)
+        messagebox.showinfo("Success", f"PDB exported to:\n{pdb_path}")
+    except Exception as e:
+        messagebox.showerror("Error", f"Error exporting PDB: {e}")
+
+#-------------------------------------------------------------------------------------------------CONTEXT MENU AND SERVICE FUNCTIONS
+def show_popup_menu(menu, event):
+    if menu is None:
+        return "break"
+    try:
+        menu.tk_popup(event.x_root, event.y_root)
+    finally:
+        menu.grab_release()
+    return "break"
+
+
+def show_connect_menu(event):
+    return show_popup_menu(connect_menu, event)
+
+
+def show_logs_menu(event):
+    return show_popup_menu(logs_menu, event)
+
+
+def find_menu_item_index(menu, label):
+    if menu is None:
+        return None
+    try:
+        end_index = menu.index("end")
+    except tk.TclError:
+        return None
+    if end_index is None:
+        return None
+    for i in range(end_index + 1):
+        try:
+            if menu.entrycget(i, "label") == label:
+                return i
+        except tk.TclError:
+            continue
+    return None
+
+
+def remove_menu_item_by_label(menu, label):
+    index = find_menu_item_index(menu, label)
+    if index is not None:
+        menu.delete(index)
+
+
+def insert_menu_item_before_label(menu, before_label, label, command):
+    if menu is None:
+        return
+    insert_index = find_menu_item_index(menu, before_label)
+    if insert_index is None:
+        menu.add_command(label=label, command=command)
+    else:
+        menu.insert(insert_index, "command", label=label, command=command)
+
+
+def unique_menu_item_label(menu, label, suffix):
+    if find_menu_item_index(menu, label) is None:
+        return label
+    clean_suffix = str(suffix).strip()
+    if clean_suffix:
+        return f"{label} {clean_suffix}"
+    return label
+
+
+def remove_leading_context_separator():
+    while True:
+        try:
+            if context_menu.index("end") is None or context_menu.type(0) != "separator":
+                return
+            context_menu.delete(0)
+        except tk.TclError:
+            return
+
+
+def dump_all_logs():
+    """Saves logs of all active Foldit clients"""
+    for item in process_tree.get_children():
+        try:
+            row = get_cached_artifact_row(item) or {}
+            log_path = str(row.get("log_path", "")).strip()
+            if log_path and row.get("binding_status") == "resolved":
+                foldit_log_handler.export_log_file(
+                    log_path,
+                    open_file=False,
+                    puzzle_id=row.get("puzzle_id"),
+                )
+        except Exception as e:
+            print(f"Error dumping log for item {item}: {e}")
+    messagebox.showinfo("Success", "All logs have been saved")
+
+def open_all_logs():
+    """Opens logs of all active Foldit clients"""
+    for item in process_tree.get_children():
+        try:
+            row = get_cached_artifact_row(item) or {}
+            log_path = str(row.get("log_path", "")).strip()
+            if log_path and row.get("binding_status") == "resolved":
+                foldit_log_handler.export_log_file(
+                    log_path,
+                    open_file=True,
+                    puzzle_id=row.get("puzzle_id"),
+                )
+                time.sleep(0.3)
+        except Exception as e:
+            print(f"Error opening log for item {item}: {e}")
+
+def apply_display_palette(palette_name, *, persist=True):
+    if persist:
+        settings_manager.save_active_display_palette(palette_name)
+    if palette_var is not None:
+        palette_var.set(settings_manager.ACTIVE_DISPLAY_PALETTE)
+
+    apply_treeview_palette()
+    for item_id in process_tree.get_children():
+        apply_row_appearance(item_id)
+    adjust_column_widths(process_tree)
+
+    stats_window = get_open_stats_window()
+    if stats_window is not None and hasattr(stats_window, "apply_display_palette_from_settings"):
+        try:
+            stats_window.apply_display_palette_from_settings()
+        except Exception as error:
+            print(f"Could not refresh stats palette: {error}")
+
+    if 'network_manager' in globals() and network_manager.has_clients():
+        network_manager.send_tree_data()
+
+def toggle_always_on_top():
+    settings_manager.save_always_on_top(not settings_manager.ALWAYS_ON_TOP)
+    root.attributes("-topmost", settings_manager.ALWAYS_ON_TOP)
+
+    # Find the index of the "Always on Top" item dynamically
+    for i in range(context_menu.index("end") + 1):
+        try:
+            # Check whether the item exists
+            if context_menu.index(i) >= 0:  # Verify that the index exists
+                label = context_menu.entrycget(i, "label")
+                if "Always on Top" in label:
+                    context_menu.entryconfig(i, label="✓ Always on Top" if settings_manager.ALWAYS_ON_TOP else "Always on Top")
+                    break
+        except tk.TclError:
+            # Ignore the error if the item does not exist
+            continue
+
+
+settings_dialog = None
+
+
+def apply_live_settings_from_dialog(changed_paths, _effective):
+    if ('display', 'monitor_columns') in changed_paths:
+        displayed = visible_column_ids(settings_manager.settings['display']['monitor_columns'])
+        process_tree.configure(displaycolumns=displayed)
+        adjust_column_widths(process_tree)
+        for remote_tree in getattr(root, 'remote_trees', {}).values():
+            remote_tree.tree.configure(displaycolumns=displayed)
+            adjust_column_widths(remote_tree.tree)
+        if not getattr(root, 'size_locked', False):
+            adjust_window_size()
+    if changed_paths & {('display', 'active_palette'), ('display', 'row_appearance')}:
+        apply_display_palette(settings_manager.ACTIVE_DISPLAY_PALETTE, persist=False)
+    if ('display', 'always_on_top') in changed_paths:
+        root.attributes("-topmost", settings_manager.ALWAYS_ON_TOP)
+        label = "✓ Always on Top" if settings_manager.ALWAYS_ON_TOP else "Always on Top"
+        for index in range(context_menu.index("end") + 1):
+            try:
+                if "Always on Top" in context_menu.entrycget(index, "label"):
+                    context_menu.entryconfig(index, label=label)
+                    break
+            except tk.TclError:
+                continue
+    if ('speed_boost', 'profile') in changed_paths and speed_boost is not None:
+        speed_boost.select_profile(settings_manager.SPEED_BOOST_PROFILE, persist=False)
+
+
+def open_settings_dialog():
+    global settings_dialog
+    if settings_dialog is not None and settings_dialog.window.winfo_exists():
+        settings_dialog.window.lift()
+        settings_dialog.window.focus_set()
+        return
+    try:
+        settings_dialog = SettingsDialog(root, settings_manager, apply_live_settings_from_dialog)
+    except Exception as error:
+        messagebox.showerror("Settings", str(error), parent=root)
+
+share_info_cache = {}  # folder -> info dict filled in by _read_share_info worker
+
+
+def _read_share_info(folder, info, previous):
+    """Worker: find the latest .ir_solution in folder and parse its name/score."""
+    try:
+        ir_files = [f for f in os.listdir(folder) if f.endswith('.ir_solution')]
+        if ir_files:
+            latest_ir = max(ir_files, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
+            info['path'] = os.path.join(folder, latest_ir)
+            info['mtime'] = os.path.getmtime(info['path'])
+            if (previous and previous.get('path') == info['path']
+                    and previous.get('mtime') == info['mtime'] and previous.get('name')):
+                info['name'] = previous['name']
+                info['score'] = previous.get('score')
+            elif get_basic_info is not None:
+                data = get_basic_info(info['path'])
+                info['name'] = " ".join((data.save_name or "").split())
+                info['score'] = f"{data.foldit_score:.1f}" if data.foldit_score is not None else None
+    except Exception as e:
+        print(f"Error reading save info for {folder}: {e}")
+    finally:
+        info['done'] = True
+
+
+def get_share_info(folder, wait=0.35):
+    """Latest-save info for a client folder, waiting at most `wait` seconds.
+
+    The disk read runs in a background thread so a slow or locked save never
+    freezes the UI; if it is not done in time the caller gets a partial dict
+    and the finished result is picked up on the next call."""
+    info = share_info_cache.get(folder)
+    if info is None or info.get('done'):
+        previous = info
+        info = {'done': False}
+        share_info_cache[folder] = info
+        info['thread'] = threading.Thread(target=_read_share_info, args=(folder, info, previous), daemon=True)
+        info['thread'].start()
+    thread = info.get('thread')
+    if thread is not None and thread.is_alive():
+        thread.join(wait)
+    return info
+
+
+def get_share_label(info):
+    name = info.get('name')
+    if not name:
+        path = info.get('path')
+        name = os.path.basename(path) if path else "SaveFile"
+    score = info.get('score')
+    return f"Share {name}" + (f" {score}" if score is not None else "")
+
+
+STATS_TO_MAIN_LABEL = "To Main"
+STATS_TO_FINALIZATION_LABEL = "To Finalization"
+MANAGE_SAVES_LABEL = "Manage Saves"
+
+
+def get_ligand_viewer():
+    """Load the offline viewer on demand, keeping monitor startup lightweight."""
+    global ligand_viewer
+    if ligand_viewer is None:
+        module = import_module("modules.ligand_viewer")
+        ligand_viewer = module.LigandViewer(
+            root, str(app_paths.reports), root_path,
+            settings_provider=lambda: settings_manager.settings.get("ligand_viewer", {}),
+        )
+    return ligand_viewer
+
+
+def open_ligand_viewer(folder=None):
+    try:
+        get_ligand_viewer().open_latest(folder)
+    except Exception as error:
+        messagebox.showerror("Ligand viewer", str(error), parent=root)
+
+
+def set_ligand_viewer_context(folder=None):
+    context_menu.entryconfigure("LigandViewer", command=lambda f=folder: open_ligand_viewer(f))
+
+def get_client_stats_identity(row_id):
+    """(client_name, puzzle_id) for a process-tree row, or None when the row has no
+    active puzzle. Stats key clients by client_name on a recognized puzzle id, which
+    is exactly what the per-pid artifact cache stores."""
+    row = get_cached_artifact_row(row_id)
+    if not row:
+        return None
+    client_name = str(row.get("client_name", "")).strip()
+    puzzle_id = str(row.get("puzzle_id", "")).strip()
+    if not client_name or not puzzle_id:
+        return None
+    return client_name, puzzle_id
+
+
+def move_client_stats_target(puzzle_id, client_name, target):
+    """Flip a client between the Main and Finalization stats tables from the main
+    window's client context menu."""
+    try:
+        stats_manager.set_client_target(puzzle_id, client_name, target)
+    except Exception as e:
+        print(f"Error moving client stats target: {e}")
+
+
+def remove_client_menu_items():
+    """Drop per-client entries (Share/Export/stats target) from the context menu."""
+    for i in range(context_menu.index('end'), -1, -1):
+        try:
+            label = context_menu.entrycget(i, "label")
+        except tk.TclError:
+            continue
+        if (
+            label.startswith("Share ")
+            or label == "Export to PDB"
+            or label.endswith("Alarm on change")
+            or label in (STATS_TO_MAIN_LABEL, STATS_TO_FINALIZATION_LABEL)
+            or label.startswith(MANAGE_SAVES_LABEL)
+        ):
+            context_menu.delete(i)
+    remove_leading_context_separator()
+
+
+def toggle_alarm_on_change(pid):
+    """Arm/disarm the one-shot score-change alarm for a single client row."""
+    if pid is None:
+        return
+    state = monitored_processes[pid]
+    state['alarm_on_change'] = not state.get('alarm_on_change', False)
+
+
+def show_tree_context_menu(event):
+    """RMB on a client row: context menu extended with that client's stats and save
+    actions (move between the Main and Finalization stats tables, Share, Export)."""
+    item = process_tree.identify('item', event.x, event.y)
+    if not item:
+        return  # empty area: the root binding shows the plain global menu
+    tags = process_tree.item(item, 'tags')
+    folder = get_folder_tag(tags)
+    if not folder:
+        return
+
+    remove_client_menu_items()
+    set_ligand_viewer_context(folder)
+    insert_index = 0
+
+    pid = get_pid_tag(tags)
+    row = get_cached_artifact_row(item) or {}
+    if speed_boost is not None and pid is not None:
+        speed_boost.populate_menu(
+            speed_boost_menu,
+            pid=pid,
+            client_name=row.get("client_name") or os.path.basename(folder),
+        )
+    if pid is not None:
+        alarm_armed = bool(monitored_processes.get(pid, {}).get('alarm_on_change'))
+        context_menu.insert(insert_index, "command",
+            label=("✓ Alarm on change" if alarm_armed else "Alarm on change"),
+            command=lambda p=pid: toggle_alarm_on_change(p),
+        )
+        insert_index += 1
+
+    # Stats: move this client between the Main (vertical) and Finalization
+    # (horizontal) tables, depending on where it currently is.
+    identity = get_client_stats_identity(item)
+    if identity is not None:
+        client_name, puzzle_id = identity
+        current_target = stats_manager.get_active_targets(puzzle_id).get(client_name, "vertical")
+        if current_target == "horizontal":
+            target_label, new_target = STATS_TO_MAIN_LABEL, "vertical"
+        else:
+            target_label, new_target = STATS_TO_FINALIZATION_LABEL, "horizontal"
+        context_menu.insert(insert_index, "command",
+            label=target_label,
+            command=lambda p=puzzle_id, c=client_name, t=new_target: move_client_stats_target(p, c, t),
+        )
+        insert_index += 1
+
+    row_puzzle_id = str(row.get("puzzle_id", "")).strip()
+    shared_root = is_shared_data_root(folder)
+    if row_puzzle_id and not shared_root:
+        context_menu.insert(
+            insert_index,
+            "command",
+            label=MANAGE_SAVES_LABEL,
+            command=lambda p=row_puzzle_id, f=folder: open_save_manager_window(p, f, "client"),
+        )
+    else:
+        label = (
+            f"{MANAGE_SAVES_LABEL} (shared Track folder)"
+            if shared_root
+            else MANAGE_SAVES_LABEL
+        )
+        context_menu.insert(insert_index, "command", label=label, state="disabled")
+    insert_index += 1
+
+    # Root-level imported solutions are shared naturally by Tracks in one data
+    # root; offering Share is therefore safe even when this row has siblings.
+    info = get_share_info(folder)
+    save_path = info.get('path')
+    if not (info.get('done') and not save_path):  # skip Share/Export only when this client has no saves
+        save_name = info.get('name')
+        context_menu.insert(insert_index, "command",
+            label=get_share_label(info),
+            command=lambda f=folder, row_id=item: copy_to_all_clients(f, row_id)
+        )
+        insert_index += 1
+        if save_path and export_pdb is not None:
+            puzzle_id_for_pdb = get_puzzle_id(get_pid_tag(tags))
+            context_menu.insert(insert_index, "command",
+                label="Export to PDB",
+                command=lambda path=save_path, name=save_name, pid=puzzle_id_for_pdb: export_save_to_pdb(path, name, pid)
+            )
+        else:
+            context_menu.insert(insert_index, "command", label="Export to PDB", state="disabled")
+        insert_index += 1
+
+    if insert_index > 0:
+        context_menu.insert(insert_index, "separator")
+
+    post_context_menu(event)
+    return "break"
+
+
+def post_context_menu(event):
+    if palette_var is not None:
+        palette_var.set(settings_manager.ACTIVE_DISPLAY_PALETTE)
+    context_menu.post(event.x_root, event.y_root)
+
+
+def show_context_menu(event):
+    """RMB outside client rows: global menu without per-client items."""
+    remove_client_menu_items()
+    selected = process_tree.selection()
+    folder = get_folder_tag(process_tree.item(selected[0], 'tags')) if selected else None
+    set_ligand_viewer_context(folder)
+    if speed_boost is not None:
+        speed_boost.populate_menu(speed_boost_menu)
+    post_context_menu(event)
+
+def reset_window_size():
+    """Reset window size and enable auto-size"""
+    root.size_locked = False
+    adjust_window_size(force=True)
+
+    # Remove the menu item
+    try:
+        for i in range(context_menu.index("end") + 1):
+            try:
+                if context_menu.entrycget(i, "label") == "Reset window size":
+                    context_menu.delete(i)
+                    break
+            except:
+                continue
+    except Exception as e:
+        print(f"Error removing menu item in reset_window_size: {e}")
+def on_window_resize(event):
+    """Handler for window resize"""
+    if not hasattr(root, 'resizing'):
+        root.resizing = False
+
+    if event.widget == root and not root.resizing:
+        root.resizing = True
+
+        # Only lock size if it's not a programmatic resize
+        if not getattr(root, 'programmatic_resize', False):
+            # Check if the size was changed by the user
+            if not hasattr(root, 'last_auto_size'):
+                root.last_auto_size = (root.winfo_width(), root.winfo_height())
+            current_size = (event.width, event.height)
+
+            if current_size != root.last_auto_size:
+                # The size was changed by the user
+                if not hasattr(root, 'size_locked') or not root.size_locked:
+                    root.size_locked = True
+                    # Add menu item after "Always on Top"
+                    always_top_index = None
+                    for i in range(context_menu.index("end") + 1):
+                        try:
+                            if context_menu.entrycget(i, "label").endswith("Always on Top"):
+                                always_top_index = i
+                                break
+                        except:
+                            continue
+
+                    if always_top_index is not None:
+                        # Check if the menu item already exists
+                        menu_exists = False
+                        for i in range(context_menu.index("end") + 1):
+                            try:
+                                if context_menu.entrycget(i, "label") == "Reset window size":
+                                    menu_exists = True
+                                    break
+                            except:
+                                continue
+
+                        if not menu_exists:
+                            context_menu.insert(always_top_index + 1, "command",
+                                label="Reset window size",
+                                command=reset_window_size
+                            )
+
+        root.resizing = False
+
+def on_treeview_click(event):
+    """Handle the event when an item in the treeview is double-clicked."""
+    global last_double_click_time
+    last_double_click_time = time.time()
+    column = column_at_x(process_tree, event.x)
+    item = process_tree.identify('item', event.x, event.y)
+    if not item:
+        return
+
+    # Get all tags and extract only pid and folder_path
+    tags = process_tree.item(item, 'tags')
+    pid = get_pid_tag(tags)
+    folder_path = get_folder_tag(tags)
+    row = get_cached_artifact_row(item) or {}
+    log_path = str(row.get("log_path", "")).strip()
+
+    if column in ("Score", "Type"):
+        if not log_path or row.get("binding_status") != "resolved":
+            return
+        foldit_log_handler.export_log_file(
+            log_path,
+            open_file=True,
+            puzzle_id=row.get("puzzle_id"),
+        )
+    if column == "CPU" and pid is not None:
+        pid_int = int(pid)
+        if speed_boost is not None:
+            if speed_boost.before_activate(
+                pid_int,
+                after=lambda target_pid=pid_int: window_manager.activate_client(target_pid),
+            ):
+                return
+        window_manager.activate_client(pid_int)
+    if column == "Folder" and folder_path:
+        open_folder(folder_path)
+    if column == "Puzzle":
+        puzzle_id = str(row.get("puzzle_id", "")).strip()
+        if puzzle_id:
+            open_stats_for_puzzle(puzzle_id)
+
+def find_foldit_installations():
+    """Return (installation folders, running folders); (None, None) if none can be found."""
+    parent_dirs = get_running_foldit_parent_dirs()
+    if not parent_dirs:
+        remembered_parent = str(settings_manager.LAST_SEEN_FOLDIT_PARENT).strip()
+        if not remembered_parent or not os.path.isdir(remembered_parent):
+            messagebox.showinfo("Info", "No running Foldit clients found. Start one manually first.")
+            return None, None
+        parent_dirs = [remembered_parent]
+
+    if not window_manager.get_executable_name():
+        messagebox.showerror("Error", "Unsupported operating system")
+        return None, None
+    foldit_folders = window_manager.find_installation_folders(parent_dirs)
+    if not foldit_folders:
+        messagebox.showerror("Error", "No Foldit installations found")
+        return None, None
+    foldit_folders.sort(key=lambda x: natural_sort(get_data_root_display_name(x)))
+
+    running_folders = set()
+    for item in process_tree.get_children():
+        folder = get_folder_tag(process_tree.item(item, 'tags'))
+        if folder:
+            running_folders.add(folder)
+    return foldit_folders, running_folders
+
+
+def launch_client_folder(folder_path):
+    """Launch a Foldit client from a specific installation folder."""
+    try:
+        window_manager.launch_client(folder_path)
+        settings_manager.save_last_seen_foldit_parent(get_foldit_parent_dir(folder_path))
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to launch Foldit: {str(e)}")
+
+
+def launch_next_client():
+    """Prefer an unused installation; duplicate one only when all are running."""
+    foldit_folders, running_folders = find_foldit_installations()
+    if not foldit_folders:
+        return
+
+    running_keys = {normalize_path(folder) for folder in running_folders}
+    unused_folders = [folder for folder in foldit_folders if normalize_path(folder) not in running_keys]
+    launch_client_folder((unused_folders or foldit_folders)[0])
+
+
+def show_new_client_menu(event):
+    """RMB on New Client, with duplicates offered only when no install is free."""
+    foldit_folders, running_folders = find_foldit_installations()
+    if not foldit_folders:
+        return "break"
+
+    running_keys = {normalize_path(folder) for folder in running_folders}
+    unused_folders = [folder for folder in foldit_folders if normalize_path(folder) not in running_keys]
+    menu = tk.Menu(root, tearoff=0)
+    for folder in foldit_folders:
+        name = get_data_root_display_name(folder)
+        is_running = normalize_path(folder) in running_keys
+        if unused_folders and is_running:
+            menu.add_command(label=f"✓ {name}", state="disabled")
+        elif is_running:
+            menu.add_command(label=f"↻ {name} (another instance)", command=lambda f=folder: launch_client_folder(f))
+        else:
+            menu.add_command(label=name, command=lambda f=folder: launch_client_folder(f))
+    try:
+        menu.tk_popup(event.x_root, event.y_root)
+    finally:
+        menu.grab_release()
+    return "break"
+
+def handle_root_configure(event=None):
+    on_window_resize(event)
+
+#--------------------------------------------------------------------------------------------MAIN WINDOW GUI
+# Create a global instance of WindowManager
+window_manager = WindowManager()
+client_resolver = ClientResolver(settings_manager.settings)
+
+root = tk.Tk()
+root.title("Foldit Monitor")
+root.attributes("-topmost", settings_manager.ALWAYS_ON_TOP)
+#root.overrideredirect(True)  # Remove window title and control buttons
+
+icon_data = create_ribbon_icon()
+icon = tk.PhotoImage(data=icon_data)
+root.iconphoto(True, icon)
+
+# Initialize optional sound support. Monitoring works normally without pygame.
+def _load_optional_pygame():
+    try:
+        import pygame
+    except Exception as error:
+        print(
+            "Alert sound support is unavailable. Use Python 3.11-3.13 and "
+            f"reinstall requirements.txt to enable it: {error}"
+        )
+        return None
+    return pygame
+
+
+def init_sound():
+    pygame = _load_optional_pygame()
+    if pygame is None:
+        return False
+    try:
+        pygame.mixer.init()
+    except pygame.error as e:
+        print(f"Error initializing sound: {e}")
+        return False
+    return True
+# init_sound()
+#if os.path.exists(settings_manager.sound_file):
+#   pygame.mixer.music.load(settings_manager.sound_file)
+#else:
+#    alert_buffer = create_alert_sound(duration=2)
+#    with open(settings_manager.sound_file, 'wb') as f:
+#        f.write(alert_buffer.getvalue())
+#pygame.mixer.music.load(settings_manager.sound_file)
+#pygame.mixer.music.set_volume(settings_manager.VOLUME)
+
+
+def play_alert_sound():
+    """(Re)initialize mixer so playback goes to the current default device, then play."""
+    pygame = _load_optional_pygame()
+    if pygame is None:
+        return False
+    try:
+        pygame.mixer.quit()
+        pygame.mixer.init()
+        pygame.mixer.music.load(settings_manager.sound_file)
+        pygame.mixer.music.set_volume(settings_manager.VOLUME)
+        pygame.mixer.music.play()
+    except pygame.error as e:
+        print(f"Error playing sound: {e}")
+        return False
+    return True
+
+
+# Set window position and make draggable
+if settings_x == -1 or settings_y == -1:
+    # Use default position (bottom right)
+    x_position = root.winfo_screenwidth() - window_width - 130
+    y_position = root.winfo_screenheight() - window_height
+else:
+    x_position = settings_x
+    y_position = settings_y
+root.geometry(f"{window_width}x{window_height}+{x_position}+{y_position}")
+make_window_draggable(root)
+root.resizing = False
+
+
+
+process_tree = ttk.Treeview(root,
+    columns=COLUMN_IDS,
+    displaycolumns=visible_column_ids(settings_manager.settings['display']['monitor_columns']),
+    show="headings",
+    selectmode='none'
+    )
+process_tree.heading("Score", text="Score")
+process_tree.heading("CPU", text="CPU", anchor="center")
+process_tree.heading("Folder", text="Cl")
+process_tree.heading("Type", text="Script")
+process_tree.column("CPU", anchor="center")
+process_tree.heading("Puzzle", text="Pzl")
+process_tree.column("Puzzle", width=50, stretch=False)
+process_tree.pack(fill="both", expand=True)
+speed_boost = create_speed_boost_integration(
+    root,
+    process_tree,
+)
+
+
+# Create a style for small buttons
+style = ttk.Style()
+style.configure('Small.TButton', padding=1)
+
+# Create a frame for buttons at the bottom of the window
+button_frame = ttk.Frame(root)
+button_frame.pack(side="bottom", fill="x", padx=2, pady=(0, 2))
+
+# Create buttons with reduced size
+style.configure('Small.TButton', padding=0, font=('TkDefaultFont', 7))
+new_client_button = ttk.Button(button_frame, text="New Client", command=launch_next_client,
+          width=9, style='Small.TButton')
+new_client_button.pack(side="left", padx=0)
+new_client_button.bind("<Button-3>", show_new_client_menu)
+stats_button = ttk.Button(
+    button_frame,
+    text="Stats",
+    command=toggle_stats_window,
+    width=8,
+    style='Small.TButton',
+)
+stats_button.pack(side="left", padx=0)
+stats_button.bind("<Button-3>", show_stats_puzzle_menu)
+stats_puzzle_menu = tk.Menu(root, tearoff=0)
+logs_menu = tk.Menu(root, tearoff=0)
+logs_menu.add_command(label="Open all local logs", command=open_all_logs)
+logs_menu.add_command(label="Dump all local logs", command=dump_all_logs)
+logs_menu.add_separator()
+logs_menu.add_command(label="Open all remote logs", command=open_all_remote_logs)
+logs_menu.add_command(label="Dump all remote logs", command=dump_all_remote_logs)
+all_logs_button = ttk.Button(button_frame, text="All Logs", command=open_all_logs,
+          width=8, style='Small.TButton')
+all_logs_button.pack(side="left", padx=0)
+all_logs_button.bind("<Button-3>", show_logs_menu)
+# ttk.Button(button_frame, text="Dump Logs", command=dump_all_logs,
+#           width=8, style='Small.TButton').pack(side="left", padx=0)
+# ttk.Button(button_frame, text="—", command=minimize_window,
+#           width=1, style='Small.TButton').pack(side="right", padx=0)
+# ttk.Button(button_frame, text="×", command=close_app,
+#           width=1, style='Small.TButton').pack(side="right", padx=0)
+
+
+root.protocol("WM_DELETE_WINDOW", on_close)
+
+# Create the Connect button context menu
+connect_menu = tk.Menu(root, tearoff=0)
+connect_menu.add_command(label="Connect...", command=show_connect_dialog)
+connect_menu.add_separator()
+connect_menu.add_command(label="Disconnect all", command=disconnect_all_clients)
+
+# Create the context menu
+context_menu = tk.Menu(root, tearoff=0)
+palette_var = tk.StringVar(value=settings_manager.ACTIVE_DISPLAY_PALETTE)
+palette_menu = tk.Menu(context_menu, tearoff=0)
+for palette_name in settings_manager.DISPLAY_PALETTES:
+    palette_menu.add_radiobutton(
+        label=palette_name.title(),
+        value=palette_name,
+        variable=palette_var,
+        command=lambda name=palette_name: apply_display_palette(name),
+    )
+if speed_boost is not None:
+    speed_boost_menu = tk.Menu(context_menu, tearoff=0)
+    speed_boost.populate_menu(speed_boost_menu)
+    context_menu.add_cascade(label="Speed boost", menu=speed_boost_menu)
+    context_menu.add_separator()
+context_menu.add_command(label="LigandViewer", command=open_ligand_viewer)
+context_menu.add_cascade(label="Palette", menu=palette_menu)
+context_menu.add_command(
+    label="✓ Always on Top" if settings_manager.ALWAYS_ON_TOP else "Always on Top",
+    command=toggle_always_on_top,
+)
+context_menu.add_command(label="Settings…", command=open_settings_dialog)
+context_menu.add_command(label="Close", command=on_close)
+
+
+# Bind events for window state changes
+root.bind("<Map>", on_window_state_change)    # Restored
+# Bind right-click to show the context menu
+root.bind("<Button-3>", show_context_menu)
+# Bind the treeview click event to the on_treeview_click function
+process_tree.bind('<Double-1>', on_treeview_click)
+
+# In the process_tree creation section, add event bindings:
+process_tree.bind('<Button-2>', handle_middle_click)
+process_tree.bind('<Button-3>', show_tree_context_menu)
+root.bind("<Configure>", handle_root_configure)
+root.bind('<FocusOut>', on_focus_out)
+
+init_fonts()
+apply_treeview_palette()
+root.tooltip = setup_tooltip(root)
+
+network_manager = NetworkManager(
+    main_window=root,
+    callbacks={
+        'create_remote_tree': create_remote_tree,
+        'remove_remote_tree': remove_remote_tree,
+        'update_remote_trees': update_remote_trees,
+        'build_artifact': build_remote_artifact,
+        'build_artifact_query': build_remote_artifact_query,
+        'artifact_received': handle_remote_artifact_received,
+        'artifact_error': handle_remote_artifact_error,
+        'get_row_payload': get_cached_artifact_row,
+    },
+    tree=process_tree,  # Pass process_tree
+    monitored_processes=monitored_processes,  # Pass monitored_processes
+    password=settings_manager.NETWORK_PASSWORD,
+    artifact_root=os.path.join(stats_manager.logs_folder, "_remote"),
+    max_artifact_bytes=settings_manager.NETWORK_MAX_ARTIFACT_BYTES,
+    artifact_chunk_bytes=settings_manager.NETWORK_ARTIFACT_CHUNK_BYTES,
+)
+network_manager.start_server(settings_manager.DEFAULT_PORT, settings_manager.SERVER_TIMEOUT)
+connect_button = ttk.Button(button_frame, text="Connect", command=show_connect_dialog,
+            width=9, style='Small.TButton')
+connect_button.pack(side="left", padx=0)
+connect_button.bind("<Button-3>", show_connect_menu)
+refresh_stats_puzzle_menu()
+
+# Establish the empty-state layout before the first process refresh.  A refresh
+# with no clients has no dirty rows, so it intentionally skips the later
+# incremental layout pass.
+adjust_column_widths(process_tree)
+adjust_window_size()
+
+#--------------------------Main loop
+
+# Start the periodic update scheduling
+schedule_update()
+
+# Add automatic connections at startup
+connect_to_startup_list()
+
+# Start the gentle auto-reconnect sweep for kept-alive hosts. Delay the first pass by
+# one interval so the startup connections above have time to land (avoids double-dialing).
+root.after(RECONNECT_INTERVAL * 1000, schedule_reconnect)
+
+root.mainloop()
+
+# if __name__ == "__main__":
+#     # Start the periodic update scheduling
+#     schedule_update()
+
+#     # Add automatic connections at startup
+#     connect_to_startup_list()
+
+#     root.mainloop()

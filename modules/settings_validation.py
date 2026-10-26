@@ -6,8 +6,11 @@ Unknown keys are deliberately left alone for forward compatibility.
 
 import os
 import ipaddress
+import math
 import re
 from typing import Any
+
+from modules.monitor_columns import validate_monitor_columns
 
 
 class SettingsValidationError(ValueError):
@@ -77,6 +80,10 @@ def validate_settings(settings: dict) -> None:
         _number(display[key], f"display.{key}", minimum=1, integer=True)
     for key in ("always_on_top", "show_puzzle_column"):
         _boolean(display[key], f"display.{key}")
+    try:
+        validate_monitor_columns(display["monitor_columns"])
+    except ValueError as error:
+        _fail("display.monitor_columns", str(error))
     if display["stats_ui_backend"] not in ("tk", "pyside6"):
         _fail("display.stats_ui_backend", "expected tk or pyside6")
     fonts = _object(display["fonts"], "display.fonts")
@@ -137,6 +144,15 @@ def validate_settings(settings: dict) -> None:
             re.compile(pattern)
         except re.error as error:
             _fail(f"logging.score_patterns[{index}]", str(error))
+
+    viewer = _object(data.get("ligand_viewer", {}), "ligand_viewer")
+    if viewer.get("quality", "Standard") not in ("Fast", "Standard", "Fine"):
+        _fail("ligand_viewer.quality", "expected Fast, Standard or Fine")
+    for key, default, lo, hi in (("reach", 8., 4, 12), ("probe_radius", 0., 0, 2)):
+        value = viewer.get(key, default)
+        _number(value, f"ligand_viewer.{key}", minimum=lo, maximum=hi)
+        if not math.isfinite(value):
+            _fail(f"ligand_viewer.{key}", "expected a finite number")
 
     speed = _object(data["speed_boost"], "speed_boost")
     _boolean(speed["enabled"], "speed_boost.enabled")

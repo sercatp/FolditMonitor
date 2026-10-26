@@ -4,8 +4,8 @@ import tkinter as tk
 from tkinter import font, messagebox, ttk
 from typing import Any, Callable, Dict, List, Optional
 
-from stats_editor import StatsEditorSession, StatsWindowControllerMixin, display_fin_client_name
-from stats_module import (
+from modules.stats_editor import StatsEditorSession, StatsWindowControllerMixin, display_fin_client_name
+from modules.stats_module import (
     PuzzleLogInfo,
     StatsManager,
     StatsUiBridge,
@@ -13,7 +13,7 @@ from stats_module import (
     natural_sort_key,
     resolve_settings_dict,
 )
-from window_manager import open_path
+from modules.window_manager import open_path
 
 
 _qt_backend_module = None
@@ -1479,7 +1479,7 @@ def _load_qt_backend(show_error: bool = False):
         return None
 
     try:
-        _qt_backend_module = importlib.import_module("stats_ui_qt")
+        _qt_backend_module = importlib.import_module("modules.stats_ui_qt")
         return _qt_backend_module
     except Exception as exc:
         _qt_backend_import_error = exc

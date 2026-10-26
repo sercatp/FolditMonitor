@@ -1,4 +1,5 @@
 import tkinter as tk
+from modules.monitor_columns import column_at_x
 
 class TooltipWindow:
     def __init__(self, parent, fonts, update_interval=1000, hover_delay=200):
@@ -115,12 +116,12 @@ class TooltipWindow:
         mouse_x = self.current_tree.winfo_pointerx() - self.current_tree.winfo_rootx()
         mouse_y = self.current_tree.winfo_pointery() - self.current_tree.winfo_rooty()
         
-        current_column = self.current_tree.identify_column(mouse_x)
+        current_column = column_at_x(self.current_tree, mouse_x)
         current_item = self.current_tree.identify('item', mouse_x, mouse_y)
         
         if (current_item == self.hover_item and 
             current_column == self.hover_column and 
-            current_column == "#1"):
+            current_column == "Score"):
             self.show(text, x, y, item)
 
     def schedule_update(self):

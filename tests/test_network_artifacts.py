@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 
-from network import (
+from modules.network import (
     ARTIFACT_QUERY_CAPABILITY,
     ARTIFACT_TRANSFER_CAPABILITY,
     NetworkManager,

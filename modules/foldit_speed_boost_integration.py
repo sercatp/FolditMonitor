@@ -3,7 +3,7 @@ import threading
 import tkinter as tk
 from tkinter import messagebox
 
-from foldit_speed_boost import (
+from modules.foldit_speed_boost import (
     FolditSpeedBoostManager,
     SpeedBoostTiming,
     SpeedBoostUnavailable,

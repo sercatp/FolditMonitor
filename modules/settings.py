@@ -8,7 +8,9 @@ import shutil
 from copy import deepcopy
 from typing import Dict, Any, Optional
 
-from settings_validation import SettingsValidationError, validate_settings
+from modules.settings_validation import SettingsValidationError, validate_settings
+from modules.monitor_columns import default_monitor_columns, effective_monitor_columns
+from modules.paths import get_app_paths
 
 
 RESET_TO_DEFAULT = object()
@@ -63,11 +65,7 @@ class Settings:
         self.root_path = root_path
         self.settings_file = os.path.join(root_path, "Foldit Monitor.json")
         self._settings_lock = threading.RLock()
-        self.bundled_resource_root = getattr(
-            sys,
-            "_MEIPASS",
-            os.path.dirname(os.path.abspath(__file__)),
-        )
+        self.bundled_resource_root = str(get_app_paths().resources)
         self.defaults_profile_file = os.path.join(
             self.bundled_resource_root,
             "Foldit Monitor.defaults.json",
@@ -330,7 +328,8 @@ class Settings:
             "display": {
                 "tooltip_lines": self.TOOLTIP_LINES,
                 "always_on_top": self.ALWAYS_ON_TOP,
-                "show_puzzle_column": False,
+                "show_puzzle_column": True,
+                "monitor_columns": default_monitor_columns(),
                 "window_position": {
                     "x": 1,
                     "y": 1
@@ -386,6 +385,7 @@ class Settings:
                 "folder_name": self.BACKUP_FOLDER_NAME,
                 "save_to_backup": self.SAVE_TO_BACKUP
             },
+            "ligand_viewer": {"quality": "Standard", "reach": 8.0, "probe_radius": 0.0},
             "speed_boost": {
                 "enabled": False,
                 "profile": self.DEFAULT_SPEED_BOOST_PROFILE,
@@ -436,6 +436,9 @@ class Settings:
 
         effective_settings = deepcopy(self.user_settings)
         self._apply_defaults(effective_settings, default_settings)
+        effective_settings["display"]["monitor_columns"] = effective_monitor_columns(
+            self.user_settings.get("display", {}), effective_settings["display"]
+        )
         self._apply_display_palette(effective_settings)
 
         if should_initialize_file:
@@ -628,6 +631,9 @@ class Settings:
                 user = {}
             effective = deepcopy(user)
             self._apply_defaults(effective, defaults)
+            effective["display"]["monitor_columns"] = effective_monitor_columns(
+                user.get("display", {}), effective["display"]
+            )
             self._apply_display_palette(effective)
             return deepcopy(defaults), deepcopy(user), effective
 
@@ -663,8 +669,25 @@ class Settings:
                     self._delete_nested_value(updated_user, path)
                 else:
                     self._set_nested_value(updated_user, path, deepcopy(value))
+            if ("display", "monitor_columns") in normalized:
+                columns = updated_user["display"].get("monitor_columns")
+                # Keep the legacy toggle useful to older monitor versions.
+                if isinstance(columns, list):
+                    puzzle = next((item for item in columns if isinstance(item, dict) and item.get("id") == "Puzzle"), None)
+                    if puzzle is not None:
+                        updated_user["display"]["show_puzzle_column"] = puzzle.get("visible")
+                elif normalized[("display", "monitor_columns")] is RESET_TO_DEFAULT:
+                    default_puzzle = next(
+                        item for item in defaults["display"]["monitor_columns"]
+                        if item["id"] == "Puzzle"
+                    )
+                    updated_user["display"]["show_puzzle_column"] = default_puzzle["visible"]
             effective = deepcopy(updated_user)
             self._apply_defaults(effective, defaults)
+            if ("display", "monitor_columns") not in normalized or normalized[("display", "monitor_columns")] is RESET_TO_DEFAULT:
+                effective["display"]["monitor_columns"] = effective_monitor_columns(
+                    updated_user.get("display", {}), effective["display"]
+                )
             self._apply_display_palette(effective)
             validate_settings(effective)
 
@@ -690,13 +713,19 @@ class Settings:
             ('display', 'active_palette'),
             ('display', 'row_appearance'),
             ('display', 'always_on_top'),
+            ('display', 'monitor_columns'),
             ('sound', 'volume'),
             ('speed_boost', 'profile'),
+            ('ligand_viewer', 'quality'),
+            ('ligand_viewer', 'reach'),
+            ('ligand_viewer', 'probe_radius'),
         }
         with self._settings_lock:
             changed = set(changed_paths) & live
             for path in changed:
                 self._set_nested_value(self.settings, path, deepcopy(self._get_nested_value(effective, path)))
+            if ('display', 'monitor_columns') in changed:
+                self.settings['display']['show_puzzle_column'] = effective['display']['show_puzzle_column']
             if changed & {('display', 'active_palette'), ('display', 'row_appearance')}:
                 self._apply_display_palette(self.settings)
                 self.ACTIVE_DISPLAY_PALETTE = self.settings['display']['active_palette']
@@ -758,8 +787,11 @@ class Settings:
             return clean_file_name
 
         runtime_path = os.path.join(self.root_path, clean_file_name)
-        if os.path.exists(runtime_path) or not getattr(sys, "frozen", False):
+        if os.path.exists(runtime_path):
             return runtime_path
+        legacy_path = os.path.join(get_app_paths().root, clean_file_name)
+        if os.path.exists(legacy_path):
+            return legacy_path
         return os.path.join(self.bundled_resource_root, clean_file_name)
 
     def update_globals(self):

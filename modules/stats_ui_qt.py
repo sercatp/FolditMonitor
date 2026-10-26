@@ -38,13 +38,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from stats_editor import (
+from modules.stats_editor import (
     StatsEditorSession,
     StatsViewLayout,
     StatsWindowControllerMixin,
     display_fin_client_name,
 )
-from stats_domain import (
+from modules.stats_domain import (
     FIN_FIXED_COLUMNS,
     encode_history_edit_value,
     format_score_history,
@@ -53,7 +53,7 @@ from stats_domain import (
     latest_history_value,
     normalize_history_value,
 )
-from stats_module import (
+from modules.stats_module import (
     PuzzleLogInfo,
     StatsManager,
     StatsUiBridge,
@@ -61,7 +61,7 @@ from stats_module import (
     natural_sort_key,
     resolve_settings_dict,
 )
-from window_manager import open_path
+from modules.window_manager import open_path
 
 
 class QtEventPump:

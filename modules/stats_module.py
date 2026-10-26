@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from stats_domain import (
+from modules.stats_domain import (
     FIN_FIXED_COLUMNS,
     FinalizationDomain,
     append_text_history_if_changed,

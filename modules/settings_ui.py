@@ -5,8 +5,9 @@ import re
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox, ttk
 
-from settings import RESET_TO_DEFAULT
-from settings_validation import SettingsValidationError
+from modules.settings import RESET_TO_DEFAULT
+from modules.settings_validation import SettingsValidationError
+from modules.monitor_columns import COLUMN_LABELS
 
 
 def _get(data, path, fallback=None):
@@ -79,8 +80,12 @@ class SettingsDialog:
         ("display", "active_palette"),
         ("display", "row_appearance"),
         ("display", "always_on_top"),
+        ("display", "monitor_columns"),
         ("sound", "volume"),
         ("speed_boost", "profile"),
+        ("ligand_viewer", "quality"),
+        ("ligand_viewer", "reach"),
+        ("ligand_viewer", "probe_radius"),
     }
 
     def __init__(self, parent, manager, on_applied):
@@ -93,6 +98,7 @@ class SettingsDialog:
         self.complex_paths = set()
         self.list_widgets = {}
         self.table_widgets = {}
+        self.monitor_columns_list = None
 
         self.window = tk.Toplevel(parent)
         self.window.title("Foldit Monitor Settings")
@@ -112,7 +118,7 @@ class SettingsDialog:
         notebook = ttk.Notebook(outer)
         notebook.pack(fill="both", expand=True)
         self.tabs = {}
-        tab_names = ["Display", "Sound", "Network", "Logs", "Monitoring"]
+        tab_names = ["Display", "Sound", "Network", "Logs", "Monitoring", "Ligand Viewer"]
         if _get(self.pending, ("speed_boost", "enabled")) is True:
             tab_names.append("Speed Boost")
         tab_names.extend(("Scripts", "State"))
@@ -125,6 +131,7 @@ class SettingsDialog:
         self._build_network()
         self._build_logging()
         self._build_monitoring()
+        self._build_ligand_viewer()
         if "Speed Boost" in self.tabs:
             self._build_speed()
         self._build_mapping()
@@ -194,12 +201,12 @@ class SettingsDialog:
         fields = [
             ("Tooltip lines", ("display", "tooltip_lines"), "int"),
             ("Always on top", ("display", "always_on_top"), "bool"),
-            ("Show puzzle column", ("display", "show_puzzle_column"), "bool"),
             ("Stale row threshold", ("display", "stale_tick_limit"), "int"),
             ("Unknown script type length", ("display", "script_type_fallback_max_length"), "int"),
         ]
         for row, (label, path, kind) in enumerate(fields):
             self._scalar(frame, row, label, path, kind)
+        self._build_monitor_columns()
         fonts = self._section(self.tabs["Display"], "Fonts and statistics window")
         for row, (label, path, kind) in enumerate([
             ("Font family", ("display", "fonts", "family"), "str"),
@@ -210,6 +217,58 @@ class SettingsDialog:
         ]):
             self._scalar(fonts, row, label, path, kind, choices=["pyside6", "tk"] if path[-1] == "stats_ui_backend" else None)
         self._build_palette(self.tabs["Display"])
+
+    def _build_monitor_columns(self):
+        path = ("display", "monitor_columns")
+        frame = self._section(self.tabs["Display"], "Main and remote columns")
+        box = tk.Listbox(frame, height=5, exportselection=False)
+        box.grid(row=0, column=0, rowspan=4, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        self.monitor_columns_list = box
+        self.complex_paths.add(path)
+
+        def selected():
+            selection = box.curselection()
+            return selection[0] if selection else None
+
+        def move(delta):
+            index = selected()
+            columns = _get(self.pending, path)
+            if index is None or not 0 <= index + delta < len(columns):
+                return
+            columns[index], columns[index + delta] = columns[index + delta], columns[index]
+            self._refresh_monitor_columns(index + delta)
+
+        def toggle():
+            index = selected()
+            if index is None:
+                return
+            columns = _get(self.pending, path)
+            if columns[index]["visible"] and sum(item["visible"] for item in columns) == 1:
+                messagebox.showinfo("Columns", "At least one column must remain visible.", parent=self.window)
+                return
+            columns[index]["visible"] = not columns[index]["visible"]
+            self._refresh_monitor_columns(index)
+
+        def reset():
+            _set(self.pending, path, self._default(path))
+            self._refresh_monitor_columns(0)
+
+        ttk.Button(frame, text="Up", command=lambda: move(-1)).grid(row=0, column=1, padx=8, sticky="ew")
+        ttk.Button(frame, text="Down", command=lambda: move(1)).grid(row=1, column=1, padx=8, sticky="ew")
+        ttk.Button(frame, text="Show / Hide", command=toggle).grid(row=2, column=1, padx=8, sticky="ew")
+        ttk.Button(frame, text="Reset to Default", command=reset).grid(row=3, column=1, padx=8, sticky="ew")
+        self._refresh_monitor_columns()
+
+    def _refresh_monitor_columns(self, selected_index=None):
+        box = self.monitor_columns_list
+        box.delete(0, "end")
+        for column in _get(self.pending, ("display", "monitor_columns"), []):
+            mark = "✓" if column["visible"] else " "
+            box.insert("end", f"[{mark}] {COLUMN_LABELS[column['id']]}")
+        if selected_index is not None:
+            box.selection_set(selected_index)
+            box.activate(selected_index)
 
     def _build_sound(self):
         frame = self._section(self.tabs["Sound"], "Alert")
@@ -267,6 +326,16 @@ class SettingsDialog:
             lambda row: row,
             lambda values: values,
         )
+
+    def _build_ligand_viewer(self):
+        frame = self._section(self.tabs["Ligand Viewer"], "Map generation")
+        self._scalar(frame, 0, "Quality", ("ligand_viewer", "quality"), choices=["Fast", "Standard", "Fine"])
+        self._scalar(frame, 1, "Measurement reach (Å)", ("ligand_viewer", "reach"), "float")
+        self._scalar(frame, 2, "Probe radius (Å)", ("ligand_viewer", "probe_radius"), "float")
+        ttk.Label(frame, text="Reach: 4–12 Å. Probe radius: 0–2 Å; zero maps empty space.\n"
+                  "Fine quality takes longer. Saved settings apply to the next report.\n"
+                  "Point sizes, atom visibility and bond appearance are adjusted inside the HTML report.",
+                  wraplength=670).grid(row=3, column=0, columnspan=3, sticky="w", pady=(12, 4))
 
     def _build_speed(self):
         frame = self._section(self.tabs["Speed Boost"], "General settings")
@@ -946,6 +1015,7 @@ class SettingsDialog:
             self._refresh_list(path)
         for path in self.table_widgets:
             self._refresh_table(path)
+        self._refresh_monitor_columns()
         self._refresh_mapping()
         if "Speed Boost" in self.tabs:
             self._refresh_profiles()

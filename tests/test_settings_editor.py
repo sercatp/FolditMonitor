@@ -3,8 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from settings import RESET_TO_DEFAULT, Settings
-from settings_validation import SettingsValidationError, validate_settings
+from modules.settings import RESET_TO_DEFAULT, Settings
+from modules.settings_validation import SettingsValidationError, validate_settings
+from modules.monitor_columns import default_monitor_columns, visible_column_ids
 
 
 class SettingsEditorTests(unittest.TestCase):
@@ -19,7 +20,67 @@ class SettingsEditorTests(unittest.TestCase):
         self.assertEqual(defaults["check_interval"], 2)
         self.assertEqual(defaults["logging"]["score_patterns"][0], r"\b\d{4,6}\.\d+\b")
         self.assertEqual(effective["speed_boost"]["profiles"]["medium"]["replacement_sleep_ms"], 5)
+        self.assertEqual(visible_column_ids(defaults["display"]["monitor_columns"]),
+                         ("Score", "CPU", "Puzzle", "Folder", "Type"))
+        self.assertTrue(defaults["display"]["show_puzzle_column"])
         validate_settings(effective)
+
+    def test_ligand_viewer_settings_persist_and_apply_to_next_report(self):
+        _, baseline, _ = self.manager.get_editor_snapshot()
+        changes = {("ligand_viewer", "quality"): "Fine", ("ligand_viewer", "reach"): 9.,
+                   ("ligand_viewer", "probe_radius"): .5}
+        effective = self.manager.save_editor_changes(changes, baseline)
+        self.assertEqual(self.manager.apply_live_editor_settings(effective, set(changes)), set(changes))
+        self.assertEqual(self.manager.settings["ligand_viewer"], {"quality": "Fine", "reach": 9., "probe_radius": .5})
+        self.assertEqual(Settings(self.temp.name).settings["ligand_viewer"], self.manager.settings["ligand_viewer"])
+        for path, invalid in (("quality", "Unknown"), ("reach", 13), ("probe_radius", -1), ("reach", float("nan"))):
+            with self.subTest(path=path, invalid=invalid):
+                with self.assertRaises(SettingsValidationError):
+                    self.manager.save_editor_changes({("ligand_viewer", path): invalid}, self.manager.user_settings)
+
+    def test_legacy_puzzle_visibility_migrates_without_rewriting_json(self):
+        for visible in (False, True):
+            with self.subTest(visible=visible):
+                disk = json.loads(self.path.read_text(encoding="utf-8"))
+                disk["display"].pop("monitor_columns", None)
+                disk["display"]["show_puzzle_column"] = visible
+                self.path.write_text(json.dumps(disk), encoding="utf-8")
+                before = self.path.read_bytes()
+                manager = Settings(self.temp.name)
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(
+                    next(item["visible"] for item in manager.settings["display"]["monitor_columns"]
+                         if item["id"] == "Puzzle"), visible
+                )
+                self.assertEqual(
+                    next(item["visible"] for item in manager.get_editor_snapshot()[2]["display"]["monitor_columns"]
+                         if item["id"] == "Puzzle"), visible
+                )
+
+    def test_column_order_saves_applies_live_and_mirrors_legacy_flag(self):
+        _, baseline, _ = self.manager.get_editor_snapshot()
+        columns = default_monitor_columns(True)
+        columns.insert(0, columns.pop(2))
+        columns[2]["visible"] = False
+        effective = self.manager.save_editor_changes({("display", "monitor_columns"): columns}, baseline)
+        applied = self.manager.apply_live_editor_settings(effective, {("display", "monitor_columns")})
+        self.assertIn(("display", "monitor_columns"), applied)
+        self.assertTrue(self.manager.settings["display"]["show_puzzle_column"])
+        self.assertEqual(visible_column_ids(self.manager.settings["display"]["monitor_columns"]),
+                         ("Puzzle", "Score", "Folder", "Type"))
+        disk = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertTrue(disk["display"]["show_puzzle_column"])
+        self.assertEqual(Settings(self.temp.name).settings["display"]["monitor_columns"], columns)
+
+    def test_invalid_column_config_is_not_saved(self):
+        _, baseline, _ = self.manager.get_editor_snapshot()
+        before = self.path.read_bytes()
+        columns = default_monitor_columns()
+        for column in columns:
+            column["visible"] = False
+        with self.assertRaises(SettingsValidationError):
+            self.manager.save_editor_changes({("display", "monitor_columns"): columns}, baseline)
+        self.assertEqual(self.path.read_bytes(), before)
 
     def test_changed_paths_preserve_unknown_and_concurrent_unrelated_edits(self):
         _, baseline, _ = self.manager.get_editor_snapshot()
@@ -129,7 +190,7 @@ class SettingsEditorTests(unittest.TestCase):
     def test_gui_smoke_on_isolated_config(self):
         try:
             import tkinter as tk
-            from settings_ui import SettingsDialog
+            from modules.settings_ui import SettingsDialog
             root = tk.Tk()
         except tk.TclError:
             self.skipTest("Tk is unavailable")
@@ -139,6 +200,11 @@ class SettingsEditorTests(unittest.TestCase):
         self.addCleanup(lambda: dialog.window.destroy() if dialog.window.winfo_exists() else None)
         root.update_idletasks()
         self.assertEqual(dialog._collect_changes(), {})
+        self.assertIn("Ligand Viewer", dialog.tabs)
+        dialog.controls[("ligand_viewer", "quality")][0].set("Fine")
+        dialog.save()
+        self.assertEqual(self.manager.settings["ligand_viewer"]["quality"], "Fine")
+        self.assertIn("All changes applied", dialog.status.get())
         dialog.controls[("sound", "volume")][0].set("0.75")
         dialog.save()
         self.assertEqual(self.manager.get_editor_snapshot()[2]["sound"]["volume"], 0.75)
@@ -150,7 +216,7 @@ class SettingsEditorTests(unittest.TestCase):
     def test_speed_boost_tab_is_available_only_when_enabled_in_json(self):
         try:
             import tkinter as tk
-            from settings_ui import SettingsDialog
+            from modules.settings_ui import SettingsDialog
             root = tk.Tk()
         except tk.TclError:
             self.skipTest("Tk is unavailable")
@@ -184,7 +250,7 @@ class SettingsEditorTests(unittest.TestCase):
         disk["display"]["active_palette"] = "contrast"
         disk["display"]["row_appearance"] = {"normal": {"foreground": "#123456"}}
         self.path.write_text(json.dumps(disk), encoding="utf-8")
-        dialog = __import__("settings_ui").SettingsDialog(root, self.manager, lambda _paths, _effective: None)
+        dialog = __import__("modules.settings_ui").SettingsDialog(root, self.manager, lambda _paths, _effective: None)
         self.addCleanup(lambda: dialog.window.destroy() if dialog.window.winfo_exists() else None)
         dialog.palette_var.set("custom")
         self.assertEqual(dialog.pending["display"]["row_appearance"]["normal"]["foreground"], "#123456")

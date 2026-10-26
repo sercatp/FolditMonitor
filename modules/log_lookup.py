@@ -2,7 +2,7 @@ import os
 import re
 from typing import Any, Iterable, Optional
 
-from stats_domain import parse_numeric_score, score_current_text
+from modules.stats_domain import parse_numeric_score, score_current_text
 
 
 def score_int(value: Any) -> Optional[int]:

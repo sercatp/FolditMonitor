@@ -34,3 +34,10 @@ _remote/
 Thumbs.db
 .idea/
 .vscode/
+
+# Private workspace and all generated local data
+/data/
+/development/
+/archive/
+/bu/
+/Foldit-Monitor-github/

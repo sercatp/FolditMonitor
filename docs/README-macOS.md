@@ -41,7 +41,7 @@ two rows therefore replaces and backs up only the target Track; sibling Tracks
 remain untouched.
 
 If automatic ownership detection cannot identify a log, add an explicit entry
-to the existing `Foldit Monitor.json` file:
+to the existing `data/Foldit Monitor.json` file:
 
 ```json
 {

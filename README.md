@@ -2,9 +2,9 @@
 
 Foldit Monitor is a desktop helper for watching local Foldit clients, tracking scores and logs, viewing puzzle statistics, and connecting monitors over a local network.
 
-[![Main window](https://github.com/sercatp/FolditMonitor/raw/main/images/main-window.png)](https://github.com/sercatp/FolditMonitor/blob/main/images/main-window.png)
+[![Main window](docs/images/main-window.png)](docs/images/main-window.png)
 
-[![Stats window](https://github.com/sercatp/FolditMonitor/raw/main/images/stats-window.jpg)](https://github.com/sercatp/FolditMonitor/blob/main/images/stats-window.jpg)
+[![Stats window](docs/images/stats-window.jpg)](docs/images/stats-window.jpg)
 
 
 ## Install and run
@@ -40,25 +40,32 @@ If you do not want to install Python, open [the latest release](https://github.c
 - **macOS:** install a Python build with Tk support; the requirements install
   the Cocoa and Quartz bridges automatically. Client-window integration remains
   experimental and there is no packaged macOS release. See the complete
-  [macOS setup and multi-Track notes](README-macOS.md).
+  [macOS setup and multi-Track notes](docs/README-macOS.md).
 
 ## First launch
 
-Foldit Monitor starts with the bundled [default profile](Foldit%20Monitor.defaults.json), then creates a separate local `Foldit Monitor.json`. That local file keeps window positions, paths, last-used puzzle data, and connections; it is intentionally not part of the repository.
+Foldit Monitor starts with the bundled [default profile](modules/resources/Foldit%20Monitor.defaults.json), then creates a separate local `data/Foldit Monitor.json`. That local file keeps window positions, paths, last-used puzzle data, and connections; it is intentionally not part of the repository.
 
 Right-click the main window and choose **Settings…** to edit the local settings. The dialog validates changes before saving them; some settings take effect after a restart.
 
-The app also creates `logs/`, `puzzle_logs/`, and `foldit_backup/` when needed. These are local working folders and can be kept or removed without changing the source code.
+Local settings, puzzle statistics, cached saves, and ligand reports live in `data/`. Existing settings, `puzzle_logs/`, `ligand_viewer_reports/`, and diagnostic `logs/` from the old layout are moved there automatically on startup. Save backups beside Foldit installations keep their existing location. Back up `data/` separately from the source code.
 
-## Main files
+## Project folders
 
-- `Foldit Monitor.pyw` — main application.
-- `settings.py`, `settings_ui.py`, `settings_validation.py` — default and local settings, the editor, and validation.
-- `network.py` — local-network synchronisation and artifact transfer.
-- `stats_*.py`, `logger.py`, `log_lookup.py` — score/log parsing and the statistics UI.
-- `save_catalog.py`, `save_manager_qt.py`, `savefile_api.py` — indexed save-file browsing and export.
-- `foldit_speed_boost*.py` — optional Frida-based speed-boost integration.
-- `alert.wav` — default alert sound.
+- `Foldit Monitor.pyw` — start the application; no other Python file needs to be launched.
+- `modules/` — application implementation.
+- `modules/resources/` — public defaults and the bundled alert sound.
+- `data/` — local settings, puzzle logs, cached saves, reports, and diagnostics; excluded from Git.
+- `tests/` — automated tests (`python -m unittest discover -s tests -q`).
+- `docs/` — platform instructions and screenshots.
+- `tools/` — optional build and source-backup utilities.
+
+The folder layout and local data are described in
+[Project structure](docs/PROJECT_STRUCTURE.md).
+
+Relative puzzle-log folders in settings are resolved inside `data/`. Absolute paths
+remain absolute. Legacy custom relative paths retain their previous locations
+during the automatic migration.
 
 ## Save Manager
 
@@ -66,6 +73,8 @@ Save Manager shows saves for the selected puzzle across Foldit clients. It check
 cached puzzle mappings against local `.ir_puzzle` files when those files are
 available. The Mode, Player ID, Source base, and Base gain columns use metadata
 found in the save file's PDLT block; unknown modes are left blank.
+Available metadata stays visible even if another field cannot be read. The
+standalone [save-file API](docs/savefile_api.md) also returns partial results.
 
 You can filter the list, select several visible saves with the platform's normal
 multi-selection keys, or use **Select All**. **Copy to…** accepts one or more
@@ -75,9 +84,15 @@ removes selected save files after a confirmation and skips files that changed
 since the list was refreshed.
 
 Speed Boost is disabled by default. To expose its menu, set
-`speed_boost.enabled` to `true` in the generated `Foldit Monitor.json` and
+`speed_boost.enabled` to `true` in the generated `data/Foldit Monitor.json` and
 restart the monitor. The same section contains the configured return-address
 `offsets`; invalid or empty lists keep the feature disabled.
+
+## Ligand Viewer
+
+Ligand Viewer displays ligands from Foldit saves in an interactive 3D view and provides a brief analysis of their surroundings.
+
+![Ligand Viewer](docs/images/ligand-viewer.jpg)
 
 ## Possible issues
 
@@ -96,7 +111,7 @@ Foldit Monitor normally detects this automatically by inspecting which
 `scriptlog.<track>.xml` file each process has open.
 
 If a log remains unidentified, add a fallback to the existing
-`Foldit Monitor.json` file:
+`data/Foldit Monitor.json` file:
 
 ```json
 {

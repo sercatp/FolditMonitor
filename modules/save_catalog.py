@@ -15,11 +15,12 @@ from pathlib import Path
 from collections import Counter, defaultdict
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-from savefile_api import FolditSaveSummary, get_save_summary
-from window_manager import delete_file
+from modules.savefile_api import FolditSaveSummary, get_save_summary
+from modules.window_manager import delete_file
 
 
-INDEX_SCHEMA_VERSION = 5
+INDEX_SCHEMA_VERSION = 7
+LEGACY_MAPPING_SCHEMA_VERSION = 5
 ACTIVE_PUZZLE_RE = re.compile(rb"Loading puzzle\s+(\d+)", re.IGNORECASE)
 PUZZLE_TITLE_RE = re.compile(rb'(?m)^\s*"title"\s*:\s*"\s*(\d+[A-Za-z]?)\s*:')
 PUZZLE_FILE_ID_RE = re.compile(rb'(?m)^\s*"id"\s*:\s*"(\d+)"')
@@ -160,7 +161,7 @@ class PuzzleMappingStore:
         try:
             with closing(sqlite3.connect(self.legacy_db_path, timeout=0.25)) as connection:
                 version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-                if version >= INDEX_SCHEMA_VERSION:
+                if version >= LEGACY_MAPPING_SCHEMA_VERSION:
                     return []
                 table = connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='puzzle_map'"
@@ -922,19 +923,19 @@ class SaveCatalog:
             return record
         try:
             summary = self.summary_reader(record.path)
-            if str(summary.puzzle_id).strip() != record.internal_puzzle_id:
+            if summary.puzzle_id is not None and str(summary.puzzle_id).strip() != record.internal_puzzle_id:
                 raise ValueError(
                     f"Puzzle mismatch: expected {record.internal_puzzle_id}, save contains {summary.puzzle_id}"
                 )
-            record.save_name = " ".join(str(summary.save_name).split())
-            record.player_name = " ".join(str(summary.player_name).split())
-            record.base_score = float(summary.base_score)
-            record.bonus_score = float(summary.bonus_score)
-            record.total_score = float(summary.total_score)
+            record.save_name = " ".join((summary.save_name or "").split())
+            record.player_name = " ".join((summary.player_name or "").split())
+            record.base_score = None if summary.base_score is None else float(summary.base_score)
+            record.bonus_score = None if summary.bonus_score is None else float(summary.bonus_score)
+            record.total_score = None if summary.total_score is None else float(summary.total_score)
             record.solution_mode = getattr(summary, "solution_mode", None)
             record.mode_player_id = getattr(summary, "mode_player_id", None)
             record.mode_reference_base_score = getattr(summary, "mode_reference_base_score", None)
-            record.error = ""
+            record.error = "; ".join(dict.fromkeys(summary.errors.values()))
         except Exception as exc:
             record.save_name = ""
             record.player_name = ""

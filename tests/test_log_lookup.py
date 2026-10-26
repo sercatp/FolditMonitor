@@ -4,7 +4,7 @@ import time
 import unittest
 from types import SimpleNamespace
 
-from log_lookup import filename_matches_log_query, find_matching_log_file
+from modules.log_lookup import filename_matches_log_query, find_matching_log_file
 
 
 def write_file(path, text, mtime_ns):
@@ -93,7 +93,7 @@ class LogLookupCases(unittest.TestCase):
 
 
 try:
-    from stats_ui_qt import StatsWindowQt
+    from modules.stats_ui_qt import StatsWindowQt
 except Exception:
     StatsWindowQt = None
 

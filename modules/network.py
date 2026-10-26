@@ -13,7 +13,9 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from collections import defaultdict
 
-from row_appearance import ROW_APPEARANCE_TAG_PREFIX, parse_appearance_tag
+from modules.row_appearance import ROW_APPEARANCE_TAG_PREFIX, parse_appearance_tag
+from modules.monitor_columns import COLUMN_IDS, default_monitor_columns, visible_column_ids
+from modules.paths import get_app_paths
 
 ARTIFACT_TRANSFER_CAPABILITY = "artifact_transfer_v1"
 ARTIFACT_QUERY_CAPABILITY = "artifact_query_v1"
@@ -143,7 +145,7 @@ class ConnectDialog:
         self.dialog.destroy()
 
 class RemoteTreeView:
-    def __init__(self, parent, address, connection_id, fonts, show_puzzle_column=True):
+    def __init__(self, parent, address, connection_id, fonts, show_puzzle_column=True, monitor_columns=None):
         self.fonts = fonts
         self.address = address
         self.connection_id = connection_id
@@ -171,9 +173,11 @@ class RemoteTreeView:
         style.configure('Treeview', rowheight=row_height)
         
         # Create treeview with style
-        columns = ("Score", "CPU", "Folder", "Type", "Puzzle") if show_puzzle_column else ("Score", "CPU", "Folder", "Type")
+        if monitor_columns is None:
+            monitor_columns = default_monitor_columns(bool(show_puzzle_column))
         self.tree = ttk.Treeview(self.frame, 
-            columns=columns,
+            columns=COLUMN_IDS,
+            displaycolumns=visible_column_ids(monitor_columns),
             show="", 
             selectmode='none', 
             style='Treeview')
@@ -300,7 +304,7 @@ class NetworkManager:
     ):
         self.main_window = main_window
         self.password = password or ""
-        self.artifact_root = artifact_root or os.path.join(os.getcwd(), "puzzle_logs", "_remote")
+        self.artifact_root = artifact_root or str(get_app_paths().puzzle_logs / "_remote")
         self.max_artifact_bytes = int(max_artifact_bytes or DEFAULT_MAX_ARTIFACT_BYTES)
         self.artifact_chunk_bytes = int(artifact_chunk_bytes or DEFAULT_ARTIFACT_CHUNK_BYTES)
         self.server_socket = None

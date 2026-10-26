@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from track_saves import (
+from modules.track_saves import (
     find_latest_track_save,
     replace_track_save_tree,
     resolve_track_copy_paths,
@@ -97,7 +97,7 @@ class TrackSaveCases(unittest.TestCase):
 class MonitorTrackIntegrationSourceCases(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.monitor_path = Path(__file__).resolve().parents[1] / "Foldit Monitor.pyw"
+        cls.monitor_path = Path(__file__).resolve().parents[1] / "modules" / "app.py"
         cls.source = cls.monitor_path.read_text(encoding="utf-8-sig")
 
     def test_launch_prefers_unused_installation_and_duplicates_only_as_fallback(self):

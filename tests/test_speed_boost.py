@@ -7,15 +7,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import foldit_speed_boost as speed_boost_module
-from foldit_speed_boost_integration import FolditSpeedBoostIntegration
-from settings import (
+import modules.foldit_speed_boost as speed_boost_module
+from modules.foldit_speed_boost_integration import FolditSpeedBoostIntegration
+from modules.settings import (
     DEFAULT_SPEED_BOOST_OFFSETS,
     DEFAULT_SPEED_BOOST_PROFILE,
     SPEED_BOOST_PROFILES,
     Settings,
 )
-from foldit_speed_boost import (
+from modules.foldit_speed_boost import (
     TARGET_SLEEP_MS,
     FolditSpeedBoostManager,
     SpeedBoostSession,
@@ -32,7 +32,7 @@ FAST_TIMING = SpeedBoostTiming(
 )
 DEFAULT_OFFSETS = tuple(int(value, 16) for value in DEFAULT_SPEED_BOOST_OFFSETS)
 FIRST_OFFSET_KEY = hex(DEFAULT_OFFSETS[0])
-MONITOR_SOURCE_PATH = Path(__file__).resolve().parents[1] / "Foldit Monitor.pyw"
+MONITOR_SOURCE_PATH = Path(__file__).resolve().parents[1] / "modules" / "app.py"
 
 
 class _Exports:
@@ -332,7 +332,7 @@ class SpeedBoostCases(unittest.TestCase):
             "from foldit_speed_boost_integration import FolditSpeedBoostIntegration",
             source,
         )
-        self.assertIn('import_module("foldit_speed_boost_integration")', source)
+        self.assertIn('import_module("modules.foldit_speed_boost_integration")', source)
 
     def test_timing_values_must_be_positive_integers(self):
         with self.assertRaises(ValueError):

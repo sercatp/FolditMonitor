@@ -10,12 +10,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from logger import FolditLogHandler, LogFileHandler
-from stats_domain import format_score_history, format_score_latest, format_score_line
-from stats_editor import StatsEditorSession
-from stats_module import StatsManager, parse_numeric_score
-from row_appearance import build_row_visual_state, resolve_row_appearance
-from settings import Settings
+from modules.logger import FolditLogHandler, LogFileHandler
+from modules.stats_domain import format_score_history, format_score_latest, format_score_line
+from modules.stats_editor import StatsEditorSession
+from modules.stats_module import StatsManager, parse_numeric_score
+from modules.row_appearance import build_row_visual_state, resolve_row_appearance
+from modules.settings import Settings
 
 
 DRW_OPEN = """<?xml version="1.0" encoding="UTF-8"?>
@@ -100,7 +100,7 @@ def make_stats_manager(temp_dir: str, script_type_mapping=None, score_decimals: 
     )
 
 
-MONITOR_SOURCE_PATH = Path(__file__).resolve().parents[1] / "Foldit Monitor.pyw"
+MONITOR_SOURCE_PATH = Path(__file__).resolve().parents[1] / "modules" / "app.py"
 
 
 class MonitorStartupLayoutCases(unittest.TestCase):
